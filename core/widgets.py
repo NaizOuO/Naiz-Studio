@@ -29,8 +29,8 @@ def draw_text(surface, text, pos, size=16, color=theme.TEXT, bold=False, center=
     return rect
 
 
-def clip_text(text: str, size: int, max_width: int) -> str:
-    f = theme.font(size)
+def clip_text(text: str, size: int, max_width: int, bold: bool = False) -> str:
+    f = theme.font(size, bold)
     if f.size(text)[0] <= max_width:
         return text
     while text and f.size(text + "...")[0] > max_width:
@@ -212,8 +212,24 @@ def _clipboard_text() -> str:
         return ""
 
 
+def _set_clipboard(text):
+    try:
+        pygame.scrap.put_text(text)
+    except Exception:
+        pass
+
+
+def _is_word_char(ch):
+    return ch.isalnum() or ch == "_"
+
+
 class TextInput:
-    """單行輸入框:打字、方向鍵、Backspace / Delete、Home / End、Ctrl+V 貼上,Enter 或 Esc 結束輸入。"""
+    """單行輸入框。
+
+    支援:打字、選取(滑鼠拖曳、Shift+方向鍵、雙擊選字、三擊或 Ctrl+A 全選)、
+    Ctrl+C / X / V、Backspace / Delete(Ctrl 一次刪一個字),Enter 或 Esc 結束輸入。
+    按住按鍵連續刪除需要主程式呼叫 pygame.key.set_repeat。
+    """
 
     def __init__(self, text="", placeholder="", accent=theme.ACCENT, size=15):
         self.text = text
@@ -221,18 +237,39 @@ class TextInput:
         self.accent = accent
         self.size = size
         self.cursor = len(text)
+        self.anchor = self.cursor
         self.focused = False
         self.error = False
         self.rect = pygame.Rect(0, 0, 0, 0)
         self._offset = 0
+        self._dragging = False
+        self._last_click_ms = -10000
+        self._last_click_index = -1
+        self._click_count = 0
+
+    # ------------------------------------------------------------ 狀態
+
+    @property
+    def selection(self):
+        return min(self.anchor, self.cursor), max(self.anchor, self.cursor)
+
+    @property
+    def selected_text(self):
+        start, end = self.selection
+        return self.text[start:end]
 
     def set_text(self, text):
         self.text = text
-        self.cursor = len(text)
+        self.cursor = self.anchor = len(text)
+
+    def select_all(self):
+        self.anchor, self.cursor = 0, len(self.text)
 
     def blur(self):
+        self._dragging = False
         if self.focused:
             self.focused = False
+            self.anchor = self.cursor
             pygame.key.stop_text_input()
 
     def _focus(self):
@@ -251,18 +288,82 @@ class TextInput:
                 return i - 1
         return len(self.text)
 
+    def _word_bounds(self, index):
+        if not self.text:
+            return 0, 0
+        probe = min(index, len(self.text) - 1)
+        kind = _is_word_char(self.text[probe])
+        start = end = probe
+        while start > 0 and _is_word_char(self.text[start - 1]) == kind:
+            start -= 1
+        while end < len(self.text) and _is_word_char(self.text[end]) == kind:
+            end += 1
+        return start, end
+
+    def _jump_word(self, index, direction):
+        i = index
+        if direction < 0:
+            while i > 0 and not _is_word_char(self.text[i - 1]):
+                i -= 1
+            while i > 0 and _is_word_char(self.text[i - 1]):
+                i -= 1
+        else:
+            while i < len(self.text) and not _is_word_char(self.text[i]):
+                i += 1
+            while i < len(self.text) and _is_word_char(self.text[i]):
+                i += 1
+        return i
+
+    def _delete_selection(self):
+        start, end = self.selection
+        if start == end:
+            return False
+        self.text = self.text[:start] + self.text[end:]
+        self.cursor = self.anchor = start
+        return True
+
     def _insert(self, value):
+        self._delete_selection()
         self.text = self.text[:self.cursor] + value + self.text[self.cursor:]
         self.cursor += len(value)
+        self.anchor = self.cursor
+
+    def _move(self, index, extend):
+        self.cursor = max(0, min(len(self.text), index))
+        if not extend:
+            self.anchor = self.cursor
+
+    # ------------------------------------------------------------ 事件
 
     def handle(self, event, mouse_pos) -> bool:
         """回傳 True 代表文字內容有改變。"""
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            if self.rect.collidepoint(mouse_pos):
-                self._focus()
-                self.cursor = self._index_at(mouse_pos[0])
-            else:
+            if not self.rect.collidepoint(mouse_pos):
                 self.blur()
+                return False
+            self._focus()
+            index = self._index_at(mouse_pos[0])
+            now = pygame.time.get_ticks()
+            if now - self._last_click_ms < 450 and abs(index - self._last_click_index) <= 1:
+                self._click_count += 1
+            else:
+                self._click_count = 1
+            self._last_click_ms, self._last_click_index = now, index
+
+            if self._click_count == 2:
+                self.anchor, self.cursor = self._word_bounds(index)
+            elif self._click_count >= 3:
+                self.select_all()
+            else:
+                shift = pygame.key.get_mods() & pygame.KMOD_SHIFT
+                self._move(index, extend=bool(shift))
+                self._dragging = True
+            return False
+        if event.type == pygame.MOUSEMOTION and self._dragging and self.focused:
+            self.cursor = self._index_at(mouse_pos[0])
+            return False
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self._dragging = False
             return False
         if not self.focused:
             return False
@@ -273,29 +374,58 @@ class TextInput:
         if event.type != pygame.KEYDOWN:
             return False
 
-        if event.key == pygame.K_BACKSPACE and self.cursor > 0:
-            self.text = self.text[:self.cursor - 1] + self.text[self.cursor:]
-            self.cursor -= 1
-            return True
-        if event.key == pygame.K_DELETE and self.cursor < len(self.text):
-            self.text = self.text[:self.cursor] + self.text[self.cursor + 1:]
-            return True
-        if event.key == pygame.K_v and event.mod & pygame.KMOD_CTRL:
+        ctrl = event.mod & pygame.KMOD_CTRL
+        shift = event.mod & pygame.KMOD_SHIFT
+        key = event.key
+        if key == pygame.K_BACKSPACE:
+            if self._delete_selection():
+                return True
+            if self.cursor > 0:
+                start = self._jump_word(self.cursor, -1) if ctrl else self.cursor - 1
+                self.text = self.text[:start] + self.text[self.cursor:]
+                self.cursor = self.anchor = start
+                return True
+            return False
+        if key == pygame.K_DELETE:
+            if self._delete_selection():
+                return True
+            if self.cursor < len(self.text):
+                end = self._jump_word(self.cursor, 1) if ctrl else self.cursor + 1
+                self.text = self.text[:self.cursor] + self.text[end:]
+                return True
+            return False
+        if ctrl and key == pygame.K_a:
+            self.select_all()
+        elif ctrl and key == pygame.K_c:
+            if self.selected_text:
+                _set_clipboard(self.selected_text)
+        elif ctrl and key == pygame.K_x:
+            if self.selected_text:
+                _set_clipboard(self.selected_text)
+                return self._delete_selection()
+        elif ctrl and key == pygame.K_v:
             pasted = _clipboard_text().replace("\r", " ").replace("\n", " ")
             if pasted:
                 self._insert(pasted)
                 return True
-        elif event.key == pygame.K_LEFT:
-            self.cursor = max(0, self.cursor - 1)
-        elif event.key == pygame.K_RIGHT:
-            self.cursor = min(len(self.text), self.cursor + 1)
-        elif event.key == pygame.K_HOME:
-            self.cursor = 0
-        elif event.key == pygame.K_END:
-            self.cursor = len(self.text)
-        elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_ESCAPE):
+        elif key in (pygame.K_LEFT, pygame.K_RIGHT):
+            direction = -1 if key == pygame.K_LEFT else 1
+            start, end = self.selection
+            if start != end and not shift:
+                self._move(start if direction < 0 else end, extend=False)
+            elif ctrl:
+                self._move(self._jump_word(self.cursor, direction), extend=bool(shift))
+            else:
+                self._move(self.cursor + direction, extend=bool(shift))
+        elif key == pygame.K_HOME:
+            self._move(0, extend=bool(shift))
+        elif key == pygame.K_END:
+            self._move(len(self.text), extend=bool(shift))
+        elif key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_ESCAPE):
             self.blur()
         return False
+
+    # ------------------------------------------------------------ 繪製
 
     def draw(self, surface, rect, mouse_pos):
         self.rect = rect
@@ -318,6 +448,13 @@ class TextInput:
 
         previous_clip = surface.get_clip()
         surface.set_clip(inner.clip(previous_clip))
+        start, end = self.selection
+        if self.focused and start != end:
+            x1 = inner.x + font.size(self.text[:start])[0] - self._offset
+            x2 = inner.x + font.size(self.text[:end])[0] - self._offset
+            highlight = pygame.Surface((max(1, x2 - x1), rect.height - 12), pygame.SRCALPHA)
+            highlight.fill((*self.accent, 90))
+            surface.blit(highlight, (x1, rect.y + 6))
         if self.text:
             image = font.render(self.text, True, theme.TEXT)
             surface.blit(image, (inner.x - self._offset, rect.centery - image.get_height() // 2))

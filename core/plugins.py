@@ -17,6 +17,8 @@ class Tool:
     category = "其他"
     description = ""
     accent = theme.ACCENT
+    # 需要額外下載的元件(core.deps.Dependency);缺少時開啟前會先詢問使用者
+    requires = ()
 
     def create_page(self, app):
         raise NotImplementedError

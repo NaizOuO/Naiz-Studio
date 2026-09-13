@@ -17,6 +17,10 @@ PDF Studio/
 output/
 error.log
 
+# 使用者同意後才下載的外部元件與模型
+bin/
+models/
+
 # 測試或處理中的 PDF 屬於個人檔案
 *.pdf
 

@@ -31,6 +31,7 @@ if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from core import paths, plugins, theme, widgets
+from core.consent import ConsentDialog
 from core.settings_panel import SettingsPanel
 from core.widgets import Button, draw_text, rounded_panel
 
@@ -63,6 +64,9 @@ class App:
 
         self.windowed_size = self.screen.get_size()
         self.fullscreen = False
+        self.f11_held = False
+        # 按住 Backspace / Delete / 方向鍵時連續觸發
+        pygame.key.set_repeat(400, 35)
 
         self.gear_img = None
         gear_path = paths.IMAGES_DIR / "ui_gear.png"
@@ -74,6 +78,7 @@ class App:
                 pass
 
         self.settings = SettingsPanel(self)
+        self.consent = ConsentDialog(self)
         self.title_rect = pygame.Rect(0, 0, 0, 0)
         self.gear_rect = pygame.Rect(0, 0, 0, 0)
         self.title_clicks = []
@@ -136,6 +141,10 @@ class App:
             self.pages[self.current.id].deactivate()
 
     def open_tool(self, tool):
+        missing = [dep for dep in tool.requires if not dep.installed()]
+        if missing:
+            self.consent.open(tool, missing)
+            return
         if tool.id not in self.pages:
             self.pages[tool.id] = tool.create_page(self)
         self.current = tool
@@ -246,6 +255,8 @@ class App:
         self.draw_header(width, mouse_pos)
         if self.settings.is_open:
             self.settings.draw(mouse_pos)
+        if self.consent.is_open:
+            self.consent.draw(mouse_pos)
 
     # ------------------------------------------------------------ 事件
 
@@ -256,10 +267,19 @@ class App:
             self.screen = pygame.display.set_mode((max(960, event.w), max(640, event.h)), pygame.RESIZABLE)
             self.windowed_size = self.screen.get_size()
             return True
+        if event.type == pygame.KEYUP and event.key == pygame.K_F11:
+            self.f11_held = False
+            return True
         if event.type == pygame.KEYDOWN and event.key == pygame.K_F11:
-            self.toggle_fullscreen()
+            # 開了按鍵連發,按住 F11 不放時只切換一次
+            if not self.f11_held:
+                self.f11_held = True
+                self.toggle_fullscreen()
             return True
 
+        if self.consent.is_open:
+            self.consent.handle_event(event, mouse_pos)
+            return True
         if self.settings.is_open:
             self.settings.handle_event(event, mouse_pos)
             return True
@@ -301,6 +321,7 @@ class App:
         while running:
             running = self.process_events(pygame.event.get())
             mouse_pos = pygame.mouse.get_pos()
+            self.consent.update()
             if self.current:
                 self.pages[self.current.id].update()
             self.draw_frame(mouse_pos)
