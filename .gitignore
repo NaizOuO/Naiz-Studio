@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# PyInstaller 建置產物
+build/
+dist/
+*.spec
+
+# 發布產物:exe 改放 GitHub Release,不進版本控制
+PDF Studio/
+
+# 執行時才產生的東西
+output/
+error.log
+
+# 測試或處理中的 PDF 屬於個人檔案
+*.pdf
+
+# 使用者的個人設定(程式會自動建立預設值)
+config.json
+
+# images 只追蹤介面素材,使用者自己放的背景圖不納入
+images/*
+!images/app_icon.png
+!images/app_icon.ico
+!images/ui_gear.png
