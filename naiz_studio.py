@@ -143,7 +143,7 @@ class App:
     def open_tool(self, tool):
         missing = [dep for dep in tool.requires if not dep.installed()]
         if missing:
-            self.consent.open(tool, missing)
+            self.consent.open(tool.name, missing, on_done=lambda: self.open_tool(tool))
             return
         if tool.id not in self.pages:
             self.pages[tool.id] = tool.create_page(self)

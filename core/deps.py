@@ -60,9 +60,13 @@ def kill_tree(proc):
 class Dependency:
     """一個要下載的元件。
 
-    files: 安裝後放在 bin/ 的檔名 -> 若下載的是 zip,對應壓縮檔內路徑的結尾(例如 "bin/ffmpeg.exe");
-           直接下載單一執行檔時值填 None。
+    files: 安裝後的檔名(相對於 bin/ 或 models/)-> 若下載的是 zip,對應壓縮檔內路徑的結尾
+           (例如 "bin/ffmpeg.exe");直接下載單一檔案時值填 None。
+           有設定 folder 時,files 只用來判斷是否已安裝。
+    folder: 把整個 zip 解壓到這個子資料夾(自動去掉 zip 裡共同的最上層資料夾),適合需要一堆 DLL 的程式。
+    location: "bin" 放執行檔,"models" 放模型。
     check_args: 安裝後用這些參數執行第一個檔案,回傳碼為 0 才算安裝成功。
+    sha256: 官方公布、固定版本的 SHA-256;有填就不再另外抓驗證檔。
     sha256_url: 官方公布的 SHA-256 檔案;有填就會在安裝前驗證下載內容。
     sha256_name: 驗證檔若是「雜湊 檔名」清單,用這個檔名找對應的那一行。
     """
@@ -74,14 +78,21 @@ class Dependency:
     url: str
     files: dict
     check_args: list = field(default_factory=list)
+    sha256: str = ""
     sha256_url: str = ""
     sha256_name: str = ""
+    folder: str = ""
+    location: str = "bin"
+
+    @property
+    def base_dir(self):
+        return paths.MODELS_DIR if self.location == "models" else paths.BIN_DIR
 
     def path(self, filename=None):
-        return paths.BIN_DIR / (filename or next(iter(self.files)))
+        return self.base_dir / (filename or next(iter(self.files)))
 
     def installed(self) -> bool:
-        return all((paths.BIN_DIR / name).is_file() and (paths.BIN_DIR / name).stat().st_size > 0
+        return all((self.base_dir / name).is_file() and (self.base_dir / name).stat().st_size > 0
                    for name in self.files)
 
 
@@ -112,11 +123,34 @@ def fetch_expected_sha256(dep: Dependency) -> str:
     raise ChecksumError(f"找不到 {dep.name} 的官方驗證碼,為了安全已停止安裝")
 
 
+def _extract_folder(dep: Dependency, archive_path):
+    destination = dep.base_dir / dep.folder
+    staging = dep.base_dir / f".{dep.folder}.part"
+    shutil.rmtree(staging, ignore_errors=True)
+    with zipfile.ZipFile(archive_path) as archive:
+        members = [m for m in archive.infolist() if not m.is_dir()]
+        names = [m.filename.replace("\\", "/") for m in members]
+        tops = {name.split("/", 1)[0] for name in names}
+        strip = len(next(iter(tops))) + 1 if len(tops) == 1 and all("/" in n for n in names) else 0
+        root = staging.resolve()
+        for member, name in zip(members, names):
+            target = (staging / name[strip:]).resolve()
+            # 防止壓縮檔裡用 ../ 把檔案寫到資料夾外面
+            if root not in target.parents:
+                raise ValueError(f"下載的 {dep.name} 內容異常,已停止安裝")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(member) as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+    shutil.rmtree(destination, ignore_errors=True)
+    staging.replace(destination)
+
+
 def install(dep: Dependency, progress=None, cancel=None):
-    paths.BIN_DIR.mkdir(parents=True, exist_ok=True)
+    base = dep.base_dir
+    base.mkdir(parents=True, exist_ok=True)
     # 先拿到官方驗證碼才開始下載;拿不到就不下載,避免裝上無法確認來源的程式
-    expected = fetch_expected_sha256(dep) if dep.sha256_url else None
-    download = paths.BIN_DIR / f".{dep.id}.download"
+    expected = dep.sha256.lower() or (fetch_expected_sha256(dep) if dep.sha256_url else None)
+    download = base / f".{dep.id}.download"
     try:
         request = urllib.request.Request(dep.url, headers={"User-Agent": "NaizStudio"})
         digest = hashlib.sha256()
@@ -138,30 +172,37 @@ def install(dep: Dependency, progress=None, cancel=None):
         if expected is not None and digest.hexdigest() != expected:
             raise ChecksumError(f"下載的 {dep.name} 驗證失敗(SHA-256 不符),已刪除,請重試")
 
-        for target, member_suffix in dep.files.items():
-            destination = paths.BIN_DIR / target
-            partial = destination.with_name(destination.name + ".part")
-            if member_suffix is None:
-                shutil.copyfile(download, partial)
-            else:
-                with zipfile.ZipFile(download) as archive:
-                    member = next((n for n in archive.namelist()
-                                   if n.replace("\\", "/").endswith(member_suffix)), None)
-                    if member is None:
-                        raise ValueError(f"下載的 {dep.name} 裡找不到 {member_suffix}")
-                    with archive.open(member) as src, open(partial, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
-            partial.replace(destination)
+        if dep.folder:
+            _extract_folder(dep, download)
+        else:
+            for target, member_suffix in dep.files.items():
+                destination = base / target
+                partial = destination.with_name(destination.name + ".part")
+                if member_suffix is None:
+                    shutil.copyfile(download, partial)
+                else:
+                    with zipfile.ZipFile(download) as archive:
+                        member = next((n for n in archive.namelist()
+                                       if n.replace("\\", "/").endswith(member_suffix)), None)
+                        if member is None:
+                            raise ValueError(f"下載的 {dep.name} 裡找不到 {member_suffix}")
+                        with archive.open(member) as src, open(partial, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                partial.replace(destination)
     except BaseException:
+        if dep.folder:
+            shutil.rmtree(base / f".{dep.folder}.part", ignore_errors=True)
         for target in dep.files:
-            (paths.BIN_DIR / target).with_name(target + ".part").unlink(missing_ok=True)
+            (base / target).with_name((base / target).name + ".part").unlink(missing_ok=True)
         raise
     finally:
         download.unlink(missing_ok=True)
 
     if dep.check_args:
-        result = run([dep.path(), *dep.check_args], capture_output=True, timeout=60)
+        result = run([dep.path(), *dep.check_args], capture_output=True, timeout=120)
         if result.returncode != 0:
+            if dep.folder:
+                shutil.rmtree(base / dep.folder, ignore_errors=True)
             for target in dep.files:
-                (paths.BIN_DIR / target).unlink(missing_ok=True)
+                (base / target).unlink(missing_ok=True)
             raise RuntimeError(f"{dep.name} 下載後無法執行,已移除,請重試")

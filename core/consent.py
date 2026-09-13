@@ -12,7 +12,8 @@ class ConsentDialog:
     def __init__(self, app):
         self.app = app
         self.is_open = False
-        self.tool = None
+        self.name = ""
+        self.on_done = None
         self.items = []
         self.phase = "ask"          # ask / downloading / error
         self.error = ""
@@ -20,8 +21,10 @@ class ConsentDialog:
         self.btn_agree = Button("同意並下載", accent=theme.ACCENT, size=15)
         self.btn_cancel = Button("取消", filled=False, size=14)
 
-    def open(self, tool, items):
-        self.tool = tool
+    def open(self, name, items, on_done=None):
+        """name: 顯示在說明裡的功能名稱;on_done: 全部下載完成後要做的事。"""
+        self.name = name
+        self.on_done = on_done
         self.items = list(items)
         self.phase = "ask"
         self.error = ""
@@ -29,7 +32,7 @@ class ConsentDialog:
 
     def close(self):
         self.is_open = False
-        self.tool = None
+        self.on_done = None
         self.items = []
 
     def _start(self):
@@ -85,9 +88,10 @@ class ConsentDialog:
                 # 例外名稱對使用者沒有意義,只顯示後面的說明
                 self.error = error.split(": ", 1)[-1]
             return
-        tool = self.tool
+        on_done = self.on_done
         self.close()
-        self.app.open_tool(tool)
+        if on_done:
+            on_done()
 
     # ------------------------------------------------------------ 繪製
 
@@ -108,7 +112,7 @@ class ConsentDialog:
         y = panel.y + 20
         draw_text(screen, "需要下載額外元件", (x, y), 17, theme.TEXT, bold=True)
         y += 32
-        draw_text(screen, widgets.clip_text(f"使用「{self.tool.name}」前,需要先下載以下元件", 13, inner),
+        draw_text(screen, widgets.clip_text(f"使用「{self.name}」前,需要先下載以下元件", 13, inner),
                   (x, y), 13, theme.TEXT_DIM)
         y += 30
 
@@ -124,7 +128,7 @@ class ConsentDialog:
                       12, theme.TEXT_DIM)
             y += ROW_H
 
-        draw_text(screen, "下載後放在程式的 bin 資料夾,之後不需要再下載", (x, y + 2), 12, theme.TEXT_FAINT)
+        draw_text(screen, "下載後放在程式資料夾內,之後不需要再下載", (x, y + 2), 12, theme.TEXT_FAINT)
         y += 28
 
         if self.phase == "downloading":
