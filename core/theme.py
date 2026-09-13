@@ -72,6 +72,8 @@ DEFAULT_CONFIG = {
 
     "bg_manual說明": "manual 模式專用:x/y 同上,scale 為縮放百分比(100 = 原始大小)",
     "bg_manual": {"x": 50, "y": 50, "scale": 100},
+
+    "dev_mode": False,
 }
 
 

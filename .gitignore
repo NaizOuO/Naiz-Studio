@@ -7,6 +7,9 @@ build/
 dist/
 *.spec
 
+# 開發者模式插件,只存在本機
+dev/
+
 # 發布產物:exe 改放 GitHub Release,不進版本控制
 PDF Studio/
 
