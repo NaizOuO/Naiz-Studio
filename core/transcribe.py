@@ -6,6 +6,7 @@
     text = transcribe.srt_to_text(srt)
 """
 
+import atexit
 import ctypes
 import os
 import platform
@@ -154,8 +155,14 @@ def _ascii_temp_dir() -> Path:
     return Path(temp)
 
 
+# 正在執行的外部程式;關閉 Naiz Studio 時一併結束,避免辨識在背景繼續跑
+_active = set()
+atexit.register(lambda: [deps.kill_tree(proc) for proc in list(_active)])
+
+
 def _run(args, cancel, on_line=None, cwd=None):
     proc = deps.popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=cwd)
+    _active.add(proc)
 
     def watch_cancel():
         while proc.poll() is None:
@@ -173,6 +180,7 @@ def _run(args, cancel, on_line=None, cwd=None):
         if on_line:
             on_line(line)
     code = proc.wait()
+    _active.discard(proc)
     if cancel is not None and cancel.is_set():
         raise deps.Cancelled()
     return code, log
