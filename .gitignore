@@ -27,4 +27,4 @@ config.json
 images/*
 !images/app_icon.png
 !images/app_icon.ico
-!images/ui_gear.png
+!images/ui_*.png

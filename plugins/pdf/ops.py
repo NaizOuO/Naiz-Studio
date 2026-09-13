@@ -1,6 +1,8 @@
 """PDF 壓縮、拆分、合併的實際運算;全部支援進度回報與中途取消。"""
 
 import io
+import re
+import unicodedata
 from pathlib import Path
 
 import pikepdf
@@ -236,57 +238,129 @@ def plan_split(total_pages: int, weights) -> list:
     return ranges
 
 
-def split(input_path, output_dir, *, weights=None, every_page=False, fmt="pdf",
-          image_dpi=150, progress=None, cancel=None) -> dict:
+def parse_page_spec(text: str, total_pages: int) -> list:
+    """把「1, 3, 5-8」轉成由小到大的頁碼清單(從 1 起算);格式錯或超出範圍會丟 ValueError。"""
+    # 使用者可能開著中文輸入法,全形數字、全形逗號、頓號都要能認
+    normalized = unicodedata.normalize("NFKC", text).replace("、", ",").replace("~", "-")
+    pages = set()
+    for raw in normalized.split(","):
+        part = raw.strip()
+        if not part:
+            continue
+        match = re.fullmatch(r"([0-9]+)\s*-\s*([0-9]+)", part)
+        if match:
+            start, end = sorted((int(match[1]), int(match[2])))
+        elif re.fullmatch(r"[0-9]+", part):
+            start = end = int(part)
+        else:
+            raise ValueError(f"看不懂「{part}」")
+        if start < 1 or end > total_pages:
+            raise ValueError(f"「{part}」超出範圍,這份只有 {total_pages} 頁")
+        pages.update(range(start, end + 1))
+    return sorted(pages)
+
+
+def format_page_spec(pages) -> str:
+    """parse_page_spec 的反向:把頁碼清單寫回「1-3, 5, 8-10」這種精簡寫法。"""
+    ordered = sorted(pages)
+    parts = []
+    i = 0
+    while i < len(ordered):
+        j = i
+        while j + 1 < len(ordered) and ordered[j + 1] == ordered[j] + 1:
+            j += 1
+        parts.append(str(ordered[i]) if i == j else f"{ordered[i]}-{ordered[j]}")
+        i = j + 1
+    return ", ".join(parts)
+
+
+def _save_pages(src, indexes, out_path):
+    dst = pikepdf.Pdf.new()
+    try:
+        for index in indexes:
+            dst.pages.append(src.pages[index])
+        dst.save(out_path, compress_streams=True, object_stream_mode=pikepdf.ObjectStreamMode.generate)
+    finally:
+        dst.close()
+
+
+def split(input_path, output_dir, *, weights, progress=None, cancel=None) -> dict:
     input_path, output_dir = Path(input_path), Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = input_path.stem
-
-    if every_page and fmt in ("png", "jpg"):
-        return _split_to_images(input_path, output_dir, stem, fmt, image_dpi, progress, cancel)
 
     with pikepdf.open(input_path) as src:
-        total = len(src.pages)
-        ranges = [(i, 1) for i in range(total)] if every_page else plan_split(total, weights)
+        ranges = plan_split(len(src.pages), weights)
         if not ranges:
             raise ValueError("頁數不足,無法照這個設定拆分")
-
         files = []
-        width = len(str(len(ranges)))
         for index, (start, count) in enumerate(ranges, start=1):
             _check(cancel)
-            name = f"{stem}_p{index:0{width}d}.pdf" if every_page else f"{stem}_part{index}.pdf"
-            out_path = output_dir / name
-            dst = pikepdf.Pdf.new()
-            for page in src.pages[start:start + count]:
-                dst.pages.append(page)
-            dst.save(out_path, compress_streams=True,
-                     object_stream_mode=pikepdf.ObjectStreamMode.generate)
-            dst.close()
+            out_path = output_dir / f"{input_path.stem}_part{index}.pdf"
+            _save_pages(src, range(start, start + count), out_path)
             files.append(out_path)
             _report(progress, index, len(ranges), f"{index}/{len(ranges)} 份")
 
     return {"files": files, "count": len(files)}
 
 
-def _split_to_images(input_path, output_dir, stem, fmt, dpi, progress, cancel):
+def extract_pages(input_path, output_dir, pages, *, combine=False, fmt="pdf", image_dpi=150,
+                  progress=None, cancel=None) -> dict:
+    """取出指定頁(從 1 起算)。combine=True 合成一個 PDF,否則每頁一個檔,可輸出成 PDF / PNG / JPG。"""
+    input_path, output_dir = Path(input_path), Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pages = sorted(set(pages))
+    if not pages:
+        raise ValueError("沒有選取任何頁面")
+    stem = input_path.stem
+
+    if not combine and fmt in ("png", "jpg"):
+        return _pages_to_images(input_path, output_dir, stem, pages, fmt, image_dpi, progress, cancel)
+
+    with pikepdf.open(input_path) as src:
+        total = len(src.pages)
+        if pages[-1] > total:
+            raise ValueError(f"第 {pages[-1]} 頁超出範圍,這份只有 {total} 頁")
+
+        if combine:
+            _check(cancel)
+            _report(progress, 0, 1, f"合成 {len(pages)} 頁")
+            out_path = output_dir / f"{stem}_selected.pdf"
+            _save_pages(src, [n - 1 for n in pages], out_path)
+            _report(progress, 1, 1, "完成")
+            return {"files": [out_path], "count": 1}
+
+        width = len(str(total))
+        files = []
+        for index, number in enumerate(pages, start=1):
+            _check(cancel)
+            out_path = output_dir / f"{stem}_p{number:0{width}d}.pdf"
+            _save_pages(src, [number - 1], out_path)
+            files.append(out_path)
+            _report(progress, index, len(pages), f"第 {number} 頁 ({index}/{len(pages)})")
+
+    return {"files": files, "count": len(files)}
+
+
+def _pages_to_images(input_path, output_dir, stem, pages, fmt, dpi, progress, cancel):
     import pymupdf
 
     doc = pymupdf.open(input_path)
-    total = doc.page_count
-    width = len(str(total))
-    files = []
     try:
-        for index in range(total):
+        total = doc.page_count
+        if pages[-1] > total:
+            raise ValueError(f"第 {pages[-1]} 頁超出範圍,這份只有 {total} 頁")
+        width = len(str(total))
+        files = []
+        for index, number in enumerate(pages, start=1):
             _check(cancel)
-            pix = doc[index].get_pixmap(dpi=dpi)
-            out_path = output_dir / f"{stem}_p{index + 1:0{width}d}.{fmt}"
+            pix = doc[number - 1].get_pixmap(dpi=dpi)
+            out_path = output_dir / f"{stem}_p{number:0{width}d}.{fmt}"
             if fmt == "jpg":
                 out_path.write_bytes(pix.tobytes("jpeg", jpg_quality=85))
             else:
                 pix.save(out_path)
             files.append(out_path)
-            _report(progress, index + 1, total, f"第 {index + 1}/{total} 頁")
+            _report(progress, index, len(pages), f"第 {number} 頁 ({index}/{len(pages)})")
     finally:
         doc.close()
     return {"files": files, "count": len(files)}

@@ -99,7 +99,8 @@ class Slider:
         return round(raw / self.step) * self.step
 
     def handle(self, event, mouse_pos):
-        hit = self.rect.inflate(0, 16)
+        # 左右放寬到涵蓋整顆圓鈕:數值在最大或最小時圓鈕有一半落在軌道外
+        hit = self.rect.inflate(20, 16)
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and hit.collidepoint(mouse_pos):
             self.dragging = True
             self.value = self._to_value(mouse_pos[0])
@@ -202,6 +203,131 @@ class SegmentedControl:
                 self.index = i
                 return True
         return False
+
+
+def _clipboard_text() -> str:
+    try:
+        return pygame.scrap.get_text() or ""
+    except Exception:
+        return ""
+
+
+class TextInput:
+    """單行輸入框:打字、方向鍵、Backspace / Delete、Home / End、Ctrl+V 貼上,Enter 或 Esc 結束輸入。"""
+
+    def __init__(self, text="", placeholder="", accent=theme.ACCENT, size=15):
+        self.text = text
+        self.placeholder = placeholder
+        self.accent = accent
+        self.size = size
+        self.cursor = len(text)
+        self.focused = False
+        self.error = False
+        self.rect = pygame.Rect(0, 0, 0, 0)
+        self._offset = 0
+
+    def set_text(self, text):
+        self.text = text
+        self.cursor = len(text)
+
+    def blur(self):
+        if self.focused:
+            self.focused = False
+            pygame.key.stop_text_input()
+
+    def _focus(self):
+        if not self.focused:
+            self.focused = True
+            pygame.key.start_text_input()
+            pygame.key.set_text_input_rect(self.rect)
+
+    def _index_at(self, x):
+        font = theme.font(self.size)
+        target = x - (self.rect.x + 10) + self._offset
+        for i in range(1, len(self.text) + 1):
+            left = font.size(self.text[:i - 1])[0]
+            right = font.size(self.text[:i])[0]
+            if target < (left + right) / 2:
+                return i - 1
+        return len(self.text)
+
+    def _insert(self, value):
+        self.text = self.text[:self.cursor] + value + self.text[self.cursor:]
+        self.cursor += len(value)
+
+    def handle(self, event, mouse_pos) -> bool:
+        """回傳 True 代表文字內容有改變。"""
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.rect.collidepoint(mouse_pos):
+                self._focus()
+                self.cursor = self._index_at(mouse_pos[0])
+            else:
+                self.blur()
+            return False
+        if not self.focused:
+            return False
+
+        if event.type == pygame.TEXTINPUT:
+            self._insert(event.text)
+            return True
+        if event.type != pygame.KEYDOWN:
+            return False
+
+        if event.key == pygame.K_BACKSPACE and self.cursor > 0:
+            self.text = self.text[:self.cursor - 1] + self.text[self.cursor:]
+            self.cursor -= 1
+            return True
+        if event.key == pygame.K_DELETE and self.cursor < len(self.text):
+            self.text = self.text[:self.cursor] + self.text[self.cursor + 1:]
+            return True
+        if event.key == pygame.K_v and event.mod & pygame.KMOD_CTRL:
+            pasted = _clipboard_text().replace("\r", " ").replace("\n", " ")
+            if pasted:
+                self._insert(pasted)
+                return True
+        elif event.key == pygame.K_LEFT:
+            self.cursor = max(0, self.cursor - 1)
+        elif event.key == pygame.K_RIGHT:
+            self.cursor = min(len(self.text), self.cursor + 1)
+        elif event.key == pygame.K_HOME:
+            self.cursor = 0
+        elif event.key == pygame.K_END:
+            self.cursor = len(self.text)
+        elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_ESCAPE):
+            self.blur()
+        return False
+
+    def draw(self, surface, rect, mouse_pos):
+        self.rect = rect
+        if self.error:
+            edge = theme.DANGER
+        elif self.focused:
+            edge = self.accent
+        else:
+            edge = theme.TEXT_FAINT if rect.collidepoint(mouse_pos) else theme.PANEL_EDGE
+        rounded_panel(surface, rect, theme.BG_DEEP, radius=8, alpha=220, border=edge)
+
+        font = theme.font(self.size)
+        inner = rect.inflate(-20, 0)
+        cursor_x = font.size(self.text[:self.cursor])[0]
+        if cursor_x - self._offset > inner.width - 2:
+            self._offset = cursor_x - inner.width + 2
+        elif cursor_x < self._offset:
+            self._offset = cursor_x
+        self._offset = max(0, min(self._offset, max(0, font.size(self.text)[0] - inner.width + 2)))
+
+        previous_clip = surface.get_clip()
+        surface.set_clip(inner.clip(previous_clip))
+        if self.text:
+            image = font.render(self.text, True, theme.TEXT)
+            surface.blit(image, (inner.x - self._offset, rect.centery - image.get_height() // 2))
+        elif not self.focused and self.placeholder:
+            image = font.render(self.placeholder, True, theme.TEXT_FAINT)
+            surface.blit(image, (inner.x, rect.centery - image.get_height() // 2))
+        if self.focused and (pygame.time.get_ticks() // 530) % 2 == 0:
+            x = inner.x + cursor_x - self._offset
+            pygame.draw.line(surface, self.accent, (x, rect.centery - 9), (x, rect.centery + 9), 2)
+        surface.set_clip(previous_clip)
 
 
 class ProgressBar:

@@ -39,6 +39,10 @@ class Page:
     def update(self):
         pass
 
+    def deactivate(self):
+        """離開這個畫面或被浮動視窗蓋住時呼叫,用來結束進行中的拖曳、自動捲動與文字輸入。"""
+        pass
+
     def draw_toolbar(self, rect, mouse_pos):
         pass
 

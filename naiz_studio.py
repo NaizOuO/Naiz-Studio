@@ -2,15 +2,26 @@
 """Naiz Studio - 本地工具包:首頁、插件載入與共用介面。"""
 
 import math
+import os
 import platform
 import sys
 import time
 from pathlib import Path
 
+# SDL 預設會丟掉「讓視窗變成作用中」的那一下點擊。從檔案總管拖檔進來後作用中的是檔案總管,
+# 不加這行的話,拖完檔第一次點選檔案、輸入框或頁面都會沒反應
+os.environ.setdefault("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1")
+
 if platform.system() == "Windows":
+    import ctypes
+
     try:
-        import ctypes
         ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+    try:
+        # 沒設定的話,用 pythonw 啟動時工作列會顯示 Python 的圖示,而不是視窗自己的圖示
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("NaizOuO.NaizStudio")
     except Exception:
         pass
 
@@ -119,6 +130,10 @@ class App:
         stored["dev_mode"] = enabled
         theme.save_config(str(paths.APP_DIR), stored)
         self.reload_tools()
+
+    def deactivate_page(self):
+        if self.current and self.current.id in self.pages:
+            self.pages[self.current.id].deactivate()
 
     def open_tool(self, tool):
         if tool.id not in self.pages:
@@ -251,12 +266,15 @@ class App:
 
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if self.title_rect.inflate(12, 12).collidepoint(mouse_pos):
+                self.deactivate_page()
                 self.register_title_click()
                 return True
             if self.gear_rect.collidepoint(mouse_pos):
+                self.deactivate_page()
                 self.settings.open()
                 return True
             if self.current and self.btn_home.clicked(mouse_pos, True):
+                self.deactivate_page()
                 self.current = None
                 return True
             if self.current is None:
@@ -269,13 +287,20 @@ class App:
             self.pages[self.current.id].handle_event(event, mouse_pos)
         return True
 
+    def process_events(self, events):
+        for event in events:
+            # 用事件本身記錄的位置。觸控板輕點、觸控螢幕時游標是直接跳過去的,
+            # 若用這一幀開頭讀到的滑鼠位置,換新目標的第一下會落在舊位置上而失效
+            pos = getattr(event, "pos", None) or pygame.mouse.get_pos()
+            if not self.handle_event(event, pos):
+                return False
+        return True
+
     def run(self):
         running = True
         while running:
+            running = self.process_events(pygame.event.get())
             mouse_pos = pygame.mouse.get_pos()
-            for event in pygame.event.get():
-                if not self.handle_event(event, mouse_pos):
-                    running = False
             if self.current:
                 self.pages[self.current.id].update()
             self.draw_frame(mouse_pos)
