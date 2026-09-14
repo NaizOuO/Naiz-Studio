@@ -21,7 +21,7 @@ OUTPUT_NOTES = {
     "txt": "沒有時間軸的純文字,方便閱讀與複製",
 }
 SPEAKER_OPTIONS = [("off", "不區分"), ("0", "自動"), ("2", "2 人"), ("3", "3 人"), ("4", "4 人"), ("5", "5 人")]
-SPEAKER_NOTES = {"off": "只轉成文字,不標示是誰說的", "0": "自動判斷人數,長錄音容易多算,建議直接指定"}
+SPEAKER_NOTES = {"off": "只轉成文字,不標示是誰說的", "0": "自動判斷人數,聲音相近時可能判錯"}
 SPEAKER_NOTES.update({value: "已知人數時選這個,結果最準" for value, _ in SPEAKER_OPTIONS[2:]})
 STATUS_TEXT = {"waiting": "等待中", "running": "", "done": "完成", "error": "失敗", "cancelled": "已取消"}
 
