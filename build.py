@@ -1,7 +1,7 @@
 """用 PyInstaller 打包成單一 exe,並整理成可以直接上傳 Release 的資料夾與 zip。
 
 用法:python build.py v1.8.0
-產出:dist/Naiz Studio/(exe、images、README.md)與 dist/Naiz Studio v1.8.0.zip
+產出:dist/Naiz Studio/(exe、images、README.md、LICENSE)與 dist/Naiz Studio v1.8.0.zip
 """
 
 import shutil
@@ -68,8 +68,10 @@ def main():
     # 圖示和介面圖片是從 exe 旁邊的 images 資料夾讀取的
     for image in ui_images():
         shutil.copy2(image, release / "images" / image.name)
-    if (ROOT / "README.md").is_file():
-        shutil.copy2(ROOT / "README.md", release / "README.md")
+    # 授權檔也放進去,下載 exe 的人才看得到授權
+    for name in ("README.md", "LICENSE"):
+        if (ROOT / name).is_file():
+            shutil.copy2(ROOT / name, release / name)
 
     archive = dist / (f"{NAME} {version}.zip" if version else f"{NAME}.zip")
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:

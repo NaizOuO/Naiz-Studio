@@ -91,6 +91,12 @@ python naiz_studio.py
 
 輸出時不會覆蓋原檔，同名時會自動加上編號。
 
+## 授權
+
+- **原始碼**：以 [MIT 授權](LICENSE) 釋出。可以自由使用、修改、再散佈（包含商業用途），只需要保留版權聲明與授權文字。
+- **Releases 提供的 exe**：內含 GPL 授權的元件（pillow-heif 附帶的 x265），因此 exe 整體依 [GPL-3.0](https://www.gnu.org/licenses/gpl-3.0.html) 散佈，對應的原始碼就是本專案。
+- **需要時才下載的元件**（FFmpeg、Whisper 等）：是獨立的程式與模型，各自依照原本的授權使用，詳見下方清單。
+
 ## 使用的開源專案
 
 | 專案 | 用途 | 授權 |
@@ -100,7 +106,7 @@ python naiz_studio.py
 | [pikepdf](https://github.com/pikepdf/pikepdf) | PDF 壓縮、拆分、合併，圖片合成 PDF | MPL-2.0 |
 | [resvg](https://github.com/linebender/resvg)（[resvg-py](https://github.com/baseplate-admin/resvg-py)） | 讀取 SVG | Apache-2.0 / MIT |
 | [Pillow](https://github.com/python-pillow/Pillow) | 圖片處理 | MIT-CMU |
-| [pillow-heif](https://github.com/bigcat88/pillow_heif) | HEIC 讀寫 | BSD-3-Clause |
+| [pillow-heif](https://github.com/bigcat88/pillow_heif) | HEIC 讀寫 | BSD-3-Clause（附帶 libheif、libde265 為 LGPL-3.0，x265 為 GPL-2.0 以上） |
 | [vtracer](https://github.com/visioncortex/vtracer) | 圖片轉 SVG | MIT |
 | [OpenCC](https://github.com/yichen0831/opencc-python) | 繁簡轉換 | Apache-2.0 |
 | [FFmpeg](https://ffmpeg.org/)（[gyan.dev](https://www.gyan.dev/ffmpeg/builds/) 版本） | 讀取影音 | GPL-3.0 |
