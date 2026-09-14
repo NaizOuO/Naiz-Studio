@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pygame
 
-from core import paths, tasks, theme, widgets
+from core import large_files, paths, tasks, theme, widgets
+from core.files import free_path
 from core.plugins import Page
 from core.scroll import BAR_SPACE, ScrollView
 from core.widgets import (Button, ProgressBar, SegmentedControl, Slider, TextInput, Toggle,
@@ -243,7 +244,37 @@ class PdfPage(Page):
 
     # ------------------------------------------------------------ 任務
 
+    def large_rows(self):
+        """需要先提醒的大檔:[(名稱, 原因)]。"""
+        files = self.current_files
+        if self.tab == "merge":
+            why = large_files.reason(sum(item.size for item in files))
+            return [(f"合併 {len(files)} 個檔案", why)] if why else []
+        to_images = self.picking and self.s_output.value == "each" and self.s_format.value in ("png", "jpg")
+        rows = []
+        for item in files:
+            if self.picking and not item.selected:
+                continue
+            pixels, number = 0, 0
+            if to_images:
+                try:
+                    pixels, number = ops.largest_render(item.path, item.selected, int(self.s_dpi.value))
+                except Exception:
+                    pass
+            why = large_files.reason(item.size, int(pixels))
+            if why:
+                name = item.path.name
+                if pixels >= large_files.WARN_PIXELS:
+                    name += f"（第 {number} 頁轉成圖片）"
+                rows.append((name, why))
+        return rows
+
     def start_job(self):
+        if self.runner.running or not self.can_run():
+            return
+        self.app.large_files.confirm(self.large_rows(), self._start_job)
+
+    def _start_job(self):
         if self.runner.running or not self.can_run():
             return
         output_dir = paths.OUTPUT_DIR
@@ -263,7 +294,7 @@ class PdfPage(Page):
                 for index, item in enumerate(items, start=1):
                     if runner.cancel_event.is_set():
                         break
-                    out = output_dir / f"{item.path.stem}_compressed.pdf"
+                    out = free_path(output_dir, f"{item.path.stem}_compressed", ".pdf")
 
                     def progress(done, total, msg, i=index, name=item.path.name):
                         runner.report(done, max(1, total), f"[{i}/{len(items)}] {name} · {msg}")
@@ -336,12 +367,12 @@ class PdfPage(Page):
             items = list(self.current_files)
             do_compress = self.m_compress.value
             quality = int(self.m_quality.value)
-            out = output_dir / f"{items[0].path.stem}_merged.pdf"
 
             def job(runner):
                 def progress(done, total, msg):
                     runner.report(done, max(1, total), msg)
 
+                out = free_path(output_dir, f"{items[0].path.stem}_merged", ".pdf")
                 try:
                     info = ops.merge([i.path for i in items], out,
                                      compress_after=do_compress, quality=quality,

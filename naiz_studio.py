@@ -32,8 +32,9 @@ import pygame
 if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from core import paths, plugins, theme, widgets
+from core import paths, plugins, tempclean, theme, widgets
 from core.consent import ConsentDialog
+from core.large_files import LargeFileDialog
 from core.settings_panel import SettingsPanel
 from core.widgets import Button, draw_text, rounded_panel
 
@@ -81,6 +82,7 @@ class App:
 
         self.settings = SettingsPanel(self)
         self.consent = ConsentDialog(self)
+        self.large_files = LargeFileDialog(self)
         self.title_rect = pygame.Rect(0, 0, 0, 0)
         self.gear_rect = pygame.Rect(0, 0, 0, 0)
         self.title_clicks = []
@@ -94,6 +96,7 @@ class App:
         self.current = None
         self.card_rects = []
         self.reload_tools()
+        tempclean.start()   # 插件載入後才開始,插件登記的暫存資料夾才算得進去
 
     # ------------------------------------------------------------ 狀態
 
@@ -270,6 +273,9 @@ class App:
         if self.consent.is_open:
             widgets.mark_text_layer()
             self.consent.draw(mouse_pos)
+        if self.large_files.is_open:
+            widgets.mark_text_layer()
+            self.large_files.draw(mouse_pos)
         self._draw_copy_toast()
 
     def _draw_copy_toast(self):
@@ -307,6 +313,9 @@ class App:
             return True
 
         if self.dev_mode and self._copy_click(event, mouse_pos):
+            return True
+        if self.large_files.is_open:
+            self.large_files.handle_event(event, mouse_pos)
             return True
         if self.consent.is_open:
             self.consent.handle_event(event, mouse_pos)

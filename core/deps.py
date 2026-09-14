@@ -28,6 +28,25 @@ class ChecksumError(Exception):
     pass
 
 
+class DiskSpaceError(Exception):
+    pass
+
+
+DISK_FULL = 28      # errno ENOSPC;Windows 的「磁碟已滿」也會對應到這個值
+SPACE_MARGIN = 100 * 1024 * 1024
+
+
+def _check_space(dep, folder, total):
+    """下載檔和解出來的檔案會同時存在,至少要有兩倍大小再多留一點;不夠就在下載前停下來。"""
+    if not total:
+        return
+    need = total * 2 + SPACE_MARGIN
+    free = shutil.disk_usage(folder).free
+    if free < need:
+        raise DiskSpaceError(f"磁碟空間不足：下載 {dep.name} 約需要 {human_size(need)}，"
+                             f"目前只剩 {human_size(free)}，請先清出空間再重試")
+
+
 def human_size(num_bytes: int) -> str:
     size = float(num_bytes)
     for unit in ("B", "KB", "MB", "GB"):
@@ -192,20 +211,22 @@ def install(dep: Dependency, progress=None, cancel=None):
     try:
         request = urllib.request.Request(dep.url, headers={"User-Agent": "NaizStudio"})
         digest = hashlib.sha256()
-        with urllib.request.urlopen(request, timeout=60) as response, open(download, "wb") as fp:
+        with urllib.request.urlopen(request, timeout=60) as response:
             total = int(response.headers.get("Content-Length") or 0)
-            done = 0
-            while True:
-                if cancel is not None and cancel.is_set():
-                    raise Cancelled()
-                chunk = response.read(256 * 1024)
-                if not chunk:
-                    break
-                fp.write(chunk)
-                digest.update(chunk)
-                done += len(chunk)
-                if progress:
-                    progress(done, total)
+            _check_space(dep, base, total)
+            with open(download, "wb") as fp:
+                done = 0
+                while True:
+                    if cancel is not None and cancel.is_set():
+                        raise Cancelled()
+                    chunk = response.read(256 * 1024)
+                    if not chunk:
+                        break
+                    fp.write(chunk)
+                    digest.update(chunk)
+                    done += len(chunk)
+                    if progress:
+                        progress(done, total)
 
         if expected is not None and digest.hexdigest() != expected:
             raise ChecksumError(f"下載的 {dep.name} 驗證失敗(SHA-256 不符)，已刪除，請重試")
@@ -214,11 +235,14 @@ def install(dep: Dependency, progress=None, cancel=None):
             _extract_folder(dep, download)
         else:
             _extract_files(dep, download)
-    except BaseException:
+    except BaseException as exc:
         if dep.folder:
             shutil.rmtree(base / f".{dep.folder}.part", ignore_errors=True)
         for target in dep.files:
             (base / target).with_name((base / target).name + ".part").unlink(missing_ok=True)
+        if isinstance(exc, OSError) and exc.errno == DISK_FULL:
+            # 伺服器沒給檔案大小、或解壓縮時才滿的情況
+            raise DiskSpaceError("磁碟空間不足，已停止下載並刪除未完成的檔案，請先清出空間再重試") from exc
         raise
     finally:
         download.unlink(missing_ok=True)

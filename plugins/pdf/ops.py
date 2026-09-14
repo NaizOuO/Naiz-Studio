@@ -10,6 +10,7 @@ from PIL import Image
 from pikepdf import Name, PdfImage
 
 from core import pdfium
+from core.files import atomic_path, free_names, free_path
 
 COMPRESS_MODES = {
     "lossless": "無損重打包",
@@ -165,9 +166,10 @@ def compress(input_path, output_path, *, mode="jpeg", quality=70, max_dim=2000,
     before = input_path.stat().st_size
     changed = 0
     unsuitable = 0
-    same_file = output_path.exists() and input_path.resolve() == output_path.resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with pikepdf.open(input_path, allow_overwriting_input=same_file) as pdf:
+    # 先寫暫存檔,原檔關閉後才換成正式檔名:中途取消或程式被關掉不會留下壞檔,輸出和輸入是同一個檔案也沒問題
+    with atomic_path(output_path) as temp, pikepdf.open(input_path) as pdf:
         total = len(pdf.pages)
 
         if not keep_bookmarks:
@@ -207,8 +209,7 @@ def compress(input_path, output_path, *, mode="jpeg", quality=70, max_dim=2000,
             pdf.remove_unreferenced_resources()
         except Exception:
             pass
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        pdf.save(output_path, compress_streams=True,
+        pdf.save(temp, compress_streams=True,
                  object_stream_mode=pikepdf.ObjectStreamMode.generate, linearize=False)
 
     after = output_path.stat().st_size
@@ -281,7 +282,8 @@ def _save_pages(src, indexes, out_path):
     try:
         for index in indexes:
             dst.pages.append(src.pages[index])
-        dst.save(out_path, compress_streams=True, object_stream_mode=pikepdf.ObjectStreamMode.generate)
+        with atomic_path(out_path) as temp:
+            dst.save(temp, compress_streams=True, object_stream_mode=pikepdf.ObjectStreamMode.generate)
     finally:
         dst.close()
 
@@ -294,15 +296,16 @@ def split(input_path, output_dir, *, weights, progress=None, cancel=None) -> dic
         ranges = plan_split(len(src.pages), weights)
         if not ranges:
             raise ValueError("頁數不足，無法照這個設定拆分")
-        files = []
-        for index, (start, count) in enumerate(ranges, start=1):
+        # 已經有同名檔案時整組加上編號,不覆蓋
+        outputs = free_names(output_dir, [f"{input_path.stem}_part{i}.pdf" for i in range(1, len(ranges) + 1)])
+        written = []
+        for index, ((start, count), out_path) in enumerate(zip(ranges, outputs), start=1):
             _check(cancel)
-            out_path = output_dir / f"{input_path.stem}_part{index}.pdf"
             _save_pages(src, range(start, start + count), out_path)
-            files.append(out_path)
+            written.append(out_path)
             _report(progress, index, len(ranges), f"{index}/{len(ranges)} 份")
 
-    return {"files": files, "count": len(files)}
+    return {"files": written, "count": len(written)}
 
 
 def extract_pages(input_path, output_dir, pages, *, combine=False, fmt="pdf", image_dpi=150,
@@ -326,21 +329,36 @@ def extract_pages(input_path, output_dir, pages, *, combine=False, fmt="pdf", im
         if combine:
             _check(cancel)
             _report(progress, 0, 1, f"合成 {len(pages)} 頁")
-            out_path = output_dir / f"{stem}_selected.pdf"
+            out_path = free_path(output_dir, f"{stem}_selected", ".pdf")
             _save_pages(src, [n - 1 for n in pages], out_path)
             _report(progress, 1, 1, "完成")
             return {"files": [out_path], "count": 1}
 
         width = len(str(total))
-        files = []
-        for index, number in enumerate(pages, start=1):
+        outputs = free_names(output_dir, [f"{stem}_p{number:0{width}d}.pdf" for number in pages])
+        written = []
+        for index, (number, out_path) in enumerate(zip(pages, outputs), start=1):
             _check(cancel)
-            out_path = output_dir / f"{stem}_p{number:0{width}d}.pdf"
             _save_pages(src, [number - 1], out_path)
-            files.append(out_path)
+            written.append(out_path)
             _report(progress, index, len(pages), f"第 {number} 頁 ({index}/{len(pages)})")
 
-    return {"files": files, "count": len(files)}
+    return {"files": written, "count": len(written)}
+
+
+def largest_render(input_path, pages, dpi):
+    """把這些頁(從 1 起算)輸出成圖片時,像素最多的那一頁:回傳 (像素數, 頁碼)。"""
+    doc = pdfium.open_document(input_path)
+    try:
+        total = pdfium.page_count(doc)
+        best = (0, 0)
+        for number in pages:
+            if 1 <= number <= total:
+                width, height = pdfium.page_size(doc, number - 1)
+                best = max(best, (width * dpi / 72 * height * dpi / 72, number))
+        return best
+    finally:
+        pdfium.close(doc)
 
 
 def _pages_to_images(input_path, output_dir, stem, pages, fmt, dpi, progress, cancel):
@@ -350,20 +368,21 @@ def _pages_to_images(input_path, output_dir, stem, pages, fmt, dpi, progress, ca
         if pages[-1] > total:
             raise ValueError(f"第 {pages[-1]} 頁超出範圍，這份只有 {total} 頁")
         width = len(str(total))
-        files = []
-        for index, number in enumerate(pages, start=1):
+        outputs = free_names(output_dir, [f"{stem}_p{number:0{width}d}.{fmt}" for number in pages])
+        written = []
+        for index, (number, out_path) in enumerate(zip(pages, outputs), start=1):
             _check(cancel)
             image = pdfium.render(doc, number - 1, dpi / 72)
-            out_path = output_dir / f"{stem}_p{number:0{width}d}.{fmt}"
-            if fmt == "jpg":
-                image.save(out_path, "JPEG", quality=85)
-            else:
-                image.save(out_path, "PNG")
-            files.append(out_path)
+            with atomic_path(out_path) as temp:
+                if fmt == "jpg":
+                    image.save(temp, "JPEG", quality=85)
+                else:
+                    image.save(temp, "PNG")
+            written.append(out_path)
             _report(progress, index, len(pages), f"第 {number} 頁 ({index}/{len(pages)})")
     finally:
         pdfium.close(doc)
-    return {"files": files, "count": len(files)}
+    return {"files": written, "count": len(written)}
 
 
 # ---------------------------------------------------------------- 合併
@@ -378,23 +397,26 @@ def merge(input_paths, output_path, *, compress_after=False, quality=70, max_dim
     merged = pikepdf.Pdf.new()
     pages = 0
     try:
-        for index, path in enumerate(paths, start=1):
-            _check(cancel)
-            with pikepdf.open(path) as src:
-                merged.pages.extend(src.pages)
-                pages += len(src.pages)
-            _report(progress, index, len(paths), f"併入 {path.name}")
+        # 合併、壓縮都做完才換成正式檔名
+        with atomic_path(output_path) as staging:
+            for index, path in enumerate(paths, start=1):
+                _check(cancel)
+                with pikepdf.open(path) as src:
+                    merged.pages.extend(src.pages)
+                    pages += len(src.pages)
+                _report(progress, index, len(paths), f"併入 {path.name}")
 
-        _report(progress, len(paths), len(paths), "寫入檔案中")
-        merged.save(output_path, compress_streams=True,
-                    object_stream_mode=pikepdf.ObjectStreamMode.generate)
+            _report(progress, len(paths), len(paths), "寫入檔案中")
+            merged.save(staging, compress_streams=True,
+                        object_stream_mode=pikepdf.ObjectStreamMode.generate)
+            merged.close()
+
+            if compress_after:
+                _report(progress, len(paths), len(paths), "壓縮中")
+                compress(staging, staging, mode="jpeg", quality=quality, max_dim=max_dim,
+                         progress=progress, cancel=cancel)
     finally:
         merged.close()
-
-    if compress_after:
-        _report(progress, len(paths), len(paths), "壓縮中")
-        compress(output_path, output_path, mode="jpeg", quality=quality, max_dim=max_dim,
-                 progress=progress, cancel=cancel)
 
     after = output_path.stat().st_size
     return {"before": before, "after": after, "pages": pages}

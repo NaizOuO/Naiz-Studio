@@ -2,8 +2,8 @@
 
 import pygame
 
-from . import paths, theme, widgets
-from .widgets import Button, SegmentedControl, Slider, draw_text, rounded_panel
+from . import large_files, paths, theme, widgets
+from .widgets import Button, SegmentedControl, Slider, Toggle, draw_text, rounded_panel
 
 MODE_NOTES = {
     "cover": "保持比例放大到填滿，裁掉超出的部分",
@@ -20,7 +20,7 @@ class SettingsPanel:
         self.app = app
         self.is_open = False
         self.dirty = False
-        self.saved_at = 0
+        self.saved_at = None    # 還沒儲存過;不能用 0,剛開程式時 get_ticks 也小於提示顯示的時間
         self.bg_files = []
         self.bg_index = 0
         self.bg_scroll = 0
@@ -32,6 +32,7 @@ class SettingsPanel:
         self.pos_x = Slider(0, 100, 50, accent=theme.ACCENT)
         self.pos_y = Slider(0, 100, 50, accent=theme.ACCENT)
         self.scale = Slider(10, 300, 100, step=5, accent=theme.ACCENT)
+        self.large_warning = Toggle(True, accent=theme.ACCENT)
         self.btn_save = Button("儲存", accent=theme.ACCENT)
         self.btn_revert = Button("還原", filled=False, size=14)
         self.rect = pygame.Rect(0, 0, 0, 0)
@@ -61,6 +62,7 @@ class SettingsPanel:
         self.pos_x.value = int(spot.get("x", 50))
         self.pos_y.value = int(spot.get("y", 50))
         self.scale.value = int(self.config["bg_manual"].get("scale", 100))
+        self.large_warning.value = bool(self.config.get(large_files.CONFIG_KEY, True))
         self.bg_scroll = 0
         self.dirty = False
         self.is_open = True
@@ -71,7 +73,9 @@ class SettingsPanel:
         mode = self.mode.value
         changed = (chosen != self.config.get("bg_image")
                    or mode != self.config.get("bg_mode")
-                   or int(self.alpha.value) != int(self.config.get("bg_alpha", 90)))
+                   or int(self.alpha.value) != int(self.config.get("bg_alpha", 90))
+                   or self.large_warning.value != bool(self.config.get(large_files.CONFIG_KEY, True)))
+        self.config[large_files.CONFIG_KEY] = self.large_warning.value
 
         if chosen != self.config.get("bg_image"):
             self.config["bg_image"] = chosen
@@ -121,7 +125,7 @@ class SettingsPanel:
             if row.collidepoint(mouse_pos):
                 self.bg_index = index
                 return
-        if self.mode.clicked(mouse_pos, True):
+        if self.mode.clicked(mouse_pos, True) or self.large_warning.clicked(mouse_pos, True):
             return
         if self.btn_save.clicked(mouse_pos, True):
             self.save()
@@ -146,7 +150,7 @@ class SettingsPanel:
         self.rect = panel
         rounded_panel(screen, panel, theme.PANEL, radius=14, alpha=250, border=theme.PANEL_EDGE)
 
-        draw_text(screen, "背景設定", (panel.x + 22, panel.y + 18), 17, theme.TEXT, bold=True)
+        draw_text(screen, "設定", (panel.x + 22, panel.y + 18), 17, theme.TEXT, bold=True)
         close = pygame.Rect(panel.right - 44, panel.y + 14, 28, 28)
         self.close_rect = close
         if self.app.dev_mode:
@@ -194,6 +198,15 @@ class SettingsPanel:
             y += 28
         self.sliders = [row[0] for row in rows]
 
+        pygame.draw.line(screen, theme.PANEL_EDGE, (x, y), (panel.right - 22, y))
+        y += 12
+        draw_text(screen, "大檔警告", (x, y + 2), 14, theme.TEXT)
+        # 說明文字固定不變;關閉警告時改成橘色,提醒目前處理大檔前不會先確認
+        draw_text(screen, "處理很大的檔案前，先提醒可能佔用大量記憶體", (x, y + 22), 12,
+                  theme.TEXT_FAINT if self.large_warning.value else theme.WARN)
+        self.large_warning.draw(screen, (panel.right - 22 - 42, y + 8), mouse_pos)
+        y += 50
+
         rows = [("快捷鍵", theme.TEXT_DIM, (("F11", "切換全螢幕"), ("Esc", "關閉這個視窗")))]
         if self.app.dev_mode:
             # 只有開發者模式看得到的操作說明
@@ -216,7 +229,7 @@ class SettingsPanel:
         foot_y = panel.bottom - 56
         if self.dirty:
             draw_text(screen, "有尚未儲存的變更", (x, foot_y + 12), 12, theme.WARN)
-        elif pygame.time.get_ticks() - self.saved_at < 2500:
+        elif self.saved_at is not None and pygame.time.get_ticks() - self.saved_at < 2500:
             draw_text(screen, "已儲存到 config.json", (x, foot_y + 12), 12, theme.ACCENT)
         else:
             draw_text(screen, "調整後即時預覽，關閉不會自動儲存", (x, foot_y + 12), 12, theme.TEXT_FAINT)

@@ -2,11 +2,18 @@
 
 import io
 import math
+import re
 import zlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
+
+from core import large_files
+from core.files import free_path, write_bytes
+
+# Pillow 預設超過約 1.8 億像素就直接報錯、不讓處理。大圖改成處理前跳提醒,讓使用者自己決定要不要繼續
+Image.MAX_IMAGE_PIXELS = None
 
 try:
     import pillow_heif
@@ -27,6 +34,8 @@ ANIMATED_FORMATS = {"gif", "webp"}
 ICO_SIZES = (16, 24, 32, 48, 64, 128, 256)
 SVG_MAX_SIDE = 2000   # 描邊的時間隨像素數暴增;SVG 本身可以任意放大,先縮小再描不會損失尺寸
 PDF_DPI = 96
+FRAME_BUDGET = 256 * 1024 * 1024   # 編輯視窗播放動畫時,所有格子加起來最多用多少記憶體
+MIN_FRAME_SIDE = 240
 HIGH_QUALITY = 92     # 沒開壓縮品質時,非 JPG 原圖改存有損格式所用的品質
 A4 = (595, 842)
 ORIENTATION = 0x0112
@@ -181,16 +190,57 @@ def target_format(path, fmt):
     return "png" if source == "svg" else source
 
 
-def free_path(folder: Path, stem: str, ext: str) -> Path:
-    """不覆蓋既有檔案:同名時加上 (2)、(3)。"""
-    out, number = folder / f"{stem}{ext}", 2
-    while out.exists():
-        out = folder / f"{stem} ({number}){ext}"
-        number += 1
-    return out
-
-
 # ------------------------------------------------------------ 讀取
+
+_SVG_TAG = re.compile(r"<svg\b[^>]*>", re.IGNORECASE)
+_SVG_LENGTH = re.compile(r"\s*([0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\s*(px|em|%)?\s*")
+
+
+def _svg_attr(tag, name):
+    match = re.search(rf"\s{name}\s*=\s*[\"']([^\"']*)[\"']", tag)
+    return match.group(1) if match else None
+
+
+def svg_size(text):
+    """不畫出來,從 <svg> 標籤的 width、height、viewBox 算出 resvg 會畫出的大小;算不出來時回傳 None。"""
+    tag = _SVG_TAG.search(text)
+    if not tag:
+        return None
+    tag = tag.group(0)
+    box = None
+    numbers = re.split(r"[\s,]+", (_svg_attr(tag, "viewBox") or "").strip())
+    if len(numbers) == 4:
+        try:
+            box = (float(numbers[2]), float(numbers[3]))
+        except ValueError:
+            box = None
+        if box and (box[0] <= 0 or box[1] <= 0):
+            box = None
+    dims = []
+    for index, name in enumerate(("width", "height")):
+        raw = _svg_attr(tag, name)
+        match = _SVG_LENGTH.fullmatch(raw) if raw is not None else None
+        if raw is not None and not match:
+            return None     # mm、pt 之類的單位,resvg 也畫不出來
+        if match is None:
+            dims.append(None)
+        elif match.group(2) == "%":
+            dims.append(box[index] * float(match.group(1)) / 100 if box else None)
+        else:
+            dims.append(float(match.group(1)) * (16 if match.group(2) == "em" else 1))
+    width, height = dims
+    if width is None or height is None:
+        if not box:
+            return None
+        if width is None and height is None:
+            width, height = box
+        elif width is None:
+            width = height * box[0] / box[1]
+        else:
+            height = width * box[1] / box[0]
+    if width <= 0 or height <= 0:
+        return None
+    return max(1, round(width)), max(1, round(height))
 
 
 def _render_svg(text, folder, zoom=None):
@@ -210,6 +260,9 @@ def open_image(path, svg_side=None):
     source = source_format(path)
     if source == "svg":
         text = data.decode("utf-8-sig", "replace")
+        size = svg_size(text)
+        if svg_side and size:
+            return _render_svg(text, path.parent, svg_side / max(size))   # 直接畫成要的大小,不用先畫一次原尺寸
         image = _render_svg(text, path.parent)
         if svg_side and max(image.size) != svg_side:
             image = _render_svg(text, path.parent, svg_side / max(image.size))
@@ -219,8 +272,22 @@ def open_image(path, svg_side=None):
     return Image.open(io.BytesIO(data))
 
 
+def _probe_svg(path, thumb_box):
+    text = path.read_bytes().decode("utf-8-sig", "replace")
+    size = svg_size(text)
+    # 知道大小時直接畫成縮圖大小,很大的 SVG 加入清單時也不用畫出整張
+    thumb = _render_svg(text, path.parent, max(thumb_box) * 2 / max(size) if size else None)
+    size = size or thumb.size
+    thumb.thumbnail(thumb_box, Image.Resampling.LANCZOS)
+    return {"format": LABELS["svg"], "size": size, "frames": 1, "thumb": (thumb.size, thumb.tobytes())}
+
+
 def probe(path, thumb_box):
-    """清單要顯示的資訊:格式、尺寸(轉正後)、動畫格數,以及 RGBA 縮圖。"""
+    """清單要顯示的資訊:格式、尺寸(轉正後)、動畫格數,以及 RGBA 縮圖。
+    很大的圖不做縮圖(thumb 是 None):加入清單時就整張解開會用掉大量記憶體,等使用者看過提醒再處理。"""
+    path = Path(path)
+    if source_format(path) == "svg":
+        return _probe_svg(path, thumb_box)
     image = open_image(path)
     frames = getattr(image, "n_frames", 1)
     width, height = image.size
@@ -228,11 +295,13 @@ def probe(path, thumb_box):
         width, height = height, width
     if image.format == "JPEG":
         image.draft("RGB", (thumb_box[0] * 2, thumb_box[1] * 2))   # 大張 JPG 直接用低解析度解碼,快很多
-    shown = ImageOps.exif_transpose(image) if frames == 1 else image
-    thumb = shown.convert("RGBA")
-    thumb.thumbnail(thumb_box, Image.Resampling.LANCZOS)
+    thumb = None
+    if image.width * image.height < large_files.WARN_PIXELS:
+        shown = ImageOps.exif_transpose(image) if frames == 1 else image
+        thumb = shown.convert("RGBA")
+        thumb.thumbnail(thumb_box, Image.Resampling.LANCZOS)
     return {"format": LABELS.get(source_format(path), "?"), "size": (width, height), "frames": frames,
-            "thumb": (thumb.size, thumb.tobytes())}
+            "thumb": (thumb.size, thumb.tobytes()) if thumb else None}
 
 
 # ------------------------------------------------------------ 處理
@@ -266,13 +335,23 @@ def load_view(path, auto_rotate, side):
     return image, full
 
 
-def load_frames(path, side):
-    """編輯視窗播放動畫用:每一格(RGBA,縮到 side 以內)和顯示的毫秒數。"""
+def load_frames(path, side, budget=FRAME_BUDGET):
+    """編輯視窗播放動畫用:每一格(RGBA,縮到 side 以內)和顯示的毫秒數。
+    所有格子都要留在記憶體裡,總量控制在 budget 以內:格數多時先把每格縮小(最小 MIN_FRAME_SIDE),
+    還是放不下就只讀前面的格子。"""
     image = open_image(path)
-    frames = []
+    count = getattr(image, "n_frames", 1)
+    per_frame = budget / max(1, count) / 4
+    fit = int(max(image.size) * math.sqrt(per_frame / max(1, image.width * image.height)))
+    side = max(MIN_FRAME_SIDE, min(side, fit))
+    frames, used = [], 0
     for frame in ImageSequence.Iterator(image):
         picture = frame.convert("RGBA")
         picture.thumbnail((side, side), Image.Resampling.LANCZOS)
+        cost = picture.width * picture.height * 4
+        if frames and used + cost > budget:
+            break
+        used += cost
         frames.append((picture, frame.info.get("duration", image.info.get("duration", 100)) or 100))
     return frames
 
@@ -411,7 +490,7 @@ def convert(path, folder: Path, s: Settings, edit=None):
         return out, ""
 
     if target == "svg" and source_format(path) == "svg" and not edited:
-        out.write_bytes(path.read_bytes())   # 已經是向量圖,重新描邊只會變差
+        write_bytes(out, path.read_bytes())   # 已經是向量圖,重新描邊只會變差
         return out, "SVG 保持原樣"
 
     image = open_image(path, s.side)
@@ -434,7 +513,7 @@ def convert(path, folder: Path, s: Settings, edit=None):
         tables = _jpeg_tables(image, s)
         image, exif = _prepare(image, s, edit)
         data = encode(image, target, s, exif, tables)
-    out.write_bytes(data)
+    write_bytes(out, data)
     return out, note
 
 
@@ -447,7 +526,7 @@ def _split_frames(path, image, target, folder, s, edit):
         picture = _fit(apply_edit(frame.convert("RGBA"), edit), s.side)
         picture.info = {}
         name = f"{path.stem}_{index:0{digits}d}{SAVE_EXT[target]}"
-        (out / name).write_bytes(encode(picture, target, s))
+        write_bytes(out / name, encode(picture, target, s))
     return out, f"拆成 {image.n_frames} 張"
 
 
@@ -457,7 +536,10 @@ def _smallest_side(paths, s, edits):
     for path, edit in zip(paths, edits):
         try:
             if source_format(path) == "svg":
-                size = open_image(path, s.side).size
+                size = svg_size(Path(path).read_bytes().decode("utf-8-sig", "replace")) or open_image(path).size
+                if s.side:   # 限制尺寸時 SVG 會直接畫成最長邊等於設定值(小圖也會放大)
+                    scale = s.side / max(size)
+                    size = (max(1, round(size[0] * scale)), max(1, round(size[1] * scale)))
             else:
                 with Image.open(path) as image:
                     size = image.size
@@ -535,7 +617,7 @@ def images_to_pdf(paths, out: Path, s: Settings, on_image=None, cancel=None, edi
         out.parent.mkdir(parents=True, exist_ok=True)
         buf = io.BytesIO()
         doc.save(buf)
-        out.write_bytes(buf.getvalue())
+        write_bytes(out, buf.getvalue())
     finally:
         doc.close()
     return failed

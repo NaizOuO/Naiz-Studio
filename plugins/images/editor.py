@@ -724,8 +724,13 @@ class ImageEditor:
             pygame.draw.line(screen, theme.PANEL_EDGE, (canvas.x + 12, bar_y), (canvas.right - 12, bar_y))
             self.btn_play.label = "暫停" if self.playing else "播放"
             self.btn_play.draw(screen, pygame.Rect(canvas.x + 14, bar_y + 8, 80, 34), mouse_pos)
-            draw_text(screen, f"第 {self.frame_index + 1} / {len(self.frames)} 格", (canvas.x + 108, bar_y + 16),
-                      13, theme.TEXT_DIM)
+            label = draw_text(screen, f"第 {self.frame_index + 1} / {len(self.frames)} 格",
+                              (canvas.x + 108, bar_y + 16), 13, theme.TEXT_DIM)
+            total = getattr(self.item, "frames", 0)
+            if len(self.frames) < total:
+                # 格數太多時只把前面的格子讀進記憶體預覽;輸出時每一格都會處理
+                draw_text(screen, f"動畫共 {total} 格，只預覽前 {len(self.frames)} 格，輸出不受影響",
+                          (label.right + 14, bar_y + 17), 12, theme.TEXT_FAINT)
 
     def _draw_fine(self, screen, mouse_pos):
         """四格各自放大裁切框的一個角;拖曳某個角時其他格的畫面不跟著移動,看得出框線在動。"""

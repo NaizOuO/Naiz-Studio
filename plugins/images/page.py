@@ -8,7 +8,7 @@ from pathlib import Path
 import pygame
 from PIL import Image
 
-from core import deps, paths, theme, widgets
+from core import deps, large_files, paths, theme, widgets
 from core.plugins import Page
 from core.scroll import BAR_SPACE, ScrollView
 from core.widgets import Button, ChoiceGrid, SegmentedControl, Slider, Toggle, draw_text, rounded_panel
@@ -198,12 +198,37 @@ class ImagePage(Page):
             except Exception as exc:
                 item.info = ops.describe_error(exc)
 
+    def large_rows(self, items, s=None):
+        """需要先提醒的大檔:[(檔名, 原因)]。s 是轉換設定;沒給時是打開編輯視窗。"""
+        rows = []
+        for item in items:
+            pixels = 0
+            if isinstance(item.info, dict):
+                width, height = item.info["size"]
+                if s is not None and s.side and ops.source_format(item.path) == "svg":
+                    scale = s.side / max(width, height)   # 限制尺寸時 SVG 直接畫成設定的大小
+                    width, height = width * scale, height * scale
+                pixels = width * height
+                target = ops.target_format(item.path, s.fmt) if s is not None else ""
+                if s is not None and item.frames > 1 and s.fmt != "pdf" and target in ops.ANIMATED_FORMATS:
+                    pixels *= item.frames   # 轉成動畫時每一格都要留在記憶體裡
+            why = large_files.reason(item.size, int(pixels))
+            if why:
+                rows.append((item.path.name, why))
+        return rows
+
     def start(self):
         if self.running or not self.items:
             return
         settings = self.settings()
         with self._lock:
             items = list(self.items)
+        self.app.large_files.confirm(self.large_rows(items, settings), lambda: self._begin(settings, items))
+
+    def _begin(self, settings, items):
+        if self.running:
+            return
+        with self._lock:
             for item in items:
                 item.status, item.message, item.out_size = "waiting", "", 0
         self.notice = ""
@@ -270,7 +295,9 @@ class ImagePage(Page):
         item.thumb = None   # 重新產生縮圖,顯示編輯後的樣子
 
     def open_editor(self, item):
-        self.editor.open(item, lambda: list(self.items), self.auto_rotate.value, self._edited)
+        self.app.large_files.confirm(
+            self.large_rows([item]),
+            lambda: self.editor.open(item, lambda: list(self.items), self.auto_rotate.value, self._edited))
 
     def modal_open(self):
         return self.editor.is_open
@@ -356,13 +383,15 @@ class ImagePage(Page):
             box = pygame.Rect(row.x + 8, row.centery - THUMB // 2, THUMB, THUMB)
             rounded_panel(screen, box, theme.PANEL, radius=6)
             editable = isinstance(item.info, dict)
-            if item.thumb is None and editable:
+            if item.thumb is None and editable and item.info["thumb"] is not None:
                 size, data = item.info["thumb"]
                 image = ops.apply_edit(Image.frombytes("RGBA", size, data), item.edit)
                 image.thumbnail((THUMB, THUMB))
                 item.thumb = pygame.image.frombytes(image.tobytes(), image.size, "RGBA")
             if item.thumb is not None:
                 screen.blit(item.thumb, item.thumb.get_rect(center=box.center))
+            elif editable:
+                draw_text(screen, "大圖", box.center, 12, theme.TEXT_FAINT, center=True)   # 太大不做縮圖
             else:
                 draw_text(screen, "?" if isinstance(item.info, str) else "...", box.center, 13, theme.TEXT_FAINT,
                           center=True)

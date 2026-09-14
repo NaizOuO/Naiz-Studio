@@ -3,8 +3,12 @@
 import json
 import os
 import platform
+import shutil
+from pathlib import Path
 
 import pygame
+
+from . import files
 
 BG_DEEP = (22, 25, 32)
 PANEL = (33, 38, 48)
@@ -73,6 +77,9 @@ DEFAULT_CONFIG = {
     "bg_manual說明": "manual 模式專用：x/y 同上，scale 為縮放百分比(100 = 原始大小)",
     "bg_manual": {"x": 50, "y": 50, "scale": 100},
 
+    "large_file_warning說明": "處理很大的檔案前先跳出提醒；false 為不提醒",
+    "large_file_warning": True,
+
     "dev_mode": False,
 }
 
@@ -80,13 +87,20 @@ DEFAULT_CONFIG = {
 def load_config(base_dir: str) -> dict:
     path = os.path.join(base_dir, "config.json")
     if not os.path.exists(path):
-        with open(path, "w", encoding="utf-8") as fp:
-            json.dump(DEFAULT_CONFIG, fp, indent=4, ensure_ascii=False)
+        save_config(base_dir, DEFAULT_CONFIG)
         return dict(DEFAULT_CONFIG)
     try:
         with open(path, "r", encoding="utf-8") as fp:
             user = json.load(fp)
-    except Exception:
+        if not isinstance(user, dict):
+            raise ValueError("config.json 的內容不是設定")
+    except ValueError:
+        # 內容壞掉(例如手動編輯打錯):之後存檔會用預設值蓋掉,所以先把原檔備份起來,
+        # 修正錯字規則之類的資料才救得回來。備份成功後寫回預設值,下次讀取就不會再備份一次
+        if _backup_broken_config(base_dir, path):
+            save_config(base_dir, DEFAULT_CONFIG)
+        return dict(DEFAULT_CONFIG)
+    except OSError:
         return dict(DEFAULT_CONFIG)
 
     config = {**DEFAULT_CONFIG, **user}
@@ -101,10 +115,20 @@ def load_config(base_dir: str) -> dict:
     return config
 
 
-def save_config(base_dir: str, config: dict) -> bool:
+def _backup_broken_config(base_dir: str, path: str) -> bool:
     try:
-        with open(os.path.join(base_dir, "config.json"), "w", encoding="utf-8") as fp:
-            json.dump(config, fp, indent=4, ensure_ascii=False)
+        shutil.copy2(path, files.free_path(Path(base_dir), "config.bak", ".json"))
+        return True
+    except OSError:
+        return False
+
+
+def save_config(base_dir: str, config: dict) -> bool:
+    # 先寫暫存檔再換掉原檔:寫到一半程式被關掉或磁碟滿了,原本的 config.json 也不會被寫壞
+    try:
+        with files.atomic_path(Path(base_dir) / "config.json") as temp:
+            with open(temp, "w", encoding="utf-8") as fp:
+                json.dump(config, fp, indent=4, ensure_ascii=False)
         return True
     except Exception:
         return False
