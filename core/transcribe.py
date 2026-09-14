@@ -18,7 +18,7 @@ import threading
 from functools import cache
 from pathlib import Path
 
-from . import deps, paths
+from . import deps, diarize, paths
 
 WHISPER_TAG = "b5130"
 _RELEASE = f"https://github.com/ggml-org/whisper.cpp/releases/download/{WHISPER_TAG}"
@@ -114,22 +114,63 @@ def engine():
     return WHISPER_CUDA if has_nvidia() else WHISPER_CPU
 
 
-def required(model_key):
-    """這個模型需要的所有元件(含 FFmpeg),呼叫端篩出未安裝的交給同意視窗。"""
-    return [deps.FFMPEG, engine(), MODELS[model_key], VAD]
+def required(model_key, speakers=None):
+    """需要的所有元件(含 FFmpeg),呼叫端篩出未安裝的交給同意視窗。speakers 不是 None 時包含說話者分離。"""
+    items = [deps.FFMPEG, engine(), MODELS[model_key], VAD]
+    return items + diarize.DEPS if speakers is not None else items
+
+
+_SPEAKER = re.compile(r"^(說話者|说话者) (\d+):")
+_SRT_TIME = re.compile(r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)")
 
 
 def srt_to_text(content: str) -> str:
-    """去掉時間軸,連續重複的行也一併去除。"""
+    """去掉時間軸,連續重複的行也一併去除;有標示說話者時,同一人連續說的話放在同一段。"""
     lines = []
+    current = None
     for block in re.split(r"\r?\n\s*\r?\n", content):
         for raw in block.splitlines():
             text = re.sub(r"<[^>]+>", "", raw).strip()
             if not text or text.isdigit() or "-->" in text:
                 continue
-            if not lines or lines[-1] != text:
+            match = _SPEAKER.match(text)
+            if match:
+                label = match.group(0)[:-1]
+                text = text[match.end():].strip()
+                if label != current:
+                    if lines:
+                        lines.append("")
+                    lines.append(f"{label}:")
+                    current = label
+            if text and (not lines or lines[-1] != text):
                 lines.append(text)
     return "\n".join(lines)
+
+
+def label_speakers(srt: str, segments) -> str:
+    """依時間重疊把每句字幕標上「說話者 N:」,編號照第一次出現的順序。"""
+    if not segments:
+        return srt
+    order = {}
+    blocks = []
+    for block in re.split(r"\r?\n\s*\r?\n", srt.strip()):
+        lines = block.splitlines()
+        index = next((i for i, line in enumerate(lines) if _SRT_TIME.search(line)), None)
+        if index is None or index + 1 >= len(lines):
+            blocks.append(block)
+            continue
+        g = [int(x) for x in _SRT_TIME.search(lines[index]).groups()]
+        start = g[0] * 3600 + g[1] * 60 + g[2] + g[3] / 1000
+        end = g[4] * 3600 + g[5] * 60 + g[6] + g[7] / 1000
+        best = max(segments, key=lambda s: min(end, s[1]) - max(start, s[0]))
+        if min(end, best[1]) - max(start, best[0]) <= 0:
+            # 沒有重疊(例如分段模型漏掉很短的句子),改用時間最接近的一段
+            middle = (start + end) / 2
+            best = min(segments, key=lambda s: abs((s[0] + s[1]) / 2 - middle))
+        speaker = order.setdefault(best[2], len(order) + 1)
+        lines[index + 1] = f"說話者 {speaker}:{lines[index + 1]}"
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks) + "\n"
 
 
 def convert_script(text: str, script: str) -> str:
@@ -186,8 +227,10 @@ def _run(args, cancel, on_line=None, cwd=None):
     return code, log
 
 
-def transcribe(media_path, model_key="turbo", script="tw", language="zh", progress=None, cancel=None) -> str:
-    """把影片或音訊轉成 SRT 字幕文字。progress(比例或 None, 說明文字);cancel 是 threading.Event。"""
+def transcribe(media_path, model_key="turbo", script="tw", language="zh", progress=None, cancel=None,
+               speakers=None) -> str:
+    """把影片或音訊轉成 SRT 字幕文字。progress(比例或 None, 說明文字);cancel 是 threading.Event。
+    speakers:None 不區分說話者,0 自動判斷人數,其他數字為指定人數。"""
     report = progress or (lambda ratio, text: None)
     cancel = cancel or threading.Event()
     exe = engine().path()
@@ -219,7 +262,13 @@ def transcribe(media_path, model_key="turbo", script="tw", language="zh", progre
         if code != 0 or not srt.is_file():
             detail = next((l for l in reversed(log) if l.strip()), "")
             raise RuntimeError(f"語音辨識失敗 {detail[:120]}".strip())
+        content = srt.read_text(encoding="utf-8", errors="replace")
+        if speakers is not None:
+            report(None, "區分說話者")
+            segments = diarize.diarize(wav, speakers, cancel, progress=lambda r: report(r, "區分說話者"))
+            content = label_speakers(content, segments)
         report(1, "整理文字")
-        return convert_script(srt.read_text(encoding="utf-8", errors="replace"), script)
+        # 先標說話者再轉換,「說話者」三個字才會跟著轉成簡體
+        return convert_script(content, script)
     finally:
         shutil.rmtree(work, ignore_errors=True)

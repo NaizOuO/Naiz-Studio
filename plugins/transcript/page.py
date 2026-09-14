@@ -20,6 +20,9 @@ OUTPUT_NOTES = {
     "srt": "有時間軸的字幕檔,可以直接掛在影片上",
     "txt": "沒有時間軸的純文字,方便閱讀與複製",
 }
+SPEAKER_OPTIONS = [("off", "不區分"), ("0", "自動"), ("2", "2 人"), ("3", "3 人"), ("4", "4 人"), ("5", "5 人")]
+SPEAKER_NOTES = {"off": "只轉成文字,不標示是誰說的", "0": "自動判斷有幾個人,可能多算或少算"}
+SPEAKER_NOTES.update({value: "已知人數時選這個,結果最準" for value, _ in SPEAKER_OPTIONS[2:]})
 STATUS_TEXT = {"waiting": "等待中", "running": "", "done": "完成", "error": "失敗", "cancelled": "已取消"}
 
 
@@ -61,6 +64,7 @@ class TranscriptPage(Page):
         self.model = SegmentedControl(transcribe.MODEL_OPTIONS, index=1, accent=accent)
         self.script = SegmentedControl(transcribe.SCRIPT_OPTIONS, accent=accent)
         self.output = SegmentedControl(OUTPUTS, accent=accent)
+        self.speakers = SegmentedControl(SPEAKER_OPTIONS, accent=accent)
 
         self.list_view = ScrollView(accent=accent)
         self.list_area = pygame.Rect(0, 0, 0, 0)
@@ -102,13 +106,14 @@ class TranscriptPage(Page):
         if self.running or not self.count("waiting"):
             return
         model = self.model.value
-        missing = [dep for dep in transcribe.required(model) if not dep.installed()]
+        speakers = None if self.speakers.value == "off" else int(self.speakers.value)
+        missing = [dep for dep in transcribe.required(model, speakers) if not dep.installed()]
         if missing:
             self.app.consent.open(self.tool.name, missing, on_done=self.start)
             return
         self.notice = ""
         self.stop_event.clear()
-        settings = (model, self.script.value, self.output.value)
+        settings = (model, self.script.value, self.output.value, speakers)
         self.worker = threading.Thread(target=self._work, args=settings, daemon=True)
         self.worker.start()
 
@@ -118,7 +123,7 @@ class TranscriptPage(Page):
             if item.status == "running":
                 item.cancel_event.set()
 
-    def _work(self, model, script, output):
+    def _work(self, model, script, output, speakers):
         folder = output_dir()
         while not self.stop_event.is_set():
             with self._lock:
@@ -131,7 +136,7 @@ class TranscriptPage(Page):
                 item.ratio, item.phase = ratio, text
 
             try:
-                srt = transcribe.transcribe(item.path, model, script, progress=progress,
+                srt = transcribe.transcribe(item.path, model, script, progress=progress, speakers=speakers,
                                             cancel=item.cancel_event)
                 folder.mkdir(parents=True, exist_ok=True)
                 base = free_base(folder, item.path.stem)
@@ -246,13 +251,14 @@ class TranscriptPage(Page):
 
         for title, control, notes in (("辨識模型", self.model, transcribe.MODEL_NOTES),
                                       ("輸出文字", self.script, transcribe.SCRIPT_NOTES),
-                                      ("輸出檔案", self.output, OUTPUT_NOTES)):
+                                      ("輸出檔案", self.output, OUTPUT_NOTES),
+                                      ("區分說話者", self.speakers, SPEAKER_NOTES)):
             draw_text(screen, title, (x, y), 14, theme.TEXT_FAINT if locked else theme.TEXT)
             y += 22
             control.draw(screen, pygame.Rect(x, y, inner, 32), mouse_pos)
             y += 38
             draw_text(screen, widgets.clip_text(notes[control.value], 12, inner), (x, y), 12, theme.TEXT_FAINT)
-            y += 30
+            y += 26
 
         pygame.draw.line(screen, theme.PANEL_EDGE, (x, y), (rect.right - 18, y))
         y += 14
@@ -313,7 +319,7 @@ class TranscriptPage(Page):
                 self.items = [i for i in self.items if i.status in ("waiting", "running")]
             return
         if not self.running:
-            for control in (self.model, self.script, self.output):
+            for control in (self.model, self.script, self.output, self.speakers):
                 if control.clicked(mouse_pos, True):
                     return
 

@@ -8,6 +8,7 @@ import platform
 import re
 import shutil
 import subprocess
+import tarfile
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
@@ -60,13 +61,13 @@ def kill_tree(proc):
 class Dependency:
     """一個要下載的元件。
 
-    files: 安裝後的檔名(相對於 bin/ 或 models/)-> 若下載的是 zip,對應壓縮檔內路徑的結尾
+    files: 安裝後的檔名(相對於 bin/ 或 models/)-> 若下載的是壓縮檔(zip 或 tar.bz2),對應壓縮檔內路徑的結尾
            (例如 "bin/ffmpeg.exe");直接下載單一檔案時值填 None。
            有設定 folder 時,files 只用來判斷是否已安裝。
-    folder: 把整個 zip 解壓到這個子資料夾(自動去掉 zip 裡共同的最上層資料夾),適合需要一堆 DLL 的程式。
+    folder: 把整個壓縮檔解壓到這個子資料夾(自動去掉共同的最上層資料夾),適合需要一堆 DLL 的程式。
     location: "bin" 放執行檔,"models" 放模型。
     check_args: 安裝後用這些參數執行第一個檔案,回傳碼為 0 才算安裝成功。
-    sha256: 官方公布、固定版本的 SHA-256;有填就不再另外抓驗證檔。
+    sha256: 固定版本的 SHA-256;有填就不再另外抓驗證檔。
     sha256_url: 官方公布的 SHA-256 檔案;有填就會在安裝前驗證下載內容。
     sha256_name: 驗證檔若是「雜湊 檔名」清單,用這個檔名找對應的那一行。
     """
@@ -123,26 +124,63 @@ def fetch_expected_sha256(dep: Dependency) -> str:
     raise ChecksumError(f"找不到 {dep.name} 的官方驗證碼,為了安全已停止安裝")
 
 
+def _open_archive(archive_path):
+    """回傳 (壓縮檔物件, [(檔內路徑, 開啟函式)]),支援 zip 與 tar.bz2 / tar.gz。"""
+    if zipfile.is_zipfile(archive_path):
+        archive = zipfile.ZipFile(archive_path)
+        entries = [(info.filename.replace("\\", "/"), lambda info=info: archive.open(info))
+                   for info in archive.infolist() if not info.is_dir()]
+    else:
+        archive = tarfile.open(archive_path)
+        entries = [(member.name, lambda member=member: archive.extractfile(member))
+                   for member in archive.getmembers() if member.isfile()]
+    return archive, entries
+
+
 def _extract_folder(dep: Dependency, archive_path):
     destination = dep.base_dir / dep.folder
     staging = dep.base_dir / f".{dep.folder}.part"
     shutil.rmtree(staging, ignore_errors=True)
-    with zipfile.ZipFile(archive_path) as archive:
-        members = [m for m in archive.infolist() if not m.is_dir()]
-        names = [m.filename.replace("\\", "/") for m in members]
+    archive, entries = _open_archive(archive_path)
+    with archive:
+        names = [name for name, _ in entries]
         tops = {name.split("/", 1)[0] for name in names}
         strip = len(next(iter(tops))) + 1 if len(tops) == 1 and all("/" in n for n in names) else 0
         root = staging.resolve()
-        for member, name in zip(members, names):
+        for name, opener in entries:
             target = (staging / name[strip:]).resolve()
             # 防止壓縮檔裡用 ../ 把檔案寫到資料夾外面
             if root not in target.parents:
                 raise ValueError(f"下載的 {dep.name} 內容異常,已停止安裝")
             target.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(member) as src, open(target, "wb") as dst:
+            with opener() as src, open(target, "wb") as dst:
                 shutil.copyfileobj(src, dst)
     shutil.rmtree(destination, ignore_errors=True)
     staging.replace(destination)
+
+
+def _extract_files(dep: Dependency, download):
+    base = dep.base_dir
+    archive, entries = (None, [])
+    if any(suffix is not None for suffix in dep.files.values()):
+        archive, entries = _open_archive(download)
+    try:
+        for target, member_suffix in dep.files.items():
+            destination = base / target
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            partial = destination.with_name(destination.name + ".part")
+            if member_suffix is None:
+                shutil.copyfile(download, partial)
+            else:
+                opener = next((open_ for name, open_ in entries if name.endswith(member_suffix)), None)
+                if opener is None:
+                    raise ValueError(f"下載的 {dep.name} 裡找不到 {member_suffix}")
+                with opener() as src, open(partial, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+            partial.replace(destination)
+    finally:
+        if archive is not None:
+            archive.close()
 
 
 def install(dep: Dependency, progress=None, cancel=None):
@@ -175,20 +213,7 @@ def install(dep: Dependency, progress=None, cancel=None):
         if dep.folder:
             _extract_folder(dep, download)
         else:
-            for target, member_suffix in dep.files.items():
-                destination = base / target
-                partial = destination.with_name(destination.name + ".part")
-                if member_suffix is None:
-                    shutil.copyfile(download, partial)
-                else:
-                    with zipfile.ZipFile(download) as archive:
-                        member = next((n for n in archive.namelist()
-                                       if n.replace("\\", "/").endswith(member_suffix)), None)
-                        if member is None:
-                            raise ValueError(f"下載的 {dep.name} 裡找不到 {member_suffix}")
-                        with archive.open(member) as src, open(partial, "wb") as dst:
-                            shutil.copyfileobj(src, dst)
-                partial.replace(destination)
+            _extract_files(dep, download)
     except BaseException:
         if dep.folder:
             shutil.rmtree(base / f".{dep.folder}.part", ignore_errors=True)
