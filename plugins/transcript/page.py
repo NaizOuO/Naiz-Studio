@@ -70,7 +70,7 @@ class TranscriptPage(Page):
 
         self.list_view = ScrollView(accent=accent)
         self.list_area = pygame.Rect(0, 0, 0, 0)
-        self.settings_view = ScrollView(accent=accent)
+        self.settings_view = ScrollView(accent=accent, indicator=True)
         self.settings_area = pygame.Rect(0, 0, 0, 0)
         self.row_buttons = []
         self.btn_clear_done = Button("清除已結束", filled=False, size=13)
@@ -282,10 +282,9 @@ class TranscriptPage(Page):
         view = self.settings_view
         area = pygame.Rect(rect.x, rect.y + 45, rect.width, rect.height - 49)
         self.settings_area = area
-        pad = 8 if view.max_scroll else 0   # 出現捲動條時,內容往左讓出位置
         screen.set_clip(area)
-        bottom = self._draw_setting_rows(rect.x + 18, area.y + 15 - view.scroll, rect.width - 36 - pad,
-                                         rect.right - pad, mouse_pos)
+        bottom = self._draw_setting_rows(rect.x + 18, area.y + 15 - view.scroll, rect.width - 36,
+                                         rect.right, mouse_pos)
         screen.set_clip(None)
         view.layout(area, bottom + view.scroll - area.y + 8)
         view.draw(screen, mouse_pos)

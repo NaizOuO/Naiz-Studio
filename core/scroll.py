@@ -34,10 +34,12 @@ def _autoscroll_icon():
 
 
 class ScrollView:
-    def __init__(self, accent=theme.ACCENT, wheel_step=40, marquee=None):
+    def __init__(self, accent=theme.ACCENT, wheel_step=40, marquee=None, indicator=False):
         self.accent = accent
         self.wheel_step = wheel_step
         self.marquee = marquee
+        # 細線模式:捲動條只是提示下面還有內容,不能拖曳,也不佔內容寬度,出現或消失時版面不會移動
+        self.indicator = indicator
         self.rect = pygame.Rect(0, 0, 0, 0)
         self.content_h = 0
         self.max_scroll = 0
@@ -69,12 +71,17 @@ class ScrollView:
         """回傳 (軌道, 拖曳塊);內容沒超出範圍時兩者都是 None。"""
         if not self.max_scroll:
             return None, None
-        track = pygame.Rect(self.rect.right - 9, self.rect.y, 7, self.rect.height)
-        bar_h = min(track.height, max(36, int(self.rect.height * self.rect.height / max(1, self.content_h))))
+        if self.indicator:
+            track = pygame.Rect(self.rect.right - 5, self.rect.y + 4, 3, self.rect.height - 8)
+        else:
+            track = pygame.Rect(self.rect.right - 9, self.rect.y, 7, self.rect.height)
+        bar_h = min(track.height, max(36, int(track.height * self.rect.height / max(1, self.content_h))))
         top = track.y + round(self.scroll / self.max_scroll * (track.height - bar_h))
         return track, pygame.Rect(track.x, top, track.width, bar_h)
 
     def _bar_hit(self):
+        if self.indicator:
+            return pygame.Rect(0, 0, 0, 0)
         return pygame.Rect(self.rect.right - BAR_SPACE, self.rect.y, BAR_SPACE, self.rect.height)
 
     def _drag_bar_to(self, screen_y):

@@ -6,6 +6,7 @@ import threading
 from pathlib import Path
 
 import pygame
+from PIL import Image
 
 from core import deps, paths, theme, widgets
 from core.plugins import Page
@@ -13,6 +14,7 @@ from core.scroll import BAR_SPACE, ScrollView
 from core.widgets import Button, ChoiceGrid, SegmentedControl, Slider, Toggle, draw_text, rounded_panel
 
 from . import ops
+from .editor import ImageEditor
 
 ROW_H = 72
 THUMB = 50
@@ -63,6 +65,7 @@ class Item:
         self.message = ""
         self.target = ""
         self.out_size = 0
+        self.edit = ops.Edit()
 
     @property
     def frames(self):
@@ -77,6 +80,8 @@ class Item:
         text = f"{self.info['format']} · {width}×{height} · {deps.human_size(self.size)}"
         if self.frames > 1:
             text += f" · 動畫 {self.frames} 格"
+        if self.edit.active:
+            text += " · 已編輯"
         return text
 
     def result(self):
@@ -122,18 +127,22 @@ class ImagePage(Page):
         self.max_side = Slider(200, 8000, 2000, step=100, accent=accent)
         self.strip_meta = Toggle(True, accent=accent)
         self.auto_rotate = Toggle(True, accent=accent)
+        self.compress = Toggle(False, accent=accent)
+        self._unused_toggle = Toggle(False, accent=accent)   # 無損格式用不到壓縮品質時,畫一個灰色的佔位
+        self.split_frames = Toggle(False, accent=accent)
         self.controls = []   # 這一幀畫出來、可以點的設定
         self.sliders = []
 
         self.list_view = ScrollView(accent=accent)
         self.list_area = pygame.Rect(0, 0, 0, 0)
-        self.settings_view = ScrollView(accent=accent)
+        self.settings_view = ScrollView(accent=accent, indicator=True)
         self.settings_area = pygame.Rect(0, 0, 0, 0)
         self.row_buttons = []
         self.btn_clear = Button("清空清單", filled=False, size=13)
         self.btn_output = Button("輸出資料夾", filled=False, size=14)
         self.btn_cancel = Button("取消", accent=theme.DANGER, filled=False)
         self.btn_run = Button("開始轉換", accent=accent)
+        self.editor = ImageEditor(lambda: self.screen, accent)
 
     # ------------------------------------------------------------ 資料
 
@@ -153,7 +162,8 @@ class ImagePage(Page):
                             max_side=int(self.max_side.value), reduce_colors=self.reduce_colors.value,
                             strip_meta=self.strip_meta.value, auto_rotate=self.auto_rotate.value,
                             svg_color=self.svg_color.value, pdf_combine=self.pdf_output.value == "combine",
-                            pdf_page=self.pdf_page.value)
+                            pdf_page=self.pdf_page.value, compress=self.compress.value,
+                            split_frames=self.split_frames.value)
 
     def add_files(self, raw_paths):
         candidates, skipped = [], 0
@@ -199,22 +209,25 @@ class ImagePage(Page):
         self.notice = ""
         self.combined = None
         self.stop_event.clear()
-        self.worker = threading.Thread(target=self._work, args=(settings, items), daemon=True)
+        self.worker = threading.Thread(target=self._work, args=(settings, items, [item.edit.copy() for item in items]),
+                                       daemon=True)
         self.worker.start()
 
-    def _work(self, s, items):
+    def _work(self, s, items, edits):
         folder = output_dir()
         if s.fmt == "pdf" and s.pdf_combine:
-            self._work_combined(s, items, folder)
+            self._work_combined(s, items, edits, folder)
         else:
-            for item in items:
+            for item, edit in zip(items, edits):
                 if self.stop_event.is_set():
                     break
                 item.status = "running"
                 try:
-                    out, item.message = ops.convert(item.path, folder, s)
+                    out, item.message = ops.convert(item.path, folder, s, edit)
                     item.target = ops.LABELS[ops.target_format(item.path, s.fmt)]
-                    item.out_size = out.stat().st_size
+                    # 逐格拆開時輸出的是資料夾,大小算裡面所有圖片的合計
+                    item.out_size = (sum(f.stat().st_size for f in out.iterdir()) if out.is_dir()
+                                     else out.stat().st_size)
                     item.status = "done"
                 except Exception as exc:
                     item.message = ops.describe_error(exc)
@@ -223,7 +236,7 @@ class ImagePage(Page):
             if item.status in ("waiting", "running"):
                 item.status = "cancelled"
 
-    def _work_combined(self, s, items, folder):
+    def _work_combined(self, s, items, edits, folder):
         out = ops.free_path(folder, f"{items[0].path.stem}_merged", ".pdf")
 
         def on_image(index):
@@ -232,7 +245,8 @@ class ImagePage(Page):
             items[index].status = "running"
 
         try:
-            failed = ops.images_to_pdf([item.path for item in items], out, s, on_image, self.stop_event)
+            failed = ops.images_to_pdf([item.path for item in items], out, s, on_image, self.stop_event,
+                                        edits)
         except ops.Cancelled:
             return
         except Exception as exc:
@@ -252,6 +266,21 @@ class ImagePage(Page):
     def stop(self):
         self.stop_event.set()
 
+    def _edited(self, item):
+        item.thumb = None   # 重新產生縮圖,顯示編輯後的樣子
+
+    def open_editor(self, item):
+        self.editor.open(item, lambda: list(self.items), self.auto_rotate.value, self._edited)
+
+    def modal_open(self):
+        return self.editor.is_open
+
+    def draw_modal(self, mouse_pos):
+        self.editor.draw(mouse_pos)
+
+    def handle_modal_event(self, event, mouse_pos):
+        self.editor.handle_event(event, mouse_pos)
+
     def deactivate(self):
         self.list_view.reset()
         self.settings_view.reset()
@@ -262,6 +291,8 @@ class ImagePage(Page):
         mouse = pygame.mouse.get_pos()
         self.list_view.update(mouse)
         self.settings_view.update(mouse)
+        if self.editor.is_open:
+            self.editor.update()
 
     # ------------------------------------------------------------ 繪製
 
@@ -324,16 +355,20 @@ class ImagePage(Page):
 
             box = pygame.Rect(row.x + 8, row.centery - THUMB // 2, THUMB, THUMB)
             rounded_panel(screen, box, theme.PANEL, radius=6)
-            if item.thumb is None and isinstance(item.info, dict):
+            editable = isinstance(item.info, dict)
+            if item.thumb is None and editable:
                 size, data = item.info["thumb"]
-                item.thumb = pygame.image.frombytes(data, size, "RGBA")
+                image = ops.apply_edit(Image.frombytes("RGBA", size, data), item.edit)
+                image.thumbnail((THUMB, THUMB))
+                item.thumb = pygame.image.frombytes(image.tobytes(), image.size, "RGBA")
             if item.thumb is not None:
                 screen.blit(item.thumb, item.thumb.get_rect(center=box.center))
             else:
                 draw_text(screen, "?" if isinstance(item.info, str) else "...", box.center, 13, theme.TEXT_FAINT,
                           center=True)
 
-            buttons_w = 34 + (92 if ordering else 0) if not self.running else 0
+            shift = 56 if editable else 0
+            buttons_w = 34 + shift + (92 if ordering else 0) if not self.running else 0
             text_x = box.right + 12
             text_w = row.right - text_x - buttons_w - 10
             draw_text(screen, widgets.clip_text(item.path.name, 14, text_w, bold=True), (text_x, row.y + 11),
@@ -343,10 +378,19 @@ class ImagePage(Page):
 
             if self.running:
                 continue
+            if editable:
+                edit = pygame.Rect(row.right - 88, row.y + 8, 48, 26)
+                hovered = edit.collidepoint(mouse_pos)
+                rounded_panel(screen, edit, theme.PANEL_LIGHT if hovered else theme.PANEL, radius=6,
+                              border=accent if hovered else None)
+                draw_text(screen, "編輯", edit.center, 12, accent if hovered or item.edit.active else theme.TEXT_DIM,
+                          center=True)
+                self.row_buttons.append(("edit", item, edit))
             if ordering:
-                draw_text(screen, str(index + 1), (row.right - 116, row.y + 21), 13, accent, bold=True, center=True)
-                up = pygame.Rect(row.right - 96, row.y + 8, 26, 26)
-                down = pygame.Rect(row.right - 66, row.y + 8, 26, 26)
+                draw_text(screen, str(index + 1), (row.right - 116 - shift, row.y + 21), 13, accent, bold=True,
+                          center=True)
+                up = pygame.Rect(row.right - 96 - shift, row.y + 8, 26, 26)
+                down = pygame.Rect(row.right - 66 - shift, row.y + 8, 26, 26)
                 for button, symbol, enabled in ((up, "▲", index > 0), (down, "▼", index < len(items) - 1)):
                     hovered = button.collidepoint(mouse_pos) and enabled
                     rounded_panel(screen, button, theme.PANEL_LIGHT if hovered else theme.PANEL, radius=6)
@@ -373,10 +417,9 @@ class ImagePage(Page):
         view = self.settings_view
         area = pygame.Rect(rect.x, rect.y + 45, rect.width, rect.height - 49)
         self.settings_area = area
-        pad = 8 if view.max_scroll else 0   # 出現捲動條時,內容往左讓出位置
         screen.set_clip(area)
-        bottom = self._draw_setting_rows(rect.x + 18, area.y + 15 - view.scroll, rect.width - 36 - pad,
-                                         rect.right - pad, mouse_pos)
+        bottom = self._draw_setting_rows(rect.x + 18, area.y + 15 - view.scroll, rect.width - 36,
+                                         rect.right, mouse_pos)
         screen.set_clip(None)
         view.layout(area, bottom + view.scroll - area.y + 8)
         view.draw(screen, mouse_pos)
@@ -401,7 +444,7 @@ class ImagePage(Page):
 
     def _slider_row(self, title, value_text, slider, x, y, inner, right, mouse_pos, title_color):
         draw_text(self.screen, title, (x, y), 14, title_color)
-        draw_text(self.screen, value_text, (right - 18, y + 7), 13, self.tool.accent, right=True)
+        draw_text(self.screen, value_text, (right - 18, y + 7), 13, slider.accent, right=True)
         slider.draw(self.screen, pygame.Rect(x, y + 28, inner, 16), mouse_pos)
         self.sliders.append(slider)
         return y + 52
@@ -421,8 +464,9 @@ class ImagePage(Page):
         y = self._note(FORMAT_NOTES[fmt], x, y, inner)
         if fmt == "svg":
             y = self._note("照片轉出來會像色塊畫，檔案也可能比原圖大", x, y, inner, theme.WARN)
-        if fmt not in ("keep", "webp", "gif") and any(item.frames > 1 for item in self.items):
-            y = self._note("動畫圖片只會保留第一格；要保留動畫請選原格式、GIF 或 WebP", x, y, inner, theme.WARN)
+        animated = any(item.frames > 1 for item in self.items)
+        if fmt == "pdf" and animated:
+            y = self._note("動畫圖片只會放入第一格", x, y, inner, theme.WARN)
         y += 10
 
         if fmt == "pdf":
@@ -430,10 +474,20 @@ class ImagePage(Page):
             y = self._segment_row("頁面大小", self.pdf_page, PDF_PAGE_NOTES, x, y, inner, mouse_pos, title_color)
         if fmt == "svg":
             y = self._segment_row("描邊顏色", self.svg_color, SVG_NOTES, x, y, inner, mouse_pos, title_color)
+
+        # 壓縮品質每個格式都在同一個位置,切換格式時面板不會跳動;無損格式用不到,顯示成灰色
         if fmt in QUALITY_FORMATS:
-            y = self._slider_row("壓縮品質", str(int(self.quality.value)), self.quality, x, y, inner, right,
-                                 mouse_pos, title_color)
-            y = self._note(QUALITY_NOTES.get(fmt, "數字越小檔案越小；70~85 通常看不出差別"), x, y, inner) + 10
+            y = self._toggle_row("壓縮品質", "關閉時保持原圖品質；開啟後可自己調整品質", self.compress, x, y, inner,
+                                 right, mouse_pos, title_color)
+            if self.compress.value:
+                y = self._slider_row("品質", str(int(self.quality.value)), self.quality, x, y + 4, inner, right,
+                                     mouse_pos, title_color)
+                y = self._note(QUALITY_NOTES.get(fmt, "數字越小檔案越小；70~85 通常看不出差別"), x, y, inner)
+                y = self._note("品質 100 不代表原圖品質", x, y, inner) + 10
+        else:
+            y = self._toggle_row("壓縮品質", "這個格式是無損的，不需要壓縮品質", self._unused_toggle, x, y, inner,
+                                 right, mouse_pos, theme.TEXT_FAINT)
+            self.controls.remove(self._unused_toggle)
         if fmt in ("keep", "png"):
             y = self._toggle_row("PNG 減少顏色", "最多保留 256 色，檔案通常小一半以上；漸層可能出現顆粒",
                                  self.reduce_colors, x, y, inner, right, mouse_pos, title_color)
@@ -444,6 +498,9 @@ class ImagePage(Page):
             y = self._slider_row("最長邊", f"{int(self.max_side.value)} px", self.max_side, x, y + 4, inner, right,
                                  mouse_pos, title_color)
             y = self._note("只縮小不放大；SVG 會直接畫成這個大小", x, y, inner) + 10
+        if animated and fmt not in ("keep", "webp", "gif", "pdf"):
+            y = self._toggle_row("動畫逐格拆開", "每一格存成一張圖，放在「檔名_frames」資料夾；關閉時只保留第一格",
+                                 self.split_frames, x, y, inner, right, mouse_pos, title_color)
 
         pygame.draw.line(screen, theme.PANEL_EDGE, (x, y), (right - 18, y))
         y += 14
@@ -527,6 +584,9 @@ class ImagePage(Page):
             for action, item, rect in self.row_buttons:
                 if not rect.collidepoint(mouse_pos):
                     continue
+                if action == "edit":
+                    self.open_editor(item)
+                    return
                 with self._lock:
                     if item not in self.items:
                         return
