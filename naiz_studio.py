@@ -11,6 +11,8 @@ from pathlib import Path
 # SDL 預設會丟掉「讓視窗變成作用中」的那一下點擊。從檔案總管拖檔進來後作用中的是檔案總管,
 # 不加這行的話,拖完檔第一次點選檔案、輸入框或頁面都會沒反應
 os.environ.setdefault("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1")
+# 讓 Windows 顯示輸入法的選字清單;打注音時組字中的文字由輸入框自己畫出來
+os.environ.setdefault("SDL_IME_SHOW_UI", "1")
 
 if platform.system() == "Windows":
     import ctypes
@@ -229,15 +231,14 @@ class App:
                               alpha=232, border=tool.accent if hover else theme.PANEL_EDGE)
                 pygame.draw.rect(self.screen, tool.accent, (card.x + 18, card.y + 20, 4, 24), border_radius=2)
                 draw_text(self.screen, tool.name, (card.x + 32, card.y + 17), 18, theme.TEXT, bold=True)
-                draw_text(self.screen, widgets.clip_text(tool.description, 13, card_w - 36),
-                          (card.x + 18, card.y + 58), 13, theme.TEXT_DIM)
-                draw_text(self.screen, "開啟", (card.right - 18, card.bottom - 20), 12,
-                          tool.accent if hover else theme.TEXT_FAINT, right=True)
+                # 說明太長時換行,最多 3 行,不再截斷成看不到內容
+                for row, line in enumerate(widgets.wrap_text(tool.description, 13, card_w - 36, max_lines=3)):
+                    draw_text(self.screen, line, (card.x + 18, card.y + 54 + row * 19), 13, theme.TEXT_DIM)
 
             y += math.ceil(len(items) / columns) * (card_h + gap) + 20
 
         if self.load_errors:
-            draw_text(self.screen, f"有 {len(self.load_errors)} 個插件載入失敗,詳細內容已寫入 error.log",
+            draw_text(self.screen, f"有 {len(self.load_errors)} 個插件載入失敗，詳細內容已寫入 error.log",
                       (rect.x, rect.bottom - 18), 12, theme.WARN)
 
     def draw_frame(self, mouse_pos=(-100, -100)):
@@ -253,6 +254,9 @@ class App:
             self.draw_home(body.inflate(-64, -56), mouse_pos)
 
         self.draw_header(width, mouse_pos)
+        page = self.pages.get(self.current.id) if self.current else None
+        if page is not None and page.modal_open():
+            page.draw_modal(mouse_pos)
         if self.settings.is_open:
             self.settings.draw(mouse_pos)
         if self.consent.is_open:
@@ -282,6 +286,11 @@ class App:
             return True
         if self.settings.is_open:
             self.settings.handle_event(event, mouse_pos)
+            return True
+        page = self.pages.get(self.current.id) if self.current else None
+        if page is not None and page.modal_open():
+            # 頁面自己的彈出視窗開著時,事件只給視窗,標題列和頁面都不會被點到
+            page.handle_modal_event(event, mouse_pos)
             return True
 
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:

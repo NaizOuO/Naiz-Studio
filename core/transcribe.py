@@ -29,7 +29,7 @@ _MODELS_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
 WHISPER_CPU = deps.Dependency(
     id="whisper-cpu",
     name="Whisper 語音辨識",
-    purpose="在電腦上把語音轉成文字,不需要上傳",
+    purpose="在電腦上把語音轉成文字，不需要上傳",
     size_text="約 8 MB",
     url=f"{_RELEASE}/whisper-bin-x64.zip",
     files={"whisper-cpu/whisper-cli.exe": None},
@@ -41,7 +41,7 @@ WHISPER_CPU = deps.Dependency(
 WHISPER_CUDA = deps.Dependency(
     id="whisper-cuda",
     name="Whisper 語音辨識(NVIDIA 顯示卡版)",
-    purpose="在電腦上把語音轉成文字,用顯示卡加速",
+    purpose="在電腦上把語音轉成文字，用顯示卡加速",
     size_text="約 643 MB",
     url=f"{_RELEASE}/whisper-cublas-12.4.0-bin-x64.zip",
     files={"whisper-cuda/whisper-cli.exe": None},
@@ -53,7 +53,7 @@ WHISPER_CUDA = deps.Dependency(
 VAD = deps.Dependency(
     id="whisper-vad",
     name="人聲偵測模型",
-    purpose="跳過沒有人說話的片段,避免辨識出不存在的句子",
+    purpose="跳過沒有人說話的片段，避免辨識出不存在的句子",
     size_text="約 1 MB",
     url="https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin",
     files={"ggml-silero-v6.2.0.bin": None},
@@ -79,9 +79,9 @@ def _model(key, filename, size_text, sha256):
 MODEL_OPTIONS = [("base", "快速"), ("turbo", "推薦"), ("large", "最準確")]
 MODEL_LABELS = dict(MODEL_OPTIONS)
 MODEL_NOTES = {
-    "base": "檔案最小、速度最快,但錯字較多,適合先大概看內容",
-    "turbo": "準確又快,大多數情況選這個",
-    "large": "錯字最少,但速度約慢 3 倍、檔案約 3GB",
+    "base": "檔案最小、速度最快，但錯字較多，適合先大概看內容",
+    "turbo": "準確又快，大多數情況選這個",
+    "large": "錯字最少，但速度約慢 3 倍、檔案約 3GB",
 }
 MODELS = {
     "base": _model("base", "ggml-base.bin", "約 141 MB",
@@ -97,9 +97,9 @@ MODEL_DTW = {"base": "base", "turbo": "large.v3.turbo", "large": "large.v3"}
 # 輸出文字選項
 SCRIPT_OPTIONS = [("tw", "台灣繁體"), ("cn", "簡體"), ("none", "不轉換")]
 SCRIPT_NOTES = {
-    "tw": "轉成台灣用字,例如「軟體」「影片」",
+    "tw": "轉成台灣用字，例如「軟體」「影片」",
     "cn": "轉成簡體中文",
-    "none": "保留辨識原本的結果,可能繁簡混雜",
+    "none": "保留辨識原本的結果，可能繁簡混雜",
 }
 _OPENCC_CONFIG = {"tw": "s2twp", "cn": "t2s"}
 
@@ -223,6 +223,12 @@ def _speaker_at(t, segments):
     return min(segments, key=lambda s: min(abs(s[0] - t), abs(s[1] - t)))[2]
 
 
+def _text_weight(words):
+    """片段有多少內容:中文字每個算 1,英文或數字每個單字算 2。"""
+    text = "".join(piece for _, piece in words)
+    return len(re.findall(r"[一-鿿]", text)) + 2 * len(re.findall(r"[A-Za-z0-9]+", text))
+
+
 def _interval_at(t, voice, tolerance=0.15):
     index = bisect.bisect_right(voice, (t + tolerance, float("inf"))) - 1
     if index >= 0 and voice[index][1] + tolerance >= t:
@@ -244,14 +250,15 @@ def build_cues(lines, voice, segments=None):
                 groups[-1][1].append(word)
             else:
                 groups.append([speaker, [word]])
-        # 太零碎的片段(不到 2 個字)併回前一段,避免一個字就換人
+        # 太零碎的片段併回前一段,避免一句話中間被切成兩個人(例如「MOS / 最重要就是…」);
+        # 中文字算 1、英文單字算 2,不到 3 就併(和使用者標註比對後,碎條從 12 條降到 7 條)
         merged = []
         for speaker, group in groups:
-            if merged and len(re.sub(r"\W", "", "".join(w for _, w in group))) < 2:
+            if merged and _text_weight(group) < 3:
                 merged[-1][1].extend(group)
             else:
                 merged.append([speaker, group])
-        if len(merged) > 1 and len(re.sub(r"\W", "", "".join(w for _, w in merged[0][1]))) < 2:
+        if len(merged) > 1 and _text_weight(merged[0][1]) < 3:
             first = merged.pop(0)
             merged[0][1][:0] = first[1]
         for speaker, group in merged:

@@ -6,10 +6,10 @@ from . import paths, theme, widgets
 from .widgets import Button, SegmentedControl, Slider, draw_text, rounded_panel
 
 MODE_NOTES = {
-    "cover": "保持比例放大到填滿,裁掉超出的部分",
-    "contain": "保持比例完整顯示,邊緣可能留白",
-    "stretch": "拉滿整個視窗,比例會被扭曲",
-    "center": "維持原始大小,可調整擺放位置",
+    "cover": "保持比例放大到填滿，裁掉超出的部分",
+    "contain": "保持比例完整顯示，邊緣可能留白",
+    "stretch": "拉滿整個視窗，比例會被扭曲",
+    "center": "維持原始大小，可調整擺放位置",
     "tile": "以原始大小重複並排",
     "manual": "自由調整位置與縮放比例",
 }
@@ -211,7 +211,7 @@ class SettingsPanel:
         elif pygame.time.get_ticks() - self.saved_at < 2500:
             draw_text(screen, "已儲存到 config.json", (x, foot_y + 12), 12, theme.ACCENT)
         else:
-            draw_text(screen, "調整後即時預覽,關閉不會自動儲存", (x, foot_y + 12), 12, theme.TEXT_FAINT)
+            draw_text(screen, "調整後即時預覽，關閉不會自動儲存", (x, foot_y + 12), 12, theme.TEXT_FAINT)
 
         self.btn_revert.draw(screen, pygame.Rect(panel.right - 190, foot_y, 78, 34), mouse_pos)
         self.btn_save.draw(screen, pygame.Rect(panel.right - 104, foot_y, 82, 34), mouse_pos)

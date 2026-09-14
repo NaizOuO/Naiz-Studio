@@ -58,19 +58,19 @@ def font(size: int, bold: bool = False) -> pygame.font.Font:
 BG_MODES = ("cover", "contain", "stretch", "center", "tile", "manual")
 
 DEFAULT_CONFIG = {
-    "說明": "bg_image 放 images/ 資料夾裡的檔名;留空則使用純色背景",
+    "說明": "bg_image 放 images/ 資料夾裡的檔名；留空則使用純色背景",
     "bg_image": "",
     "bg_alpha": 90,
 
-    "bg_mode說明": "cover=覆蓋(保持比例,裁掉超出部分) / contain=完整顯示(保持比例,可能留白) / "
-                   "stretch=延展(拉滿視窗,會變形) / center=原始大小置中 / "
+    "bg_mode說明": "cover=覆蓋(保持比例，裁掉超出部分) / contain=完整顯示(保持比例，可能留白) / "
+                   "stretch=延展(拉滿視窗，會變形) / center=原始大小置中 / "
                    "tile=並排重複 / manual=自由調整",
     "bg_mode": "cover",
 
-    "bg_center說明": "center 模式專用:x/y 為 0-100,50 表示置中,0 靠左(上),100 靠右(下)",
+    "bg_center說明": "center 模式專用：x/y 為 0-100，50 表示置中，0 靠左(上)，100 靠右(下)",
     "bg_center": {"x": 50, "y": 50},
 
-    "bg_manual說明": "manual 模式專用:x/y 同上,scale 為縮放百分比(100 = 原始大小)",
+    "bg_manual說明": "manual 模式專用：x/y 同上，scale 為縮放百分比(100 = 原始大小)",
     "bg_manual": {"x": 50, "y": 50, "scale": 100},
 
     "dev_mode": False,

@@ -255,7 +255,7 @@ def parse_page_spec(text: str, total_pages: int) -> list:
         else:
             raise ValueError(f"看不懂「{part}」")
         if start < 1 or end > total_pages:
-            raise ValueError(f"「{part}」超出範圍,這份只有 {total_pages} 頁")
+            raise ValueError(f"「{part}」超出範圍，這份只有 {total_pages} 頁")
         pages.update(range(start, end + 1))
     return sorted(pages)
 
@@ -291,7 +291,7 @@ def split(input_path, output_dir, *, weights, progress=None, cancel=None) -> dic
     with pikepdf.open(input_path) as src:
         ranges = plan_split(len(src.pages), weights)
         if not ranges:
-            raise ValueError("頁數不足,無法照這個設定拆分")
+            raise ValueError("頁數不足，無法照這個設定拆分")
         files = []
         for index, (start, count) in enumerate(ranges, start=1):
             _check(cancel)
@@ -319,7 +319,7 @@ def extract_pages(input_path, output_dir, pages, *, combine=False, fmt="pdf", im
     with pikepdf.open(input_path) as src:
         total = len(src.pages)
         if pages[-1] > total:
-            raise ValueError(f"第 {pages[-1]} 頁超出範圍,這份只有 {total} 頁")
+            raise ValueError(f"第 {pages[-1]} 頁超出範圍，這份只有 {total} 頁")
 
         if combine:
             _check(cancel)
@@ -348,7 +348,7 @@ def _pages_to_images(input_path, output_dir, stem, pages, fmt, dpi, progress, ca
     try:
         total = doc.page_count
         if pages[-1] > total:
-            raise ValueError(f"第 {pages[-1]} 頁超出範圍,這份只有 {total} 頁")
+            raise ValueError(f"第 {pages[-1]} 頁超出範圍，這份只有 {total} 頁")
         width = len(str(total))
         files = []
         for index, number in enumerate(pages, start=1):

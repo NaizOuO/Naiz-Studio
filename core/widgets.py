@@ -38,6 +38,30 @@ def clip_text(text: str, size: int, max_width: int, bold: bool = False) -> str:
     return text + "..."
 
 
+def wrap_text(text: str, size: int, max_width: int, bold: bool = False, max_lines=None) -> list:
+    """依寬度自動換行;英文單字盡量不從中間切開,超過 max_lines 時最後一行結尾加上「...」。"""
+    f = theme.font(size, bold)
+    lines, current = [], ""
+    for ch in text:
+        if f.size(current + ch)[0] <= max_width:
+            current += ch
+            continue
+        cut = current.rfind(" ")
+        if ch.isascii() and ch.isalnum() and current[-1:].isascii() and current[-1:].isalnum() and cut > 0:
+            # 正在英文單字中間:退回上一個空白再換行
+            lines.append(current[:cut])
+            current = current[cut + 1:] + ch
+        else:
+            lines.append(current)
+            current = ch.lstrip()
+    if current:
+        lines.append(current)
+    if max_lines and len(lines) > max_lines:
+        rest = " ".join(lines[max_lines - 1:])
+        lines = lines[:max_lines - 1] + [clip_text(rest, size, max_width, bold)]
+    return lines
+
+
 class Button:
     def __init__(self, label, accent=theme.ACCENT, filled=True, size=16, icon=None):
         self.label = label
@@ -246,6 +270,9 @@ class TextInput:
         self._last_click_ms = -10000
         self._last_click_index = -1
         self._click_count = 0
+        self.composition = ""      # 輸入法組字中、還沒選字的文字(例如注音)
+        self.composition_cursor = 0
+        self._ime_rect = None
 
     # ------------------------------------------------------------ 狀態
 
@@ -267,6 +294,7 @@ class TextInput:
 
     def blur(self):
         self._dragging = False
+        self.composition = ""
         if self.focused:
             self.focused = False
             self.anchor = self.cursor
@@ -368,10 +396,19 @@ class TextInput:
         if not self.focused:
             return False
 
+        if event.type == pygame.TEXTEDITING:
+            # 輸入法組字中(注音還沒選字):先記下來畫在游標位置,選好字後才會送出 TEXTINPUT
+            self.composition = event.text
+            self.composition_cursor = max(0, min(len(event.text), getattr(event, "start", len(event.text))))
+            return False
         if event.type == pygame.TEXTINPUT:
+            self.composition = ""
             self._insert(event.text)
             return True
         if event.type != pygame.KEYDOWN:
+            return False
+        if self.composition:
+            # 組字中的 Backspace、方向鍵是給輸入法用的,不能拿來刪或移動已經打好的字
             return False
 
         ctrl = event.mod & pygame.KMOD_CTRL
@@ -439,32 +476,46 @@ class TextInput:
 
         font = theme.font(self.size)
         inner = rect.inflate(-20, 0)
-        cursor_x = font.size(self.text[:self.cursor])[0]
+        composing = self.focused and bool(self.composition)
+        shown = self.text[:self.cursor] + self.composition + self.text[self.cursor:] if composing else self.text
+        caret = self.cursor + (self.composition_cursor if composing else 0)
+        cursor_x = font.size(shown[:caret])[0]
         if cursor_x - self._offset > inner.width - 2:
             self._offset = cursor_x - inner.width + 2
         elif cursor_x < self._offset:
             self._offset = cursor_x
-        self._offset = max(0, min(self._offset, max(0, font.size(self.text)[0] - inner.width + 2)))
+        self._offset = max(0, min(self._offset, max(0, font.size(shown)[0] - inner.width + 2)))
 
         previous_clip = surface.get_clip()
         surface.set_clip(inner.clip(previous_clip))
         start, end = self.selection
-        if self.focused and start != end:
+        if self.focused and start != end and not composing:
             x1 = inner.x + font.size(self.text[:start])[0] - self._offset
             x2 = inner.x + font.size(self.text[:end])[0] - self._offset
             highlight = pygame.Surface((max(1, x2 - x1), rect.height - 12), pygame.SRCALPHA)
             highlight.fill((*self.accent, 90))
             surface.blit(highlight, (x1, rect.y + 6))
-        if self.text:
-            image = font.render(self.text, True, theme.TEXT)
+        if shown:
+            image = font.render(shown, True, theme.TEXT)
             surface.blit(image, (inner.x - self._offset, rect.centery - image.get_height() // 2))
         elif not self.focused and self.placeholder:
             image = font.render(self.placeholder, True, theme.TEXT_FAINT)
             surface.blit(image, (inner.x, rect.centery - image.get_height() // 2))
+        if composing:
+            # 組字中的文字加底線,和一般輸入法的顯示方式一樣
+            x1 = inner.x + font.size(self.text[:self.cursor])[0] - self._offset
+            x2 = x1 + font.size(self.composition)[0]
+            pygame.draw.line(surface, self.accent, (x1, rect.bottom - 8), (x2, rect.bottom - 8), 1)
         if self.focused and (pygame.time.get_ticks() // 530) % 2 == 0:
             x = inner.x + cursor_x - self._offset
             pygame.draw.line(surface, self.accent, (x, rect.centery - 9), (x, rect.centery + 9), 2)
         surface.set_clip(previous_clip)
+        if self.focused:
+            # 讓輸入法的選字清單出現在游標旁邊
+            ime_rect = pygame.Rect(inner.x + cursor_x - self._offset, rect.y, 1, rect.height)
+            if ime_rect != self._ime_rect:
+                self._ime_rect = ime_rect
+                pygame.key.set_text_input_rect(ime_rect)
 
 
 class ProgressBar:

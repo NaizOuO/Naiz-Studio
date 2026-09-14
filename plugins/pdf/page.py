@@ -283,7 +283,7 @@ class PdfPage(Page):
                         runner.log("已取消")
                         break
                     except Exception as exc:
-                        runner.log(f"{item.path.name}: 失敗 - {exc}")
+                        runner.log(f"{item.path.name}：失敗 - {exc}")
 
         elif self.tab == "split" and not self.picking:
             items = list(self.current_files)
@@ -300,12 +300,12 @@ class PdfPage(Page):
                     try:
                         info = ops.split(item.path, output_dir, weights=weights, progress=progress,
                                          cancel=runner.cancel_event)
-                        runner.log(f"{item.path.name}: 拆成 {info['count']} 份")
+                        runner.log(f"{item.path.name}：拆成 {info['count']} 份")
                     except ops.Cancelled:
                         runner.log("已取消")
                         break
                     except Exception as exc:
-                        runner.log(f"{item.path.name}: 失敗 - {exc}")
+                        runner.log(f"{item.path.name}：失敗 - {exc}")
 
         elif self.tab == "split":
             jobs = [(item.path, sorted(item.selected)) for item in self.current_files if item.selected]
@@ -325,12 +325,12 @@ class PdfPage(Page):
                         info = ops.extract_pages(path, output_dir, pages, combine=combine, fmt=fmt,
                                                  image_dpi=dpi, progress=progress,
                                                  cancel=runner.cancel_event)
-                        runner.log(f"{path.name}: 取出 {len(pages)} 頁,產生 {info['count']} 個檔案")
+                        runner.log(f"{path.name}：取出 {len(pages)} 頁，產生 {info['count']} 個檔案")
                     except ops.Cancelled:
                         runner.log("已取消")
                         break
                     except Exception as exc:
-                        runner.log(f"{path.name}: 失敗 - {exc}")
+                        runner.log(f"{path.name}：失敗 - {exc}")
 
         else:
             items = list(self.current_files)
@@ -346,7 +346,7 @@ class PdfPage(Page):
                     info = ops.merge([i.path for i in items], out,
                                      compress_after=do_compress, quality=quality,
                                      progress=progress, cancel=runner.cancel_event)
-                    runner.log(f"合併 {len(items)} 個檔案,共 {info['pages']} 頁")
+                    runner.log(f"合併 {len(items)} 個檔案，共 {info['pages']} 頁")
                     runner.log(f"{out.name}: {ops.human_size(info['after'])}")
                 except ops.Cancelled:
                     runner.log("已取消")
@@ -600,16 +600,16 @@ class PdfPage(Page):
         y += 44
 
         mode = self.c_mode.value
-        note = {"lossless": "只重新打包,畫質完全不變",
-                "jpeg": "DCT 傅立葉轉換,適合彩色圖片",
-                "jpeg2000": "小波轉換,比 JPEG 再小約 20%,但較慢",
-                "grayscale": "轉為灰階,彩圖會變黑白",
+        note = {"lossless": "只重新打包，畫質完全不變",
+                "jpeg": "DCT 傅立葉轉換，適合彩色圖片",
+                "jpeg2000": "小波轉換，比 JPEG 再小約 20%，但較慢",
+                "grayscale": "轉為灰階，彩圖會變黑白",
                 "bw": "CCITT G4 · 黑白掃描文件專用"}[mode]
         draw_text(self.screen, note, (rect.x + 18, y), 12,
                   theme.DANGER if mode == "bw" else theme.TEXT_FAINT)
         y += 20
         if mode == "bw":
-            draw_text(self.screen, "非黑白的圖會自動跳過,不會被破壞", (rect.x + 18, y), 12, theme.DANGER)
+            draw_text(self.screen, "非黑白的圖會自動跳過，不會被破壞", (rect.x + 18, y), 12, theme.DANGER)
             y += 20
         y += 6
 
@@ -698,7 +698,7 @@ class PdfPage(Page):
         if self.page_error:
             draw_text(self.screen, widgets.clip_text(self.page_error, 12, inner), (x, y), 12, theme.DANGER)
         else:
-            draw_text(self.screen, "用逗號分隔,連續的頁用 - 連接", (x, y), 12, theme.TEXT_FAINT)
+            draw_text(self.screen, "用逗號分隔，連續的頁用 - 連接", (x, y), 12, theme.TEXT_FAINT)
         y += 24
 
         half = (inner - 10) // 2
@@ -718,8 +718,8 @@ class PdfPage(Page):
             y = self.option_row(rect, y, "輸出格式")
             self.s_format.draw(self.screen, pygame.Rect(x, y, inner, 32), mouse_pos)
             y += 42
-            note = "建議 PDF:保留文字與向量,檔案更小" if self.s_format.value == "pdf" \
-                else "圖片會失去文字,且通常比 PDF 更大"
+            note = "建議 PDF：保留文字與向量，檔案更小" if self.s_format.value == "pdf" \
+                else "圖片會失去文字，且通常比 PDF 更大"
             draw_text(self.screen, note, (x, y), 12, theme.TEXT_FAINT)
             y += 22
             if self.s_format.value in ("png", "jpg"):
@@ -789,7 +789,7 @@ class PdfPage(Page):
         else:
             shown = self.result_lines or lines
             if error:
-                draw_text(self.screen, f"錯誤: {error}", (bar.x, bar.y + 2), 13, theme.DANGER)
+                draw_text(self.screen, f"錯誤：{error}", (bar.x, bar.y + 2), 13, theme.DANGER)
             elif shown:
                 for i, line in enumerate(shown[:3]):
                     draw_text(self.screen, widgets.clip_text(line, 13, bar.width), (bar.x, bar.y + i * 19), 13,
@@ -799,7 +799,7 @@ class PdfPage(Page):
                 if self.picking and self.current_files and not self.can_run():
                     status = "勾選或輸入要取出的頁面"
                 draw_text(self.screen, status, (bar.x, bar.y + 2), 13, theme.TEXT_DIM)
-                draw_text(self.screen, "輸出位置: output\\", (bar.x, bar.y + 22), 12, theme.TEXT_FAINT)
+                draw_text(self.screen, "輸出位置：output\\", (bar.x, bar.y + 22), 12, theme.TEXT_FAINT)
 
         side = pygame.Rect(rect.right - 238, rect.y + 18, 104, 38)
         if running:

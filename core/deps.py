@@ -100,7 +100,7 @@ class Dependency:
 FFMPEG = Dependency(
     id="ffmpeg",
     name="FFmpeg",
-    purpose="處理影片與音訊,例如合併影像和聲音、轉換格式",
+    purpose="處理影片與音訊，例如合併影像和聲音、轉換格式",
     size_text="約 106 MB",
     url="https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
     files={"ffmpeg.exe": "bin/ffmpeg.exe", "ffprobe.exe": "bin/ffprobe.exe"},
@@ -121,7 +121,7 @@ def fetch_expected_sha256(dep: Dependency) -> str:
         if dep.sha256_name and dep.sha256_name not in (token.lstrip("*") for token in line.split()):
             continue
         return match.group(0).lower()
-    raise ChecksumError(f"找不到 {dep.name} 的官方驗證碼,為了安全已停止安裝")
+    raise ChecksumError(f"找不到 {dep.name} 的官方驗證碼，為了安全已停止安裝")
 
 
 def _open_archive(archive_path):
@@ -151,7 +151,7 @@ def _extract_folder(dep: Dependency, archive_path):
             target = (staging / name[strip:]).resolve()
             # 防止壓縮檔裡用 ../ 把檔案寫到資料夾外面
             if root not in target.parents:
-                raise ValueError(f"下載的 {dep.name} 內容異常,已停止安裝")
+                raise ValueError(f"下載的 {dep.name} 內容異常，已停止安裝")
             target.parent.mkdir(parents=True, exist_ok=True)
             with opener() as src, open(target, "wb") as dst:
                 shutil.copyfileobj(src, dst)
@@ -208,7 +208,7 @@ def install(dep: Dependency, progress=None, cancel=None):
                     progress(done, total)
 
         if expected is not None and digest.hexdigest() != expected:
-            raise ChecksumError(f"下載的 {dep.name} 驗證失敗(SHA-256 不符),已刪除,請重試")
+            raise ChecksumError(f"下載的 {dep.name} 驗證失敗(SHA-256 不符)，已刪除，請重試")
 
         if dep.folder:
             _extract_folder(dep, download)
@@ -230,4 +230,4 @@ def install(dep: Dependency, progress=None, cancel=None):
                 shutil.rmtree(base / dep.folder, ignore_errors=True)
             for target in dep.files:
                 (base / target).unlink(missing_ok=True)
-            raise RuntimeError(f"{dep.name} 下載後無法執行,已移除,請重試")
+            raise RuntimeError(f"{dep.name} 下載後無法執行，已移除，請重試")

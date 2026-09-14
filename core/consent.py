@@ -81,9 +81,9 @@ class ConsentDialog:
             if error.startswith("Cancelled"):
                 self.error = "已取消下載"
             elif error.startswith("HTTPError"):
-                self.error = "下載來源暫時無法使用,請稍後再試"
+                self.error = "下載來源暫時無法使用，請稍後再試"
             elif "URLError" in error or "timed out" in error:
-                self.error = "無法連線,請確認網路後再試一次"
+                self.error = "無法連線，請確認網路後再試一次"
             else:
                 # 例外名稱對使用者沒有意義,只顯示後面的說明
                 self.error = error.split(": ", 1)[-1]
@@ -112,7 +112,7 @@ class ConsentDialog:
         y = panel.y + 20
         draw_text(screen, "需要下載額外元件", (x, y), 17, theme.TEXT, bold=True)
         y += 32
-        draw_text(screen, widgets.clip_text(f"使用「{self.name}」前,需要先下載以下元件", 13, inner),
+        draw_text(screen, widgets.clip_text(f"使用「{self.name}」前，需要先下載以下元件", 13, inner),
                   (x, y), 13, theme.TEXT_DIM)
         y += 30
 
@@ -128,7 +128,7 @@ class ConsentDialog:
                       12, theme.TEXT_DIM)
             y += ROW_H
 
-        draw_text(screen, "下載後放在程式資料夾內,之後不需要再下載", (x, y + 2), 12, theme.TEXT_FAINT)
+        draw_text(screen, "下載後放在程式資料夾內，之後不需要再下載", (x, y + 2), 12, theme.TEXT_FAINT)
         y += 28
 
         if self.phase == "downloading":

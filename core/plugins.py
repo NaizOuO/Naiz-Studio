@@ -35,6 +35,16 @@ class Page:
     def screen(self):
         return self.app.screen
 
+    # 頁面自己的彈出視窗(例如編輯規則):開著時主程式會把它畫在最上層,事件也只交給它
+    def modal_open(self):
+        return False
+
+    def draw_modal(self, mouse_pos):
+        pass
+
+    def handle_modal_event(self, event, mouse_pos):
+        pass
+
     def handle_event(self, event, mouse_pos):
         pass
 
