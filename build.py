@@ -12,7 +12,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 NAME = "Naiz Studio"
 # 插件是執行時才從資料夾讀入,PyInstaller 看不到它們用了哪些套件,要自己列出來
-EXTRA_IMPORTS = ["pymupdf", "pikepdf", "opencc", "pillow_heif", "vtracer", "queue"]
+EXTRA_IMPORTS = ["pypdfium2", "resvg_py", "pikepdf", "opencc", "pillow_heif", "vtracer", "queue"]
+# 已經不用的套件:開發環境裡可能還裝著,明確排除才不會被一起打包
+EXCLUDE = ["tkinter", "pymupdf", "fitz"]
 COLLECT = ["core", "PIL"]
 
 
@@ -36,8 +38,9 @@ def pyinstaller_args(script, name, windowed=True, workdir=None):
             "--icon", str(ROOT / "images" / "app_icon.ico"),
             "--paths", str(ROOT),
             # 插件原始檔要放進 exe,程式才能照資料夾載入(開發者插件不在這裡,不會被打包)
-            "--add-data", f"{ROOT / 'plugins'};plugins",
-            "--exclude-module", "tkinter"]
+            "--add-data", f"{ROOT / 'plugins'};plugins"]
+    for module in EXCLUDE:
+        args += ["--exclude-module", module]
     if windowed:
         args.append("--windowed")
     for module in plugin_modules() + EXTRA_IMPORTS:

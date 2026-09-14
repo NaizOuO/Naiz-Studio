@@ -2,6 +2,7 @@
 
 import io
 import math
+import zlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -192,19 +193,27 @@ def free_path(folder: Path, stem: str, ext: str) -> Path:
 # ------------------------------------------------------------ 讀取
 
 
+def _render_svg(text, folder, zoom=None):
+    import resvg_py
+
+    # 用字串搭配 resources_dir:SVG 裡用相對路徑引用的圖片才讀得到(直接給檔案路徑反而讀不到)
+    png = bytes(resvg_py.svg_to_bytes(svg_string=text, resources_dir=str(folder), zoom=zoom))
+    image = Image.open(io.BytesIO(png))
+    image.load()
+    return image.convert("RGBA")
+
+
 def open_image(path, svg_side=None):
-    """SVG 用 PyMuPDF 畫成點陣圖(svg_side 指定最長邊,沒指定時用原本大小)。"""
+    """SVG 用 resvg 畫成點陣圖(svg_side 指定最長邊,沒指定時用原本大小)。"""
     path = Path(path)
     data = path.read_bytes()   # 先讀進記憶體,處理時不會一直佔用原檔
     source = source_format(path)
     if source == "svg":
-        import pymupdf
-
-        with pymupdf.open(stream=data, filetype="svg") as doc:
-            page = doc[0]
-            zoom = svg_side / max(page.rect.width, page.rect.height, 1) if svg_side else 1.0
-            pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=True)
-            return Image.frombytes("RGBA", (pix.width, pix.height), pix.samples)
+        text = data.decode("utf-8-sig", "replace")
+        image = _render_svg(text, path.parent)
+        if svg_side and max(image.size) != svg_side:
+            image = _render_svg(text, path.parent, svg_side / max(image.size))
+        return image
     if source == "heic" and pillow_heif is None:
         raise RuntimeError("缺少讀取 HEIC 的元件")
     return Image.open(io.BytesIO(data))
@@ -461,12 +470,29 @@ def _smallest_side(paths, s, edits):
     return min(sides) if sides else None
 
 
+def _pdf_image(pdf, image, s, tables):
+    """把處理好的圖做成 PDF 裡的圖片:沒有透明用 JPG,有透明用無損壓縮再加上透明遮罩。"""
+    import pikepdf
+
+    name = pikepdf.Name
+    common = {"Type": name.XObject, "Subtype": name.Image, "Width": image.width, "Height": image.height,
+              "BitsPerComponent": 8}
+    if image.mode == "RGBA":
+        mask = pikepdf.Stream(pdf, zlib.compress(image.getchannel("A").tobytes()), ColorSpace=name.DeviceGray,
+                              Filter=name.FlateDecode, **common)
+        return pikepdf.Stream(pdf, zlib.compress(image.convert("RGB").tobytes()), ColorSpace=name.DeviceRGB,
+                              Filter=name.FlateDecode, SMask=mask, **common)
+    space = name.DeviceGray if image.mode == "L" else name.DeviceRGB
+    return pikepdf.Stream(pdf, encode(image, "jpg", s, tables=tables), ColorSpace=space, Filter=name.DCTDecode,
+                          **common)
+
+
 def images_to_pdf(paths, out: Path, s: Settings, on_image=None, cancel=None, edits=None):
     """依順序每張圖一頁合成 PDF;讀不了的圖會跳過。回傳 {第幾張: 錯誤訊息}。"""
-    import pymupdf
+    import pikepdf
 
     edits = list(edits) if edits is not None else [None] * len(paths)
-    doc = pymupdf.open()
+    doc = pikepdf.Pdf.new()
     failed = {}
     smallest = _smallest_side(paths, s, edits) if s.pdf_page == "min" else None
     try:
@@ -483,13 +509,7 @@ def images_to_pdf(paths, out: Path, s: Settings, on_image=None, cancel=None, edi
                     image = _fit(image, smallest)
                 if image.mode == "RGBA" and image.getchannel("A").getextrema()[0] == 255:
                     image = image.convert("RGB")
-                if image.mode == "RGBA":
-                    # 有透明的圖用無損 PNG 放入,透明處才不會變黑
-                    buf = io.BytesIO()
-                    image.save(buf, "PNG", optimize=True)
-                    data = buf.getvalue()
-                else:
-                    data = encode(image, "jpg", s, tables=tables)
+                xobject = _pdf_image(doc, image, s, tables)
             except Exception as exc:
                 failed[index] = describe_error(exc)
                 continue
@@ -502,12 +522,20 @@ def images_to_pdf(paths, out: Path, s: Settings, on_image=None, cancel=None, edi
                 page_w, page_h = width * scale, height * scale
             else:
                 page_w, page_h = width * 72 / PDF_DPI, height * 72 / PDF_DPI
-            page = doc.new_page(width=page_w, height=page_h)
-            page.insert_image(page.rect, stream=data, keep_proportion=True)
-        if not doc.page_count:
+            # 等比例放進頁面並置中(A4 時圖和頁面比例不同)
+            fit = min(page_w / width, page_h / height)
+            draw_w, draw_h = width * fit, height * fit
+            x, y = (page_w - draw_w) / 2, (page_h - draw_h) / 2
+            page = doc.add_blank_page(page_size=(page_w, page_h))
+            resource = page.add_resource(xobject, pikepdf.Name.XObject, prefix="Im")
+            page.obj.Contents = doc.make_stream(
+                f"q {draw_w:.4f} 0 0 {draw_h:.4f} {x:.4f} {y:.4f} cm {resource} Do Q".encode())
+        if not len(doc.pages):
             raise RuntimeError(failed[0] if len(paths) == 1 else "沒有可以放入 PDF 的圖片")
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_bytes(doc.tobytes(garbage=3, deflate=True))
+        buf = io.BytesIO()
+        doc.save(buf)
+        out.write_bytes(buf.getvalue())
     finally:
         doc.close()
     return failed

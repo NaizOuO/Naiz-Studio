@@ -9,6 +9,8 @@ import pikepdf
 from PIL import Image
 from pikepdf import Name, PdfImage
 
+from core import pdfium
+
 COMPRESS_MODES = {
     "lossless": "無損重打包",
     "jpeg": "JPEG (DCT)",
@@ -342,27 +344,25 @@ def extract_pages(input_path, output_dir, pages, *, combine=False, fmt="pdf", im
 
 
 def _pages_to_images(input_path, output_dir, stem, pages, fmt, dpi, progress, cancel):
-    import pymupdf
-
-    doc = pymupdf.open(input_path)
+    doc = pdfium.open_document(input_path)
     try:
-        total = doc.page_count
+        total = pdfium.page_count(doc)
         if pages[-1] > total:
             raise ValueError(f"第 {pages[-1]} 頁超出範圍，這份只有 {total} 頁")
         width = len(str(total))
         files = []
         for index, number in enumerate(pages, start=1):
             _check(cancel)
-            pix = doc[number - 1].get_pixmap(dpi=dpi)
+            image = pdfium.render(doc, number - 1, dpi / 72)
             out_path = output_dir / f"{stem}_p{number:0{width}d}.{fmt}"
             if fmt == "jpg":
-                out_path.write_bytes(pix.tobytes("jpeg", jpg_quality=85))
+                image.save(out_path, "JPEG", quality=85)
             else:
-                pix.save(out_path)
+                image.save(out_path, "PNG")
             files.append(out_path)
             _report(progress, index, len(pages), f"第 {number} 頁 ({index}/{len(pages)})")
     finally:
-        doc.close()
+        pdfium.close(doc)
     return {"files": files, "count": len(files)}
 
 

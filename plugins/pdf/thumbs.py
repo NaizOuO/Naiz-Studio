@@ -5,6 +5,8 @@ from collections import OrderedDict
 
 import pygame
 
+from core import pdfium
+
 
 class ThumbnailCache:
     def __init__(self, box_size, capacity=800):
@@ -46,15 +48,13 @@ class ThumbnailCache:
                 self._cond.notify()
 
     def _worker(self):
-        import pymupdf
-
         docs = {}
         while True:
             with self._cond:
                 if not self._wanted:
                     # 閒下來就關檔,否則 Windows 會一直佔用這些 PDF,使用者無法刪除或改名
                     for doc in docs.values():
-                        doc.close()
+                        pdfium.close(doc)
                     docs.clear()
                 while not self._wanted:
                     self._cond.wait()
@@ -64,11 +64,13 @@ class ThumbnailCache:
             path, number = key
             try:
                 if path not in docs:
-                    docs[path] = pymupdf.open(path)
-                page = docs[path][number - 1]
-                zoom = min(self.box_w / max(1, page.rect.width), self.box_h / max(1, page.rect.height))
-                pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
-                result = (pix.width, pix.height, pix.samples)
+                    docs[path] = pdfium.open_document(path)
+                doc = docs[path]
+                width, height = pdfium.page_size(doc, number - 1)
+                # PDFium 算像素時無條件進位,比例稍微縮一點,縮圖才不會比格子大 1 像素
+                zoom = min(self.box_w / max(1, width), self.box_h / max(1, height)) * 0.9999
+                image = pdfium.render(doc, number - 1, zoom)
+                result = (image.width, image.height, image.tobytes())
                 with self._cond:
                     self._ready[key] = result
             except Exception:

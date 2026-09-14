@@ -96,8 +96,9 @@ python naiz_studio.py
 | 專案 | 用途 | 授權 |
 |---|---|---|
 | [pygame-ce](https://github.com/pygame-community/pygame-ce) | 介面 | LGPL-2.1 |
-| [PyMuPDF](https://github.com/pymupdf/PyMuPDF) | PDF 讀取、轉圖片、SVG | AGPL-3.0 |
-| [pikepdf](https://github.com/pikepdf/pikepdf) | PDF 壓縮與重新打包 | MPL-2.0 |
+| [pypdfium2](https://github.com/pypdfium2-team/pypdfium2)（[PDFium](https://pdfium.googlesource.com/pdfium/)） | PDF 轉圖片、頁面縮圖 | Apache-2.0 / BSD-3-Clause |
+| [pikepdf](https://github.com/pikepdf/pikepdf) | PDF 壓縮、拆分、合併，圖片合成 PDF | MPL-2.0 |
+| [resvg](https://github.com/linebender/resvg)（[resvg-py](https://github.com/baseplate-admin/resvg-py)） | 讀取 SVG | Apache-2.0 / MIT |
 | [Pillow](https://github.com/python-pillow/Pillow) | 圖片處理 | MIT-CMU |
 | [pillow-heif](https://github.com/bigcat88/pillow_heif) | HEIC 讀寫 | BSD-3-Clause |
 | [vtracer](https://github.com/visioncortex/vtracer) | 圖片轉 SVG | MIT |

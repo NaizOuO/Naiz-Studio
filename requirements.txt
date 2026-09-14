@@ -3,5 +3,6 @@ pikepdf
 Pillow
 pillow-heif
 pygame-ce
-pymupdf
+pypdfium2
+resvg-py
 vtracer
