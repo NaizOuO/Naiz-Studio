@@ -325,7 +325,7 @@ class TranscriptPage(Page):
         if locked:
             draw_text(screen, "轉錄中無法變更設定", (x, y), 12, theme.WARN)
             y += 22
-        for line in ("目前辨識語言為中文", "全部在這台電腦上處理，不會上傳"):
+        for line in ("目前辨識語言為中文", "全部在本地處理，不會上傳"):
             draw_text(screen, line, (x, y), 12, theme.TEXT_FAINT)
             y += 20
         return y

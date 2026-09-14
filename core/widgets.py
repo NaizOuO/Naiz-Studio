@@ -1,5 +1,7 @@
 """可重複使用的 pygame UI 元件。"""
 
+import math
+
 import pygame
 
 from . import theme
@@ -208,16 +210,17 @@ class SegmentedControl:
         seg_w = rect.width / len(self.options)
         for i, (_key, label) in enumerate(self.options):
             seg = pygame.Rect(int(rect.x + i * seg_w), rect.y, int(seg_w), rect.height)
-            self.rects.append(seg)
-            active = i == self.index
-            hover = seg.collidepoint(mouse_pos)
-            if active:
-                inner = seg.inflate(-6, -6)
-                rounded_panel(surface, inner, tuple(int(c * 0.30) for c in self.accent), radius=6)
-                draw_text(surface, label, inner.center, 14, self.accent, bold=True, center=True)
-            else:
-                draw_text(surface, label, seg.center, 14,
-                          theme.TEXT if hover else theme.TEXT_DIM, center=True)
+            self._draw_segment(surface, seg, label, i == self.index, mouse_pos)
+
+    def _draw_segment(self, surface, seg, label, active, mouse_pos):
+        self.rects.append(seg)
+        if active:
+            inner = seg.inflate(-6, -6)
+            rounded_panel(surface, inner, tuple(int(c * 0.30) for c in self.accent), radius=6)
+            draw_text(surface, label, inner.center, 14, self.accent, bold=True, center=True)
+        else:
+            draw_text(surface, label, seg.center, 14,
+                      theme.TEXT if seg.collidepoint(mouse_pos) else theme.TEXT_DIM, center=True)
 
     def clicked(self, mouse_pos, click) -> bool:
         if not click:
@@ -227,6 +230,27 @@ class SegmentedControl:
                 self.index = i
                 return True
         return False
+
+
+class ChoiceGrid(SegmentedControl):
+    """選項太多、一列放不下時分成多列排列;用法和 SegmentedControl 相同,draw 只看 rect 的寬度並回傳佔用的高度。"""
+
+    def __init__(self, options, columns, index=0, accent=theme.ACCENT, row_h=34):
+        super().__init__(options, index, accent)
+        self.columns = columns
+        self.row_h = row_h
+
+    def draw(self, surface, rect, mouse_pos):
+        rows = math.ceil(len(self.options) / self.columns)
+        box = pygame.Rect(rect.x, rect.y, rect.width, rows * self.row_h)
+        rounded_panel(surface, box, theme.PANEL, radius=8, border=theme.PANEL_EDGE)
+        self.rects = []
+        cell_w = box.width / self.columns
+        for i, (_key, label) in enumerate(self.options):
+            row, col = divmod(i, self.columns)
+            cell = pygame.Rect(int(box.x + col * cell_w), box.y + row * self.row_h, int(cell_w), self.row_h)
+            self._draw_segment(surface, cell, label, i == self.index, mouse_pos)
+        return box.height
 
 
 def _clipboard_text() -> str:

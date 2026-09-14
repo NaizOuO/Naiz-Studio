@@ -1,5 +1,7 @@
 opencc-python-reimplemented
 pikepdf
 Pillow
+pillow-heif
 pygame-ce
 pymupdf
+vtracer
