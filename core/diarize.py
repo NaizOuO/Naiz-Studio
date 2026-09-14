@@ -46,6 +46,8 @@ EMBEDDING = deps.Dependency(
 DEPS = [SHERPA, SEGMENTATION, EMBEDDING]
 # 自動判斷人數時的門檻:實測 0.5 會多分、0.8 以上會把不同人併在一起
 AUTO_THRESHOLD = 0.7
+# 自動模式下,說話時間佔全部不到這個比例的群視為背景雜音,併入主要說話者
+MIN_SHARE = 0.05
 _SEGMENT = re.compile(r"^\s*(\d+(?:\.\d+)?)\s+--\s+(\d+(?:\.\d+)?)\s+speaker_(\d+)")
 _PROGRESS = re.compile(r"progress\s+(\d+(?:\.\d+)?)%")
 
@@ -66,7 +68,8 @@ def diarize(wav_path, speakers=0, cancel=None, progress=None):
             if match:
                 progress(float(match.group(1)) / 100)
 
-    clustering = f"--clustering.num-clusters={speakers}" if speakers else \
+    # 指定人數時多分一群:背景偶爾出聲的人常會搶走一個名額,讓兩位主講者被併成同一群
+    clustering = f"--clustering.num-clusters={speakers + 1}" if speakers else \
         f"--clustering.cluster-threshold={AUTO_THRESHOLD}"
     # sherpa-onnx 一樣開不了含中文的路徑,模型用「工作目錄 + 純英文檔名」
     args = [SHERPA.path(), f"--segmentation.pyannote-model={SEGMENTATION.path().name}",
@@ -75,4 +78,32 @@ def diarize(wav_path, speakers=0, cancel=None, progress=None):
     code, log = _run(args, cancel, on_line=on_line, cwd=paths.MODELS_DIR)
     if code != 0 or any("Errors in config" in line for line in log):
         raise RuntimeError("區分說話者失敗")
-    return segments
+    return merge_minor(segments, speakers)
+
+
+def merge_minor(segments, keep=0):
+    """把說話時間很短的群(例如背景偶爾出聲的人)併入時間上最接近的主要說話者。
+    keep > 0 時只保留說話時間最長的 keep 位;keep = 0(自動)時保留佔總說話時間 MIN_SHARE 以上的。"""
+    if not segments:
+        return segments
+    total = {}
+    for start, end, speaker in segments:
+        total[speaker] = total.get(speaker, 0) + end - start
+    ranked = sorted(total, key=total.get, reverse=True)
+    if keep:
+        main = set(ranked[:keep])
+    else:
+        whole = sum(total.values())
+        main = {k for k in ranked if total[k] >= whole * MIN_SHARE} or {ranked[0]}
+    anchors = [seg for seg in segments if seg[2] in main]
+
+    def distance(anchor, middle):
+        return 0 if anchor[0] <= middle <= anchor[1] else min(abs(anchor[0] - middle), abs(anchor[1] - middle))
+
+    merged = []
+    for start, end, speaker in segments:
+        if speaker not in main:
+            middle = (start + end) / 2
+            speaker = min(anchors, key=lambda anchor: distance(anchor, middle))[2]
+        merged.append((start, end, speaker))
+    return merged
