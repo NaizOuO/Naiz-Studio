@@ -85,6 +85,8 @@ class App:
         self.gear_rect = pygame.Rect(0, 0, 0, 0)
         self.title_clicks = []
         self.btn_home = Button("首頁", filled=False, size=14)
+        self.copy_toast = None
+        self._swallow_click = False
 
         self.tools = []
         self.load_errors = []
@@ -242,6 +244,10 @@ class App:
                       (rect.x, rect.bottom - 18), 12, theme.WARN)
 
     def draw_frame(self, mouse_pos=(-100, -100)):
+        if self.dev_mode:
+            widgets.begin_text_log()
+        else:
+            widgets.stop_text_log()
         width, height = self.screen.get_size()
         self.screen.fill(theme.BG_DEEP)
         if self.background:
@@ -256,11 +262,30 @@ class App:
         self.draw_header(width, mouse_pos)
         page = self.pages.get(self.current.id) if self.current else None
         if page is not None and page.modal_open():
+            widgets.mark_text_layer()
             page.draw_modal(mouse_pos)
         if self.settings.is_open:
+            widgets.mark_text_layer()
             self.settings.draw(mouse_pos)
         if self.consent.is_open:
+            widgets.mark_text_layer()
             self.consent.draw(mouse_pos)
+        self._draw_copy_toast()
+
+    def _draw_copy_toast(self):
+        if self.copy_toast is None:
+            return
+        label, at, pos = self.copy_toast
+        if pygame.time.get_ticks() - at > 1600:
+            self.copy_toast = None
+            return
+        paused = widgets.pause_text_log()   # 提示本身不算畫面上的文字
+        text = widgets.clip_text(label, 13, 360)
+        box = pygame.Rect(pos[0] + 14, pos[1] + 16, theme.font(13).size(text)[0] + 24, 30)
+        box.clamp_ip(self.screen.get_rect())
+        rounded_panel(self.screen, box, theme.PANEL_LIGHT, radius=8, alpha=240, border=theme.ACCENT)
+        draw_text(self.screen, text, (box.x + 12, box.y + 6), 13, theme.TEXT)
+        widgets.resume_text_log(paused)
 
     # ------------------------------------------------------------ 事件
 
@@ -281,6 +306,8 @@ class App:
                 self.toggle_fullscreen()
             return True
 
+        if self.dev_mode and self._copy_click(event, mouse_pos):
+            return True
         if self.consent.is_open:
             self.consent.handle_event(event, mouse_pos)
             return True
@@ -314,6 +341,27 @@ class App:
 
         if self.current:
             self.pages[self.current.id].handle_event(event, mouse_pos)
+        return True
+
+    def _copy_click(self, event, pos):
+        """開發者模式:Ctrl+左鍵複製那段文字,Ctrl+Shift+左鍵複製整個畫面的文字;這次點擊不會傳給畫面。"""
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1 and self._swallow_click:
+            self._swallow_click = False
+            return True
+        if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
+            return False
+        mods = pygame.key.get_mods()
+        if not mods & pygame.KMOD_CTRL:
+            return False
+        self._swallow_click = True
+        whole = bool(mods & pygame.KMOD_SHIFT)
+        text = widgets.screen_text() if whole else widgets.text_at(pos)
+        if text:
+            widgets.copy_to_clipboard(text)
+            label = "已複製整個畫面的文字" if whole else f"已複製：{text}"
+        else:
+            label = "這裡沒有文字"
+        self.copy_toast = (label, pygame.time.get_ticks(), pos)
         return True
 
     def process_events(self, events):

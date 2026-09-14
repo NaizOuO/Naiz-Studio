@@ -194,16 +194,24 @@ class SettingsPanel:
             y += 28
         self.sliders = [row[0] for row in rows]
 
-        keys_y = panel.bottom - 108
+        rows = [("快捷鍵", theme.TEXT_DIM, (("F11", "切換全螢幕"), ("Esc", "關閉這個視窗")))]
+        if self.app.dev_mode:
+            # 只有開發者模式看得到的操作說明
+            rows += [("開發者", theme.WARN, (("Ctrl + 左鍵", "複製滑鼠指到的文字"),)),
+                     ("", theme.WARN, (("Ctrl + Shift + 左鍵", "複製整個畫面的文字"),))]
+        keys_y = panel.bottom - 108 - 26 * (len(rows) - 1)
         if y < keys_y - 8:      # 視窗太矮、滑桿快頂到時就不擠這塊
             pygame.draw.line(screen, theme.PANEL_EDGE, (x, keys_y), (panel.right - 22, keys_y))
-            draw_text(screen, "快捷鍵", (x, keys_y + 12), 12, theme.TEXT_DIM)
-            for offset, (key, desc) in enumerate((("F11", "切換全螢幕"), ("Esc", "關閉這個視窗"))):
-                kx = x + 60 + offset * 180
-                chip = pygame.Rect(kx, keys_y + 8, 40, 20)
-                rounded_panel(screen, chip, theme.PANEL_LIGHT, radius=5, border=theme.PANEL_EDGE)
-                draw_text(screen, key, chip.center, 11, theme.TEXT_DIM, center=True)
-                draw_text(screen, desc, (kx + 48, keys_y + 11), 12, theme.TEXT_FAINT)
+            for index, (label, color, keys) in enumerate(rows):
+                row_y = keys_y + 8 + index * 26
+                draw_text(screen, label, (x, row_y + 4), 12, color)
+                kx = x + 60
+                for key, desc in keys:
+                    chip = pygame.Rect(kx, row_y, theme.font(11).size(key)[0] + 18, 20)
+                    rounded_panel(screen, chip, theme.PANEL_LIGHT, radius=5, border=theme.PANEL_EDGE)
+                    draw_text(screen, key, chip.center, 11, theme.TEXT_DIM, center=True)
+                    desc_rect = draw_text(screen, desc, (chip.right + 8, row_y + 3), 12, theme.TEXT_FAINT)
+                    kx = max(x + 240, desc_rect.right + 24)
 
         foot_y = panel.bottom - 56
         if self.dirty:

@@ -18,6 +18,64 @@ def rounded_panel(surface, rect, color=theme.PANEL, radius=10, alpha=None, borde
         pygame.draw.rect(surface, border, rect, 1, border_radius=radius)
 
 
+# ------------------------------------------------------------ 開發者模式:複製畫面上的文字
+# 開啟時記錄這一幀畫出來的每段文字和位置,讓 Ctrl+左鍵 可以複製;關閉時完全不記錄
+
+_text_log = None     # [(畫面上看得到的範圍, 原文)];None 表示不記錄
+_layer_start = 0     # 最上層視窗的文字從第幾筆開始
+_full_text = {}      # 被截斷成「...」的文字 → 完整原文
+
+
+def begin_text_log():
+    """每一幀開始畫之前呼叫;上一幀的紀錄會被清掉,不會越存越多。"""
+    global _text_log, _layer_start
+    _text_log, _layer_start = [], 0
+    _full_text.clear()
+
+
+def stop_text_log():
+    global _text_log
+    _text_log = None
+    _full_text.clear()
+
+
+def mark_text_layer():
+    """之後畫的是浮在上層的視窗;複製整個畫面時只取最上層的文字。"""
+    global _layer_start
+    if _text_log is not None:
+        _layer_start = len(_text_log)
+
+
+def pause_text_log():
+    global _text_log
+    paused, _text_log = _text_log, None
+    return paused
+
+
+def resume_text_log(paused):
+    global _text_log
+    _text_log = paused
+
+
+def text_at(pos):
+    """滑鼠位置最上面的那段文字;沒有則回傳 None。"""
+    for rect, text in reversed(_text_log or []):
+        if rect.collidepoint(pos):
+            return text
+    return None
+
+
+def screen_text():
+    """最上層畫面的所有文字,由上到下、同一列由左到右,用換行串起來。"""
+    rows = []
+    for rect, text in sorted((_text_log or [])[_layer_start:], key=lambda entry: (entry[0].centery, entry[0].x)):
+        if rows and abs(rows[-1][0] - rect.centery) <= 8:
+            rows[-1][1].append((rect.x, text))
+        else:
+            rows.append([rect.centery, [(rect.x, text)]])
+    return "\n".join("  ".join(text for _, text in sorted(items)) for _, items in rows)
+
+
 def draw_text(surface, text, pos, size=16, color=theme.TEXT, bold=False, center=False, right=False):
     img = theme.font(size, bold).render(text, True, color)
     rect = img.get_rect()
@@ -28,6 +86,10 @@ def draw_text(surface, text, pos, size=16, color=theme.TEXT, bold=False, center=
     else:
         rect.topleft = pos
     surface.blit(img, rect)
+    if _text_log is not None and text and surface is pygame.display.get_surface():
+        visible = rect.clip(surface.get_clip())   # 被捲到看不見的文字不算
+        if visible.width and visible.height:
+            _text_log.append((visible, _full_text.get(text, text)))
     return rect
 
 
@@ -35,8 +97,11 @@ def clip_text(text: str, size: int, max_width: int, bold: bool = False) -> str:
     f = theme.font(size, bold)
     if f.size(text)[0] <= max_width:
         return text
+    original = text
     while text and f.size(text + "...")[0] > max_width:
         text = text[:-1]
+    if _text_log is not None:
+        _full_text[text + "..."] = original
     return text + "..."
 
 
@@ -265,6 +330,10 @@ def _set_clipboard(text):
         pygame.scrap.put_text(text)
     except Exception:
         pass
+
+
+def copy_to_clipboard(text):
+    _set_clipboard(text)
 
 
 def _is_word_char(ch):
