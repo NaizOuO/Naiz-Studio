@@ -8,6 +8,7 @@ from pathlib import Path
 import pygame
 
 from core import large_files, paths, tasks, theme, widgets
+from core.drag_sort import DragSort, move_items
 from core.files import free_path
 from core.plugins import Page
 from core.scroll import BAR_SPACE, ScrollView
@@ -23,6 +24,11 @@ PICK_VISIBLE_FILES = 3
 TILE_W, THUMB_H, LABEL_H, TILE_GAP = 96, 118, 22, 10
 TILE_H = 6 + THUMB_H + LABEL_H
 LOADING_PAGES = "頁數還在讀取中"
+
+
+def pdf_output_dir():
+    """PDF 工具的輸出放在自己的資料夾,和圖片、影音等其他工具分開。"""
+    return paths.OUTPUT_DIR / "pdf"
 
 
 class FileItem:
@@ -100,6 +106,10 @@ class PdfPage(Page):
         self.btn_clear = Button("清空清單", filled=False, size=14)
         self.btn_output = Button("輸出資料夾", filled=False, size=14)
         self.row_buttons = []
+        self.merge_drag = DragSort(purple, on_drop=self._reorder_merge)
+
+    def _reorder_merge(self, indexes, insert_at):
+        self.files["merge"], _ = move_items(self.files["merge"], indexes, insert_at)
 
     # ------------------------------------------------------------ 資料
 
@@ -162,6 +172,7 @@ class PdfPage(Page):
 
     def deactivate(self):
         self.page_input.blur()
+        self.merge_drag.cancel()
         self.grid_view.reset()
         for view in self.list_views.values():
             view.reset()
@@ -277,7 +288,8 @@ class PdfPage(Page):
     def _start_job(self):
         if self.runner.running or not self.can_run():
             return
-        output_dir = paths.OUTPUT_DIR
+        output_dir = pdf_output_dir()
+        output_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(exist_ok=True)
         self.result_lines = []
         self.page_input.blur()
@@ -400,6 +412,9 @@ class PdfPage(Page):
             self.apply_typed_spec()
 
         mouse = pygame.mouse.get_pos()
+        delta = self.merge_drag.update(self.list_area) if self.tab == "merge" else 0
+        if delta:
+            self.list_views["merge"].set_scroll(self.list_views["merge"].scroll + delta)
         for key, view in self.list_views.items():
             if key == self.tab:
                 view.update(mouse)
@@ -487,6 +502,7 @@ class PdfPage(Page):
         view = self.list_views[self.tab]
         view.layout(area, len(files) * FILE_ROW_H + 16)
         self.list_area = area
+        slots = []
 
         self.screen.set_clip(area)
         for index, item in enumerate(files):
@@ -513,17 +529,13 @@ class PdfPage(Page):
                       self.accent if self.picking and item.selected else theme.TEXT_DIM)
 
             if self.tab == "merge":
-                draw_text(self.screen, str(index + 1), (row.right - 116, row.centery), 13,
+                draw_text(self.screen, str(index + 1), (row.right - 60, row.centery), 13,
                           self.accent, bold=True, center=True)
-                up = pygame.Rect(row.right - 96, row.y + 8, 26, 26)
-                down = pygame.Rect(row.right - 66, row.y + 8, 26, 26)
-                for r, sym, enabled in ((up, "▲", index > 0), (down, "▼", index < len(files) - 1)):
-                    hovered = r.collidepoint(mouse_pos) and enabled
-                    rounded_panel(self.screen, r, theme.PANEL_LIGHT if hovered else theme.PANEL, radius=6)
-                    draw_text(self.screen, sym, r.center, 11,
-                              theme.TEXT if enabled else theme.TEXT_FAINT, center=True)
-                self.row_buttons.append(("up", index, up))
-                self.row_buttons.append(("down", index, down))
+                slots.append((index, row))
+                if self.merge_drag.dragging(index):
+                    shade = pygame.Surface(row.size, pygame.SRCALPHA)
+                    shade.fill((20, 24, 30, 150))
+                    self.screen.blit(shade, row.topleft)
 
             remove = pygame.Rect(row.right - 34, row.y + 8, 26, 26)
             hovered = remove.collidepoint(mouse_pos)
@@ -535,9 +547,14 @@ class PdfPage(Page):
             self.row_buttons.append(("remove", index, remove))
             if self.tab == "split":
                 self.row_buttons.append(("select", index, row))
+            elif self.tab == "merge":
+                self.row_buttons.append(("drag", index, row))   # 放在刪除按鈕後面,按到刪除時不會開始拖曳
         self.screen.set_clip(None)
 
         view.draw(self.screen, mouse_pos)
+        if self.tab == "merge":
+            self.merge_drag.set_slots(slots, len(files))
+            self.merge_drag.draw(self.screen, area)
 
     def draw_page_grid(self, rect, mouse_pos):
         item = self.split_item
@@ -778,7 +795,7 @@ class PdfPage(Page):
     def draw_merge_options(self, rect, y, mouse_pos):
         inner = rect.width - 36
         files = self.current_files
-        draw_text(self.screen, "用左側清單的 ▲▼ 調整合併順序", (rect.x + 18, y), 13, theme.TEXT_DIM)
+        draw_text(self.screen, "拖曳左側清單的檔案調整合併順序", (rect.x + 18, y), 13, theme.TEXT_DIM)
         y += 30
 
         total_pages = sum(f.pages for f in files if f.pages and f.pages > 0)
@@ -830,7 +847,7 @@ class PdfPage(Page):
                 if self.picking and self.current_files and not self.can_run():
                     status = "勾選或輸入要取出的頁面"
                 draw_text(self.screen, status, (bar.x, bar.y + 2), 13, theme.TEXT_DIM)
-                draw_text(self.screen, "輸出位置：output\\", (bar.x, bar.y + 22), 12, theme.TEXT_FAINT)
+                draw_text(self.screen, "輸出位置：output\\pdf\\", (bar.x, bar.y + 22), 12, theme.TEXT_FAINT)
 
         side = pygame.Rect(rect.right - 238, rect.y + 18, 104, 38)
         if running:
@@ -851,6 +868,8 @@ class PdfPage(Page):
                 self.apply_typed_spec()
             if self.grid_view.rect.width and self.grid_view.handle_event(event, mouse_pos):
                 return
+        if self.tab == "merge" and self.merge_drag.handle(event, mouse_pos):
+            return
         if self.current_files and self.list_views[self.tab].handle_event(event, mouse_pos):
             return
 
@@ -895,10 +914,8 @@ class PdfPage(Page):
                         if index < self.split_index:
                             self.split_index -= 1
                         self.load_spec_into_input()
-                elif action == "up" and index > 0:
-                    files[index - 1], files[index] = files[index], files[index - 1]
-                elif action == "down" and index < len(files) - 1:
-                    files[index + 1], files[index] = files[index], files[index + 1]
+                elif action == "drag":
+                    self.merge_drag.press(mouse_pos, [index])
                 elif action == "select":
                     self.select_split_file(index)
                 return
@@ -940,7 +957,7 @@ class PdfPage(Page):
                 self.runner.request_cancel()
                 self.status = "取消中..."
         elif self.btn_output.clicked(mouse_pos, True):
-            paths.OUTPUT_DIR.mkdir(exist_ok=True)
-            os.startfile(paths.OUTPUT_DIR)
+            pdf_output_dir().mkdir(parents=True, exist_ok=True)
+            os.startfile(pdf_output_dir())
         elif self.btn_run.clicked(mouse_pos, True):
             self.start_job()

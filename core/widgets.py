@@ -496,6 +496,13 @@ class TextInput:
         self.composition = ""      # 輸入法組字中、還沒選字的文字(例如注音)
         self.composition_cursor = 0
         self._ime_rect = None
+        self.mask = False          # 密碼欄:畫面上用圓點顯示,也不能複製
+
+    def _shown(self, text):
+        return "•" * len(text) if self.mask else text
+
+    def focus(self):
+        self._focus()
 
     # ------------------------------------------------------------ 狀態
 
@@ -533,8 +540,8 @@ class TextInput:
         font = theme.font(self.size)
         target = x - (self.rect.x + 10) + self._offset
         for i in range(1, len(self.text) + 1):
-            left = font.size(self.text[:i - 1])[0]
-            right = font.size(self.text[:i])[0]
+            left = font.size(self._shown(self.text[:i - 1]))[0]
+            right = font.size(self._shown(self.text[:i]))[0]
             if target < (left + right) / 2:
                 return i - 1
         return len(self.text)
@@ -657,10 +664,10 @@ class TextInput:
         if ctrl and key == pygame.K_a:
             self.select_all()
         elif ctrl and key == pygame.K_c:
-            if self.selected_text:
+            if self.selected_text and not self.mask:
                 _set_clipboard(self.selected_text)
         elif ctrl and key == pygame.K_x:
-            if self.selected_text:
+            if self.selected_text and not self.mask:
                 _set_clipboard(self.selected_text)
                 return self._delete_selection()
         elif ctrl and key == pygame.K_v:
@@ -701,6 +708,7 @@ class TextInput:
         inner = rect.inflate(-20, 0)
         composing = self.focused and bool(self.composition)
         shown = self.text[:self.cursor] + self.composition + self.text[self.cursor:] if composing else self.text
+        shown = self._shown(shown)
         caret = self.cursor + (self.composition_cursor if composing else 0)
         cursor_x = font.size(shown[:caret])[0]
         if cursor_x - self._offset > inner.width - 2:
@@ -713,8 +721,8 @@ class TextInput:
         surface.set_clip(inner.clip(previous_clip))
         start, end = self.selection
         if self.focused and start != end and not composing:
-            x1 = inner.x + font.size(self.text[:start])[0] - self._offset
-            x2 = inner.x + font.size(self.text[:end])[0] - self._offset
+            x1 = inner.x + font.size(self._shown(self.text[:start]))[0] - self._offset
+            x2 = inner.x + font.size(self._shown(self.text[:end]))[0] - self._offset
             highlight = pygame.Surface((max(1, x2 - x1), rect.height - 12), pygame.SRCALPHA)
             highlight.fill((*self.accent, 90))
             surface.blit(highlight, (x1, rect.y + 6))
@@ -726,8 +734,8 @@ class TextInput:
             surface.blit(image, (inner.x, rect.centery - image.get_height() // 2))
         if composing:
             # 組字中的文字加底線,和一般輸入法的顯示方式一樣
-            x1 = inner.x + font.size(self.text[:self.cursor])[0] - self._offset
-            x2 = x1 + font.size(self.composition)[0]
+            x1 = inner.x + font.size(self._shown(self.text[:self.cursor]))[0] - self._offset
+            x2 = x1 + font.size(self._shown(self.composition))[0]
             pygame.draw.line(surface, self.accent, (x1, rect.bottom - 8), (x2, rect.bottom - 8), 1)
         if self.focused and (pygame.time.get_ticks() // 530) % 2 == 0:
             x = inner.x + cursor_x - self._offset

@@ -9,6 +9,7 @@ import pygame
 from PIL import Image
 
 from core import deps, large_files, paths, theme, widgets
+from core.drag_sort import DragSort, move_items
 from core.plugins import Page
 from core.scroll import BAR_SPACE, ScrollView
 from core.widgets import Button, ChoiceGrid, SegmentedControl, Slider, Toggle, draw_text, rounded_panel
@@ -42,7 +43,7 @@ QUALITY_NOTES = {
     "pdf": "照片以 JPG 放入，70~85 通常看不出差別；有透明的圖以無損方式放入",
 }
 PDF_OUTPUTS = [("combine", "合成一個檔"), ("each", "每張一個檔")]
-PDF_OUTPUT_NOTES = {"combine": "全部圖片合成一份 PDF，可用 ▲▼ 調整順序", "each": "每張圖各自存成一份 PDF"}
+PDF_OUTPUT_NOTES = {"combine": "全部圖片合成一份 PDF，拖曳左側清單可以調整順序", "each": "每張圖各自存成一份 PDF"}
 PDF_PAGES = [("fit", "依圖片大小"), ("min", "依最小圖片"), ("a4", "A4")]
 PDF_PAGE_NOTES = {"fit": "頁面和圖片一樣大，不留白邊",
                   "min": "以最小圖片的長邊為準，調整所有圖片的大小", "a4": "放進 A4 頁面，橫的圖自動用橫向"}
@@ -138,6 +139,7 @@ class ImagePage(Page):
         self.settings_view = ScrollView(accent=accent, indicator=True)
         self.settings_area = pygame.Rect(0, 0, 0, 0)
         self.row_buttons = []
+        self.order_drag = DragSort(accent, on_drop=self._reorder)
         self.btn_clear = Button("清空清單", filled=False, size=13)
         self.btn_output = Button("輸出資料夾", filled=False, size=14)
         self.btn_cancel = Button("取消", accent=theme.DANGER, filled=False)
@@ -308,14 +310,22 @@ class ImagePage(Page):
     def handle_modal_event(self, event, mouse_pos):
         self.editor.handle_event(event, mouse_pos)
 
+    def _reorder(self, indexes, insert_at):
+        with self._lock:
+            self.items, _ = move_items(self.items, indexes, insert_at)
+
     def deactivate(self):
         self.list_view.reset()
         self.settings_view.reset()
+        self.order_drag.cancel()
         for slider in (self.quality, self.max_side):
             slider.dragging = False
 
     def update(self):
         mouse = pygame.mouse.get_pos()
+        delta = self.order_drag.update(self.list_area)
+        if delta:
+            self.list_view.set_scroll(self.list_view.scroll + delta)
         self.list_view.update(mouse)
         self.settings_view.update(mouse)
         if self.editor.is_open:
@@ -371,6 +381,7 @@ class ImagePage(Page):
         items = list(self.items)
         view.layout(area, len(items) * ROW_H + 16)
         ordering = self.ordering and not self.running
+        slots = []
         screen.set_clip(area)
         for index, item in enumerate(items):
             y = area.y + 8 + index * ROW_H - view.scroll
@@ -397,7 +408,7 @@ class ImagePage(Page):
                           center=True)
 
             shift = 56 if editable else 0
-            buttons_w = 34 + shift + (92 if ordering else 0) if not self.running else 0
+            buttons_w = 34 + shift + (40 if ordering else 0) if not self.running else 0
             text_x = box.right + 12
             text_w = row.right - text_x - buttons_w - 10
             draw_text(screen, widgets.clip_text(item.path.name, 14, text_w, bold=True), (text_x, row.y + 11),
@@ -416,17 +427,13 @@ class ImagePage(Page):
                           center=True)
                 self.row_buttons.append(("edit", item, edit))
             if ordering:
-                draw_text(screen, str(index + 1), (row.right - 116 - shift, row.y + 21), 13, accent, bold=True,
+                draw_text(screen, str(index + 1), (row.right - 60 - shift, row.y + 21), 13, accent, bold=True,
                           center=True)
-                up = pygame.Rect(row.right - 96 - shift, row.y + 8, 26, 26)
-                down = pygame.Rect(row.right - 66 - shift, row.y + 8, 26, 26)
-                for button, symbol, enabled in ((up, "▲", index > 0), (down, "▼", index < len(items) - 1)):
-                    hovered = button.collidepoint(mouse_pos) and enabled
-                    rounded_panel(screen, button, theme.PANEL_LIGHT if hovered else theme.PANEL, radius=6)
-                    draw_text(screen, symbol, button.center, 11, theme.TEXT if enabled else theme.TEXT_FAINT,
-                              center=True)
-                self.row_buttons.append(("up", item, up))
-                self.row_buttons.append(("down", item, down))
+                slots.append((index, row))
+                if self.order_drag.dragging(index):
+                    shade = pygame.Surface(row.size, pygame.SRCALPHA)
+                    shade.fill((20, 24, 30, 150))
+                    screen.blit(shade, row.topleft)
             remove = pygame.Rect(row.right - 34, row.y + 8, 26, 26)
             hovered = remove.collidepoint(mouse_pos)
             rounded_panel(screen, remove, theme.DANGER if hovered else theme.PANEL, radius=6)
@@ -435,8 +442,13 @@ class ImagePage(Page):
             pygame.draw.line(screen, cross, (ax - 5, ay - 5), (ax + 5, ay + 5), 2)
             pygame.draw.line(screen, cross, (ax + 5, ay - 5), (ax - 5, ay + 5), 2)
             self.row_buttons.append(("remove", item, remove))
+            if ordering:
+                self.row_buttons.append(("drag", item, row))   # 放在最後,按到編輯、刪除時不會開始拖曳
         screen.set_clip(None)
         view.draw(screen, mouse_pos)
+        if ordering:
+            self.order_drag.set_slots(slots, len(items))
+            self.order_drag.draw(screen, area)
 
     def draw_settings(self, rect, mouse_pos):
         screen = self.screen
@@ -591,6 +603,8 @@ class ImagePage(Page):
     # ------------------------------------------------------------ 事件
 
     def handle_event(self, event, mouse_pos):
+        if self.ordering and not self.running and self.order_drag.handle(event, mouse_pos):
+            return
         if self.items and self.list_view.handle_event(event, mouse_pos):
             return
         if self.settings_view.handle_event(event, mouse_pos):
@@ -619,13 +633,10 @@ class ImagePage(Page):
                 with self._lock:
                     if item not in self.items:
                         return
-                    index = self.items.index(item)
                     if action == "remove":
                         self.items.remove(item)
-                    elif action == "up" and index > 0:
-                        self.items[index - 1], self.items[index] = item, self.items[index - 1]
-                    elif action == "down" and index < len(self.items) - 1:
-                        self.items[index + 1], self.items[index] = item, self.items[index + 1]
+                    elif action == "drag":
+                        self.order_drag.press(mouse_pos, [self.items.index(item)])
                 return
 
         if self.items and not self.running and self.btn_clear.clicked(mouse_pos, True):

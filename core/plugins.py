@@ -51,6 +51,14 @@ class Page:
     def update(self):
         pass
 
+    def has_unsaved(self):
+        """有沒有還沒儲存的變更;關閉程式前會先詢問。"""
+        return False
+
+    def leave(self, proceed):
+        """要離開這個畫面(回首頁、關閉程式)時呼叫;需要先詢問時自己跳視窗,確定離開後再呼叫 proceed()。"""
+        proceed()
+
     def deactivate(self):
         """離開這個畫面或被浮動視窗蓋住時呼叫,用來結束進行中的拖曳、自動捲動與文字輸入。"""
         pass

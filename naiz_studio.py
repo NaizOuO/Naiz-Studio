@@ -89,6 +89,8 @@ class App:
         self.btn_home = Button("首頁", filled=False, size=14)
         self.copy_toast = None
         self._swallow_click = False
+        self.quit_requested = False
+        self._quit_confirmed = set()    # 關閉程式時已經確認過「不儲存」的工具
 
         self.tools = []
         self.load_errors = []
@@ -295,9 +297,30 @@ class App:
 
     # ------------------------------------------------------------ 事件
 
+    def request_quit(self):
+        """關閉程式前,有未儲存變更的工具先切過去詢問;回傳 True 代表可以直接結束。"""
+        for tool in self.tools:
+            page = self.pages.get(tool.id)
+            if page is None or tool.id in self._quit_confirmed or not page.has_unsaved():
+                continue
+            self.deactivate_page()
+            self.current = tool
+            page.leave(lambda tool_id=tool.id: self._confirm_quit(tool_id))
+            return False
+        return True
+
+    def _confirm_quit(self, tool_id):
+        self._quit_confirmed.add(tool_id)
+        if self.request_quit():
+            self.quit_requested = True
+
+    def go_home(self):
+        self.current = None
+
     def handle_event(self, event, mouse_pos):
         if event.type == pygame.QUIT:
-            return False
+            self._quit_confirmed.clear()
+            return not self.request_quit()
         if event.type == pygame.VIDEORESIZE and not self.fullscreen:
             self.screen = pygame.display.set_mode((max(960, event.w), max(640, event.h)), pygame.RESIZABLE)
             self.windowed_size = self.screen.get_size()
@@ -340,7 +363,7 @@ class App:
                 return True
             if self.current and self.btn_home.clicked(mouse_pos, True):
                 self.deactivate_page()
-                self.current = None
+                self.pages[self.current.id].leave(self.go_home)   # 有未儲存的變更時工具會先詢問
                 return True
             if self.current is None:
                 for tool, card in self.card_rects:
@@ -353,14 +376,15 @@ class App:
         return True
 
     def _copy_click(self, event, pos):
-        """開發者模式:Ctrl+左鍵複製那段文字,Ctrl+Shift+左鍵複製整個畫面的文字;這次點擊不會傳給畫面。"""
+        """開發者模式:Ctrl+Alt+左鍵複製那段文字,Ctrl+Alt+Shift+左鍵複製整個畫面的文字;這次點擊不會傳給畫面。
+        只用 Ctrl+左鍵 會和工具裡的多選(例如 PDF 編輯器選頁面)衝突,所以多按一個 Alt。"""
         if event.type == pygame.MOUSEBUTTONUP and event.button == 1 and self._swallow_click:
             self._swallow_click = False
             return True
         if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
             return False
         mods = pygame.key.get_mods()
-        if not mods & pygame.KMOD_CTRL:
+        if not (mods & pygame.KMOD_CTRL and mods & pygame.KMOD_ALT):
             return False
         self._swallow_click = True
         whole = bool(mods & pygame.KMOD_SHIFT)
@@ -378,7 +402,7 @@ class App:
             # 用事件本身記錄的位置。觸控板輕點、觸控螢幕時游標是直接跳過去的,
             # 若用這一幀開頭讀到的滑鼠位置,換新目標的第一下會落在舊位置上而失效
             pos = getattr(event, "pos", None) or pygame.mouse.get_pos()
-            if not self.handle_event(event, pos):
+            if not self.handle_event(event, pos) or self.quit_requested:
                 return False
         return True
 

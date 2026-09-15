@@ -210,8 +210,8 @@ class SettingsPanel:
         rows = [("快捷鍵", theme.TEXT_DIM, (("F11", "切換全螢幕"), ("Esc", "關閉這個視窗")))]
         if self.app.dev_mode:
             # 只有開發者模式看得到的操作說明
-            rows += [("開發者", theme.WARN, (("Ctrl + 左鍵", "複製滑鼠指到的文字"),)),
-                     ("", theme.WARN, (("Ctrl + Shift + 左鍵", "複製整個畫面的文字"),))]
+            rows += [("開發者", theme.WARN, (("Ctrl + Alt + 左鍵", "複製滑鼠指到的文字"),)),
+                     ("", theme.WARN, (("Ctrl + Alt + Shift + 左鍵", "複製整個畫面的文字"),))]
         keys_y = panel.bottom - 108 - 26 * (len(rows) - 1)
         if y < keys_y - 8:      # 視窗太矮、滑桿快頂到時就不擠這塊
             pygame.draw.line(screen, theme.PANEL_EDGE, (x, keys_y), (panel.right - 22, keys_y))
