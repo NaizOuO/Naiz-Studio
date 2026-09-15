@@ -1,6 +1,6 @@
 # Naiz Studio
 
-在自己的電腦上處理 PDF、圖片與錄音的工具包。所有檔案都在本地處理，不會上傳。
+在自己的電腦上處理 PDF、圖片、影音與錄音的工具包。所有檔案都在本地處理，不會上傳。
 
 ## 功能
 
@@ -15,6 +15,14 @@
 - **編輯**：裁切、擴展畫布、旋轉、翻轉，每張圖可分開設定，也可套用到全部
 - **動畫 GIF**：保留動畫、播放預覽，或逐格拆成多張圖片
 - **隱私**：可移除拍攝資訊（GPS 位置、拍攝時間等），並依拍攝方向自動轉正
+
+### 影音轉檔
+- **影片**：MP4、MOV、MKV、WebM、AVI、WMV、FLV、MPEG-1、MPEG-2、M2TS、OGV、3GP、SWF、DVD（NTSC、PAL）、GIF
+- **壓縮**：選「檔案最小」「平衡」「接近原畫質」，或直接指定目標大小（例如 25 MB 以下）
+- **進階設定**：編碼器（H.264、H.265、AV1、VP9 等）、解析度、畫面速率、位元速率、編碼速度、時間範圍、聲音
+- **顯示卡加速**：自動偵測可用的顯示卡；轉檔前會預估輸出大小
+- **影片轉 GIF**：可調整每秒格數、寬度、抖色方式；GIF、WebP 動畫也能轉成影片
+- **音訊**：MP3、M4A、WAV、FLAC、OGG、Opus、WMA、AIFF、ALAC、AC3，影片可以直接取出聲音
 
 ### 錄音轉逐字稿
 - 把錄音或影片轉成字幕檔（SRT）與純文字（TXT）
@@ -44,6 +52,7 @@ python naiz_studio.py
 - 目前只在 **Windows 11 64 位元** 上測試過
 - 螢幕至少能顯示 960 × 640 的視窗
 - **PDF 工具、圖片工具**：一般電腦即可，不需要額外下載任何東西
+- **影音轉檔**：需要下載 FFmpeg。NVIDIA 顯示卡實測可以加速（RTX 5060 Ti 轉 30 秒 1080p 影片約 2 秒）；AMD、Intel 顯示卡程式會自動偵測，但還沒有實測
 - **錄音轉逐字稿**：需要下載語音辨識元件，速度取決於顯示卡
 
 | 硬體 | 使用的版本 | 實測速度（11 分鐘中文錄音，「推薦」模型） |
@@ -63,7 +72,7 @@ python naiz_studio.py
 
 | 元件 | 用途 | 下載大小 | 安裝後大小 |
 |---|---|---|---|
-| FFmpeg | 讀取錄音與影片中的聲音 | 約 106 MB | 約 196 MB |
+| FFmpeg | 影音轉檔，以及讀取錄音與影片中的聲音 | 約 106 MB | 約 196 MB |
 | Whisper 語音辨識（CPU 版） | 把語音轉成文字 | 約 8 MB | 約 21 MB |
 | Whisper 語音辨識（NVIDIA 顯示卡版） | 用顯示卡加速辨識 | 約 643 MB | 約 1.1 GB |
 | 人聲偵測模型 | 跳過沒有人說話的片段 | 約 1 MB | 約 1 MB |
@@ -83,6 +92,7 @@ python naiz_studio.py
 |---|---|
 | `output\` | PDF 工具的結果 |
 | `output\images\` | 圖片工具的結果 |
+| `output\media\` | 影音轉檔的結果 |
 | `output\transcripts\` | 逐字稿 |
 | `bin\`、`models\` | 下載的元件 |
 | `images\` | 介面圖片；也可以放自己的圖片當作背景 |
@@ -109,7 +119,7 @@ python naiz_studio.py
 | [pillow-heif](https://github.com/bigcat88/pillow_heif) | HEIC 讀寫 | BSD-3-Clause（附帶 libheif、libde265 為 LGPL-3.0，x265 為 GPL-2.0 以上） |
 | [vtracer](https://github.com/visioncortex/vtracer) | 圖片轉 SVG | MIT |
 | [OpenCC](https://github.com/yichen0831/opencc-python) | 繁簡轉換 | Apache-2.0 |
-| [FFmpeg](https://ffmpeg.org/)（[gyan.dev](https://www.gyan.dev/ffmpeg/builds/) 版本） | 讀取影音 | GPL-3.0 |
+| [FFmpeg](https://ffmpeg.org/)（[gyan.dev](https://www.gyan.dev/ffmpeg/builds/) 版本） | 影音轉檔、讀取影音 | GPL-3.0 |
 | [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | 語音辨識 | MIT |
 | [Whisper 模型](https://github.com/openai/whisper) | 語音辨識模型 | MIT |
 | [Silero VAD](https://github.com/snakers4/silero-vad) | 人聲偵測模型 | MIT |

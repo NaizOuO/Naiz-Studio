@@ -318,6 +318,136 @@ class ChoiceGrid(SegmentedControl):
         return box.height
 
 
+class Dropdown:
+    """下拉選單:選項太多、排成按鈕放不下時使用。
+
+    options 是 [(值, 顯示文字)] 或 [(值, 顯示文字, 右側小字)]。
+    用法:draw() 畫出收合的框;整個畫面(或視窗)都畫完後再呼叫 draw_menu(),展開的清單才會蓋在最上面。
+    事件先交給 handle(),回傳 True 代表這個事件被選單用掉了(包括點在清單外把它收起來)。
+    """
+
+    ROW_H = 30
+    MAX_ROWS = 8
+
+    def __init__(self, options, index=0, accent=theme.ACCENT, size=14):
+        self.options = list(options)
+        self.index = index
+        self.accent = accent
+        self.size = size
+        self.enabled = True
+        self.is_open = False
+        self.scroll = 0
+        self.rect = pygame.Rect(0, 0, 0, 0)
+        self._menu = pygame.Rect(0, 0, 0, 0)
+
+    @property
+    def value(self):
+        return self.options[self.index][0]
+
+    @property
+    def label(self):
+        return self.options[self.index][1]
+
+    def set_options(self, options, value=None):
+        """換一組選項;原本的值還在新選項裡就保留,否則選 value 或第一個。"""
+        keep = self.value if self.options else None
+        self.options = list(options)
+        keys = [option[0] for option in self.options]
+        wanted = keep if keep in keys else value
+        self.index = keys.index(wanted) if wanted in keys else 0
+        self.is_open = False
+
+    def set_value(self, value):
+        keys = [option[0] for option in self.options]
+        if value in keys:
+            self.index = keys.index(value)
+
+    def close(self):
+        self.is_open = False
+
+    def _visible_rows(self):
+        return min(len(self.options), self.MAX_ROWS)
+
+    def _max_scroll(self):
+        return max(0, len(self.options) - self.MAX_ROWS)
+
+    # ------------------------------------------------------------ 事件
+
+    def handle(self, event, pos) -> bool:
+        if not self.is_open:
+            if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self.enabled
+                    and self.rect.collidepoint(pos)):
+                self.is_open = True
+                # 打開時讓目前選的項目出現在清單裡
+                self.scroll = max(0, min(self.index - self.MAX_ROWS // 2, self._max_scroll()))
+                return True
+            return False
+        if event.type == pygame.MOUSEWHEEL:
+            self.scroll = max(0, min(self.scroll - event.y, self._max_scroll()))
+            return True
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            self.is_open = False
+            return True
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            if event.button == 1 and self._menu.collidepoint(pos):
+                row = (pos[1] - self._menu.y - 4) // self.ROW_H
+                if 0 <= row < self._visible_rows():
+                    self.index = row + self.scroll
+            self.is_open = False    # 點在清單外面只是收起來,不會點到底下的東西
+            return True
+        return event.type in (pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION)
+
+    # ------------------------------------------------------------ 繪製
+
+    def draw(self, surface, rect, mouse_pos):
+        self.rect = rect
+        hover = self.enabled and rect.collidepoint(mouse_pos)
+        edge = self.accent if self.is_open else (theme.TEXT_FAINT if hover else theme.PANEL_EDGE)
+        rounded_panel(surface, rect, theme.BG_DEEP, radius=8, alpha=220, border=edge)
+        color = theme.TEXT if self.enabled else theme.TEXT_FAINT
+        text = clip_text(self.label, self.size, rect.width - 44)
+        image_h = theme.font(self.size).get_height()
+        draw_text(surface, text, (rect.x + 12, rect.centery - image_h // 2), self.size, color)
+        cx, cy = rect.right - 18, rect.centery
+        points = [(cx - 5, cy - 2), (cx, cy + 3), (cx + 5, cy - 2)] if not self.is_open else \
+            [(cx - 5, cy + 2), (cx, cy - 3), (cx + 5, cy + 2)]
+        pygame.draw.lines(surface, theme.TEXT_DIM if self.enabled else theme.TEXT_FAINT, False, points, 2)
+
+    def draw_menu(self, surface, mouse_pos):
+        if not self.is_open:
+            return
+        rows = self._visible_rows()
+        height = rows * self.ROW_H + 8
+        menu = pygame.Rect(self.rect.x, self.rect.bottom + 4, self.rect.width, height)
+        if menu.bottom > surface.get_height() - 8:
+            menu.bottom = self.rect.y - 4     # 下面放不下時往上展開
+        self._menu = menu
+        rounded_panel(surface, menu, theme.PANEL_LIGHT, radius=8, border=self.accent)
+        for row in range(rows):
+            index = row + self.scroll
+            option = self.options[index]
+            item = pygame.Rect(menu.x + 4, menu.y + 4 + row * self.ROW_H, menu.width - 8, self.ROW_H)
+            active = index == self.index
+            if active:
+                rounded_panel(surface, item, tuple(int(c * 0.30) for c in self.accent), radius=6)
+            elif item.collidepoint(mouse_pos):
+                rounded_panel(surface, item, theme.PANEL, radius=6)
+            note_w = 0
+            if len(option) > 2 and option[2]:
+                note_rect = draw_text(surface, option[2], (item.right - 10, item.centery), 12, theme.TEXT_FAINT,
+                                      right=True)
+                note_w = note_rect.width + 12
+            text = clip_text(option[1], self.size, item.width - 20 - note_w)
+            draw_text(surface, text, (item.x + 10, item.centery - theme.font(self.size).get_height() // 2),
+                      self.size, self.accent if active else theme.TEXT)
+        if self._max_scroll():
+            track = pygame.Rect(menu.right - 5, menu.y + 6, 3, menu.height - 12)
+            bar_h = max(20, track.height * rows // len(self.options))
+            top = track.y + (track.height - bar_h) * self.scroll // self._max_scroll()
+            pygame.draw.rect(surface, theme.PANEL_EDGE, track, border_radius=2)
+            pygame.draw.rect(surface, self.accent, (track.x, top, 3, bar_h), border_radius=2)
+
+
 def _clipboard_text() -> str:
     try:
         return pygame.scrap.get_text() or ""

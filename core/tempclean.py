@@ -20,6 +20,8 @@ EXTENSION = "temp_markers"
 MARKERS = ("plugins/pdf", "plugins/images")    # 本程式打包進去的插件資料夾
 LIBRARY_SUFFIXES = (".dll", ".pyd")
 MIN_AGE = 300    # 剛建立的資料夾可能是正在啟動、還沒載入 DLL 的程式,先不動
+WORK_PREFIXES = ("naiz_media_", "naiz_asr_")    # 轉檔(分析兩次的紀錄)、語音辨識的暫存工作資料夾
+WORK_MIN_AGE = 12 * 3600    # 很長的影片可能要轉好幾個小時,裡面的檔案 12 小時都沒更新才算是被中斷留下的
 _FOLDER = re.compile(r"_MEI[0-9A-Fa-f]+")
 _REMOVING = re.compile(r"_MEI[0-9A-Fa-f]+\.removing")
 
@@ -66,9 +68,36 @@ def stale_folders(markers, root=None, now=None):
     return found
 
 
+def _newest_change(folder):
+    newest = folder.stat().st_mtime
+    for path in folder.rglob("*"):
+        try:
+            newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            continue
+    return newest
+
+
+def stale_work_folders(root=None, now=None):
+    """轉檔、語音辨識被中斷(關機、當機)時留下的工作資料夾;裡面的檔案很久沒更新才算。"""
+    root = Path(root) if root is not None else Path(tempfile.gettempdir())
+    now = time.time() if now is None else now
+    found = []
+    for entry in root.iterdir():
+        try:
+            if entry.is_dir() and entry.name.startswith(WORK_PREFIXES) and now - _newest_change(entry) >= WORK_MIN_AGE:
+                found.append(entry)
+        except OSError:
+            continue
+    return found
+
+
 def clean(markers, root=None) -> int:
     """回傳刪掉幾個資料夾。先改名再刪:刪到一半被中斷時,下次啟動還認得出來繼續刪。"""
     removed = 0
+    for folder in stale_work_folders(root):
+        shutil.rmtree(folder, ignore_errors=True)
+        removed += not folder.exists()
     for folder in stale_folders(markers, root):
         target = folder
         if not _REMOVING.fullmatch(folder.name):

@@ -14,6 +14,9 @@ BYTES_PER_PIXEL = 4
 CONFIG_KEY = "large_file_warning"
 ROW_H = 58
 MAX_ROWS = 4
+MEMORY_SUBTITLE = "以下檔案處理時會用到大量記憶體或時間"
+MEMORY_NOTES = ("記憶體不夠時處理會失敗，處理期間電腦也可能變慢",
+                "建議先關閉其他佔用記憶體的程式；不確定的話可以先取消")
 
 
 def reason(size=0, pixels=0) -> str:
@@ -31,18 +34,22 @@ class LargeFileDialog:
         self.app = app
         self.is_open = False
         self.rows = []
+        self.notes = MEMORY_NOTES
+        self.subtitle = MEMORY_SUBTITLE
         self.on_continue = None
         self.read = False
         self.check_rect = pygame.Rect(0, 0, 0, 0)
         self.btn_next = Button("下一步", accent=theme.WARN, size=15)
         self.btn_cancel = Button("取消", filled=False, size=14)
 
-    def confirm(self, rows, on_continue):
-        """rows:[(檔名, 原因)]。沒有要提醒的檔案、或設定裡關掉提醒時直接繼續。"""
+    def confirm(self, rows, on_continue, notes=MEMORY_NOTES, subtitle=MEMORY_SUBTITLE):
+        """rows:[(檔名, 原因)];subtitle、notes:清單上面和下面的說明(預設是記憶體的提醒)。
+        沒有要提醒的檔案、或設定裡關掉提醒時直接繼續。"""
         if not rows or not self.app.config.get(CONFIG_KEY, True):
             on_continue()
             return
         self.rows, self.on_continue = list(rows), on_continue
+        self.notes, self.subtitle = tuple(notes), subtitle
         self.read = False
         self.is_open = True
 
@@ -79,7 +86,7 @@ class LargeFileDialog:
         shown = self.rows[:MAX_ROWS]
         more = len(self.rows) - len(shown)
         panel_w = 520
-        panel_h = 238 + len(shown) * ROW_H + (22 if more else 0)
+        panel_h = 198 + len(self.notes) * 20 + len(shown) * ROW_H + (22 if more else 0)
         panel = pygame.Rect((width - panel_w) // 2, (height - panel_h) // 2, panel_w, panel_h)
         rounded_panel(screen, panel, theme.PANEL, radius=14, alpha=250, border=theme.WARN)
 
@@ -87,7 +94,7 @@ class LargeFileDialog:
         y = panel.y + 20
         draw_text(screen, "檔案很大，繼續前請先確認", (x, y), 17, theme.WARN, bold=True)
         y += 32
-        draw_text(screen, "以下檔案處理時會用到大量記憶體或時間", (x, y), 13, theme.TEXT_DIM)
+        draw_text(screen, self.subtitle, (x, y), 13, theme.TEXT_DIM)
         y += 28
 
         for name, why in shown:
@@ -102,8 +109,7 @@ class LargeFileDialog:
             y += 22
 
         y += 4
-        for line in ("記憶體不夠時處理會失敗，處理期間電腦也可能變慢",
-                     "建議先關閉其他佔用記憶體的程式；不確定的話可以先取消"):
+        for line in self.notes:
             draw_text(screen, line, (x, y), 12, theme.TEXT_DIM)
             y += 20
 
