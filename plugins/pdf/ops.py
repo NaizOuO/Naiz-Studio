@@ -446,7 +446,8 @@ def merge(input_paths, output_path, *, page_size="keep", compress_after=False, q
                             width, height = shown_size(page)
                             if target is None:
                                 target = (width, height)
-                            size = target if (width >= height) == (target[0] >= target[1]) else target[::-1]
+                            # 正方形當成直向處理
+                            size = target if (width > height) == (target[0] > target[1]) else target[::-1]
                             destination = merged.add_blank_page(page_size=size)
                             destination.add_overlay(page)   # 等比縮放置中
                     pages += len(src.pages)

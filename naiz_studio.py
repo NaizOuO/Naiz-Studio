@@ -421,6 +421,12 @@ class App:
 
 
 def main():
+    # 給其他程式呼叫的命令列模式:不開視窗,做完就結束
+    if len(sys.argv) > 1 and sys.argv[1] == "--cli":
+        from core.cli import main as cli_main
+
+        sys.exit(cli_main(sys.argv[2:]))
+
     # 用 pythonw 啟動時沒有主控台,錯誤訊息會直接消失,所以改寫進 log 並跳視窗告知
     try:
         App().run()

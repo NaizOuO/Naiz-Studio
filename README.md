@@ -110,6 +110,23 @@ python naiz_studio.py
 | Liberation Sans、Liberation Serif（各 4 種樣式） | 英文，字寬和 Arial、Times New Roman 一樣 | 全部一起下載約 2.3 MB |
 | Noto Sans Mono | 英文等寬，程式碼、數據 | 約 1.6 MB |
 
+## 給其他程式呼叫（命令列）
+
+可以不開視窗，直接請 Naiz Studio 處理檔案。
+
+```bash
+python naiz_cli.py images-to-pdf --output 報告.pdf 照片1.jpg 照片2.jpg
+```
+
+打包成 exe 後則是 `"Naiz Studio.exe" --cli images-to-pdf …`；exe 沒有主控台，要加 `--result 結果.json`
+把結果寫成檔案。
+
+- `--page-size keep|a4|first`：每頁維持原大小、統一成 A4、統一成第一頁的大小（等比縮放置中，直向橫向各自對齊）
+- `--quality none|light|standard|strong`：壓縮等級
+- `--list 清單.txt`：檔案很多時改用清單檔，每行一個路徑
+- 結果是一行 JSON：`{"ok": true, "output": "…", "pages": 3, "bytes": 812345}`；失敗時 `ok` 為 `false`，
+  `error` 是可以直接顯示給使用者看的中文訊息，離開碼為 1
+
 ## 檔案位置
 
 以下都在 exe（或原始碼版的 `naiz_studio.py`）所在的資料夾：
