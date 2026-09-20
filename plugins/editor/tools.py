@@ -13,22 +13,22 @@ from core.widgets import Dropdown, draw_text, rounded_panel
 
 from . import annot_view, annots, fonts, geometry, model, pdfwrite
 from .font_picker import FontPicker
+from .palette import ColorPalette
 from .textarea import TextEditor, simple_layout
 
 BAR_H = 86
 TOOLS = [("select", "選取"), ("highlight", "螢光筆"), ("underline", "底線"), ("strike", "刪除線"), ("textbox", "文字框"),
          ("note", "便利貼"), ("line", "直線"), ("arrow", "箭頭"), ("rect", "方框"), ("ellipse", "圓形"), ("ink", "手繪")]
-COLORS = [(255, 214, 0), (120, 220, 90), (80, 190, 255), (255, 120, 190), (230, 40, 40), (255, 140, 0),
-          (40, 110, 230), (20, 20, 20)]
 WIDTH_OPTIONS = [(f"{v:g}", f"{v:g} pt") for v in (1, 2, 3, 5, 8)]
+SHAPE_WIDTH_OPTIONS = [("0", "無線條")] + WIDTH_OPTIONS
 BORDER_OPTIONS = [("0", "無外框")] + [(f"{v:g}", f"外框 {v:g} pt") for v in (1, 2, 3)]
 OPACITY_OPTIONS = [("1", "0%"), ("0.75", "25%"), ("0.5", "50%"), ("0.3", "70%")]
 SIZE_OPTIONS = [(f"{v:g}", f"{v:g} pt") for v in (8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 64, 72)]
 DEFAULTS = {
     "highlight": dict(opacity=1.0), "underline": dict(opacity=1.0), "strike": dict(opacity=1.0),
-    "textbox": dict(width=0.0, font="", font_size=14.0, opacity=1.0), "note": {},
+    "textbox": dict(width=0.0, font="", font_size=14.0, opacity=1.0, background=()), "note": {},
     "line": dict(width=2.0, opacity=1.0), "arrow": dict(width=2.0, opacity=1.0),
-    "rect": dict(width=2.0, opacity=1.0, fill=False), "ellipse": dict(width=2.0, opacity=1.0, fill=False),
+    "rect": dict(width=2.0, opacity=1.0, background=()), "ellipse": dict(width=2.0, opacity=1.0, background=()),
     "ink": dict(width=2.0, opacity=1.0),
 }
 DOUBLE_CLICK_MS = 400
@@ -38,8 +38,16 @@ HINT = "選擇上方的工具後在頁面上拖曳；點選註解可以移動、
 
 
 def _values(annot):
-    return dict(color=annot.color, opacity=annot.opacity, width=annot.width, fill=annot.fill, font=annot.font,
-                font_size=annot.font_size)
+    return dict(color=annot.color, opacity=annot.opacity, width=annot.width, background=annot.background,
+                font=annot.font, font_size=annot.font_size)
+
+
+# 每一種註解在設定列上有哪些顏色可以調:(設定名稱, 按鈕文字, 可不可以選「無」)
+COLOR_SLOTS = {
+    "textbox": [("color", "文字", False), ("background", "背景", True)],
+    "rect": [("color", "線條", False), ("background", "填滿", True)],
+    "ellipse": [("color", "線條", False), ("background", "填滿", True)],
+}
 
 
 class AnnotController:
@@ -53,8 +61,10 @@ class AnnotController:
         self.editing = None         # 正在打字的文字框或便利貼
         self.cache = annot_view.SurfaceCache()
         self.picker = FontPicker(page, self.accent)
+        self.palette = ColorPalette(self.accent)
+        self._palette_key = ""
         self.bar_rect = pygame.Rect(0, 0, 0, 0)
-        self.tool_rects, self.swatch_rects, self.fill_rects = [], [], []
+        self.tool_rects, self.color_buttons = [], []
         self.font_rect = pygame.Rect(0, 0, 0, 0)
         self.width_menu = Dropdown(WIDTH_OPTIONS, accent=self.accent, size=13)
         self.opacity_menu = Dropdown(OPACITY_OPTIONS, accent=self.accent, size=13)
@@ -146,9 +156,14 @@ class AnnotController:
         return None, None
 
     def apply_setting(self, **values):
-        kind, _ = self.target()
+        kind, current = self.target()
         if kind is None:
             return
+        if kind in ("rect", "ellipse"):
+            after = dict(current, **values)
+            if not after["width"] and not after["background"]:
+                self.page.notify("方框、圓形至少要留下線條或填滿其中一種", theme.WARN)
+                return
         self.settings[kind].update({key: value for key, value in values.items()
                                     if key == "color" or key in self.settings[kind]})
         if self.editing is not None:
@@ -284,7 +299,8 @@ class AnnotController:
             if index is not None:
                 editor.click(index, bool(pygame.key.get_mods() & pygame.KMOD_SHIFT))
                 return True
-            if self.bar_rect.collidepoint(pos) or any(menu.is_open for menu, _ in self._menus):
+            if self.bar_rect.collidepoint(pos) or self.palette.is_open \
+                    or any(menu.is_open for menu, _ in self._menus):
                 return False
             self.finish_editing()
             return False
@@ -302,6 +318,8 @@ class AnnotController:
 
     def handle_event(self, event, pos):
         """回傳 True 代表事件被註解工具用掉了。"""
+        if self.palette.handle_event(event, pos):
+            return True
         if self.editing is not None and self._handle_editing(event, pos):
             return True
         if self._handle_menus(event, pos):
@@ -341,13 +359,11 @@ class AnnotController:
             if rect.collidepoint(pos):
                 self.set_tool(key)
                 return
-        for color, rect in self.swatch_rects:
+        for key, rect, value, allow_none in self.color_buttons:
             if rect.collidepoint(pos):
-                self.apply_setting(color=color)
-                return
-        for fill, rect in self.fill_rects:
-            if rect.collidepoint(pos):
-                self.apply_setting(fill=fill)
+                self._palette_key = key
+                self.palette.open(rect, value, lambda color, key=key: self.apply_setting(**{key: color}),
+                                  allow_none=allow_none)
                 return
         if self.font_rect.collidepoint(pos):
             self.open_picker()
@@ -580,10 +596,12 @@ class AnnotController:
         self.tool = "select"
         self.cache.clear()
         self.picker.close()
+        self.palette.close()
 
     def deactivate(self):
         self.finish_editing()
         self.cancel_action()
+        self.palette.close()
         for menu in (self.width_menu, self.opacity_menu, self.size_menu):
             menu.close()
 
@@ -619,9 +637,27 @@ class AnnotController:
             menu.set_options(options)
         menu.set_value(key)
 
+    def _draw_color_button(self, x, cy, label, key, value, allow_none, mouse_pos):
+        screen = self.page.screen
+        rect = pygame.Rect(x, cy - 15, theme.font(13).size(label)[0] + 54, 30)
+        active = self.palette.is_open and self._palette_key == key
+        hover = rect.collidepoint(mouse_pos)
+        rounded_panel(screen, rect, theme.BG_DEEP, radius=8, alpha=220,
+                      border=self.accent if active else (theme.TEXT_FAINT if hover else theme.PANEL_EDGE))
+        self._label(label, rect.x + 10, cy, theme.TEXT)
+        swatch = pygame.Rect(rect.right - 28, cy - 9, 18, 18)
+        if value:
+            pygame.draw.rect(screen, value, swatch, border_radius=4)
+        else:
+            pygame.draw.rect(screen, theme.PANEL, swatch, border_radius=4)
+            pygame.draw.line(screen, theme.DANGER, (swatch.x + 3, swatch.bottom - 3), (swatch.right - 3, swatch.y + 3), 2)
+        pygame.draw.rect(screen, theme.PANEL_EDGE, swatch, 1, border_radius=4)
+        self.color_buttons.append((key, rect, tuple(value or ()), allow_none))
+        return rect
+
     def _draw_settings(self, row, mouse_pos):
         screen = self.page.screen
-        self.swatch_rects, self.fill_rects, self._menus = [], [], []
+        self.color_buttons, self._menus = [], []
         self.font_rect = pygame.Rect(0, 0, 0, 0)
         kind, values = self.target()
         cy = row.centery
@@ -629,29 +665,11 @@ class AnnotController:
             draw_text(screen, widgets.clip_text(HINT, 12, row.width), (row.x, cy - 8), 12, theme.TEXT_FAINT)
             return
         x = row.x
-        if row.width >= 800:    # 視窗窄時省略種類名稱,選取框已經看得出是哪一個註解
-            x = self._label(annots.LABELS[kind], row.x, cy, self.accent).right + 16
-        palette = list(COLORS) if tuple(values["color"]) in COLORS else [tuple(values["color"])] + COLORS
-        for color in palette:
-            swatch = pygame.Rect(x, cy - 9, 18, 18)
-            pygame.draw.rect(screen, color, swatch, border_radius=5)
-            if tuple(values["color"]) == color:
-                pygame.draw.rect(screen, self.accent, swatch.inflate(6, 6), 2, border_radius=7)
-            else:
-                pygame.draw.rect(screen, theme.PANEL_EDGE, swatch, 1, border_radius=5)
-            self.swatch_rects.append((color, swatch))
-            x = swatch.right + 5
-        x += 8
-        if kind in ("rect", "ellipse"):
-            for fill, label in ((False, "外框"), (True, "填色")):
-                box = pygame.Rect(x, cy - 14, 48, 28)
-                active = bool(values["fill"]) == fill
-                rounded_panel(screen, box, tuple(int(c * 0.3) for c in self.accent) if active else theme.BG_DEEP,
-                              radius=7, border=self.accent if active else theme.PANEL_EDGE)
-                draw_text(screen, label, box.center, 13, self.accent if active else theme.TEXT_DIM, center=True)
-                self.fill_rects.append((fill, box))
-                x = box.right + 4
-            x += 8
+        if row.width >= 900:    # 視窗窄時省略種類名稱,選取框已經看得出是哪一個註解
+            x = self._label(annots.LABELS[kind], row.x, cy, self.accent).right + 14
+        for key, label, allow_none in COLOR_SLOTS.get(kind, [("color", "顏色", False)]):
+            x = self._draw_color_button(x, cy, label, key, values[key], allow_none, mouse_pos).right + 6
+        x += 6
         if kind == "textbox":
             face = fonts.CATALOG.resolve(values["font"])
             self.font_rect = pygame.Rect(x, cy - 15, 150, 30)
@@ -667,10 +685,11 @@ class AnnotController:
             self._menus.append((self.size_menu, "font_size"))
             x += 90
         if kind in annots.SHAPES or kind == "textbox":
-            base = BORDER_OPTIONS if kind == "textbox" else WIDTH_OPTIONS
+            base = BORDER_OPTIONS if kind == "textbox" else \
+                (SHAPE_WIDTH_OPTIONS if kind in ("rect", "ellipse") else WIDTH_OPTIONS)
             self._sync(self.width_menu, base, values["width"], lambda v: f"{v:g} pt")
-            self.width_menu.enabled = not (kind in ("rect", "ellipse") and values["fill"])
-            menu_w = 100 if kind == "textbox" else 84
+            self.width_menu.enabled = True
+            menu_w = 100 if kind in ("textbox", "rect", "ellipse") else 84
             if kind != "textbox":
                 x = self._label("粗細", x, cy).right + 6
             self.width_menu.draw(screen, pygame.Rect(x, cy - 15, menu_w, 30), mouse_pos)
@@ -685,6 +704,7 @@ class AnnotController:
     def draw_menus(self, mouse_pos):
         for menu, _ in self._menus:
             menu.draw_menu(self.page.screen, mouse_pos)
+        self.palette.draw(self.page.screen, mouse_pos)
 
     # ------------------------------------------------------------ 繪製:頁面上的註解
 

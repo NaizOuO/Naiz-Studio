@@ -11,11 +11,14 @@ _original_flags = {}        # (文件, 頁, 第幾個註解) → 開檔時的旗
 _touched_pages = set()
 
 
-def open_document(path, password=None):
+def open_document(source, password=None):
+    """source 是檔案路徑,或已經讀進記憶體的內容(bytes)。
+    用 bytes 開啟時 Windows 不會鎖住檔案,使用者可以照常刪除、改名、移動那個檔。"""
     import pypdfium2
 
     with LOCK:
-        return pypdfium2.PdfDocument(str(path), password=password)
+        return pypdfium2.PdfDocument(source if isinstance(source, (bytes, bytearray)) else str(source),
+                                     password=password)
 
 
 def error_type():

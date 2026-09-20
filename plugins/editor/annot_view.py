@@ -88,7 +88,7 @@ def _textbox_surface(mapper, annot, cache):
     width, height = max(1, math.ceil((x1 - x0) * scale)), max(1, math.ceil((y1 - y0) * scale))
     if width * height > 40_000_000:
         return None
-    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    image = Image.new("RGBA", (width, height), tuple(annot.background) + (255,) if annot.background else (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
     color = tuple(annot.color) + (255,)
     if annot.width:
@@ -162,13 +162,19 @@ def draw_annot(screen, mapper, annot, cache):
                 _thick_line(layer, paint, b, end, line_width)
     elif kind in ("rect", "ellipse"):
         box = mapper.box(annot.box).move(-area.x, -area.y)
-        width = 0 if annot.fill else max(1, round(line_width))
-        if kind == "rect":
-            if width:
-                box = box.inflate(width // 2 * 2 - width + 1, width // 2 * 2 - width + 1)
-            pygame.draw.rect(layer, paint, box, width)
-        else:
-            pygame.draw.ellipse(layer, paint, box, width)
+        width = max(1, round(line_width)) if annot.width else 0
+        if annot.background:
+            fill = tuple(annot.background) + (255,)
+            if kind == "rect":
+                pygame.draw.rect(layer, fill, box)
+            else:
+                pygame.draw.ellipse(layer, fill, box)
+        if width:
+            if kind == "rect":
+                pygame.draw.rect(layer, paint, box.inflate(width // 2 * 2 - width + 1, width // 2 * 2 - width + 1),
+                                 width)
+            else:
+                pygame.draw.ellipse(layer, paint, box, width)
     elif kind == "ink":
         for stroke in annot.points:
             points = [local(p) for p in stroke]

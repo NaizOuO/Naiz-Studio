@@ -35,10 +35,13 @@ class FileItem:
     def __init__(self, path: Path):
         self.path = path
         self.size = path.stat().st_size if path.exists() else 0
-        self.pages = None
+        self.is_image = path.suffix.lower() in ops.IMAGE_EXTS
+        self.pages = 1 if self.is_image else None
         self.selected = set()
         self.spec_text = ""
-        threading.Thread(target=self._load_pages, daemon=True).start()
+        self.auto_select = not self.is_image    # 拆分時預設全選,使用者再自己取消
+        if not self.is_image:
+            threading.Thread(target=self._load_pages, daemon=True).start()
 
     def _load_pages(self):
         try:
@@ -48,6 +51,8 @@ class FileItem:
 
     @property
     def page_label(self):
+        if self.is_image:
+            return "圖片"
         if self.pages is None:
             return "讀取中..."
         if self.pages < 0:
@@ -98,6 +103,7 @@ class PdfPage(Page):
         self.thumbs = ThumbnailCache((TILE_W - 12, THUMB_H))
 
         purple = theme.TAB_COLORS["merge"]
+        self.m_size = SegmentedControl([(key, label) for key, label in ops.MERGE_SIZES.items()], accent=purple)
         self.m_compress = Toggle(False, accent=purple)
         self.m_quality = Slider(10, 95, 70, accent=purple)
 
@@ -141,9 +147,11 @@ class PdfPage(Page):
         was_empty = not self.current_files
         existing = {item.path for item in self.current_files}
         added = 0
+        # 合併可以放圖片(每張一頁),其他分頁只收 PDF
+        allowed = {".pdf"} | (ops.IMAGE_EXTS if self.tab == "merge" else set())
         for raw in raw_paths:
             path = Path(raw)
-            if path.suffix.lower() != ".pdf" or not path.is_file() or path in existing:
+            if path.suffix.lower() not in allowed or not path.is_file() or path in existing:
                 continue
             self.current_files.append(FileItem(path))
             added += 1
@@ -152,6 +160,20 @@ class PdfPage(Page):
             self.result_lines = []
             if self.tab == "split" and was_empty:
                 self.load_spec_into_input()
+
+    def _auto_select_all(self):
+        """拆分頁面讀完後預設全選;使用者已經自己打過頁碼就不動它。"""
+        for item in self.files["split"]:
+            if not item.auto_select or item.pages is None:
+                continue
+            item.auto_select = False
+            if item.pages > 0 and not item.spec_text:
+                item.selected = set(range(1, item.pages + 1))
+                item.spec_text = ops.format_page_spec(item.selected)
+                if item is self.split_item and not self.page_input.focused:
+                    self.page_input.set_text(item.spec_text)
+                    self.page_input.error = False
+                    self.page_error = ""
 
     def can_run(self):
         if not self.current_files:
@@ -379,6 +401,7 @@ class PdfPage(Page):
             items = list(self.current_files)
             do_compress = self.m_compress.value
             quality = int(self.m_quality.value)
+            page_size = self.m_size.value
 
             def job(runner):
                 def progress(done, total, msg):
@@ -386,7 +409,7 @@ class PdfPage(Page):
 
                 out = free_path(output_dir, f"{items[0].path.stem}_merged", ".pdf")
                 try:
-                    info = ops.merge([i.path for i in items], out,
+                    info = ops.merge([i.path for i in items], out, page_size=page_size,
                                      compress_after=do_compress, quality=quality,
                                      progress=progress, cancel=runner.cancel_event)
                     runner.log(f"合併 {len(items)} 個檔案，共 {info['pages']} 頁")
@@ -410,6 +433,7 @@ class PdfPage(Page):
         item = self.split_item
         if self.page_error == LOADING_PAGES and item is not None and item.pages is not None:
             self.apply_typed_spec()
+        self._auto_select_all()
 
         mouse = pygame.mouse.get_pos()
         delta = self.merge_drag.update(self.list_area) if self.tab == "merge" else 0
@@ -795,7 +819,7 @@ class PdfPage(Page):
     def draw_merge_options(self, rect, y, mouse_pos):
         inner = rect.width - 36
         files = self.current_files
-        draw_text(self.screen, "拖曳左側清單的檔案調整合併順序", (rect.x + 18, y), 13, theme.TEXT_DIM)
+        draw_text(self.screen, "拖曳左側清單的檔案調整合併順序，也可以放進圖片", (rect.x + 18, y), 13, theme.TEXT_DIM)
         y += 30
 
         total_pages = sum(f.pages for f in files if f.pages and f.pages > 0)
@@ -810,6 +834,16 @@ class PdfPage(Page):
                   self.accent, bold=True, center=True)
         draw_text(self.screen, "合計大小", (box.right - 40, box.y + 38), 11, theme.TEXT_FAINT, center=True)
         y += 78
+
+        draw_text(self.screen, "頁面大小", (rect.x + 18, y), 14, theme.TEXT)
+        y += 24
+        self.m_size.draw(self.screen, pygame.Rect(rect.x + 18, y, inner, 32), mouse_pos)
+        y += 38
+        hint = {"keep": "每一頁維持自己原本的大小",
+                "a4": "全部縮放置中到 A4，直向、橫向各自對齊",
+                "first": "全部縮放置中到第一頁的大小，直向、橫向各自對齊"}[self.m_size.value]
+        draw_text(self.screen, hint, (rect.x + 18, y), 12, theme.TEXT_FAINT)
+        y += 28
 
         draw_text(self.screen, "合併後壓縮", (rect.x + 18, y + 2), 14, theme.TEXT)
         draw_text(self.screen, "用 JPEG 重新編碼圖片", (rect.x + 18, y + 22), 12, theme.TEXT_FAINT)
@@ -950,6 +984,7 @@ class PdfPage(Page):
                 if self.s_output.value == "each":
                     self.s_format.clicked(mouse_pos, True)
         else:
+            self.m_size.clicked(mouse_pos, True)
             self.m_compress.clicked(mouse_pos, True)
 
         if self.runner.running:

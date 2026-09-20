@@ -17,10 +17,10 @@ LINE_HEIGHT = 1.3           # 行高是字型大小的幾倍
 BASELINE = 1.0              # 每行的基線離行頂多少(字型大小的倍數)
 MIN_TEXT_W = 24.0
 MIN_SHAPE = 4.0
-DEFAULT_COLORS = {
-    "highlight": (255, 214, 0), "underline": (40, 110, 230), "strike": (220, 40, 40), "textbox": (20, 20, 20),
-    "note": (255, 196, 0), "line": (220, 40, 40), "arrow": (220, 40, 40), "rect": (220, 40, 40),
-    "ellipse": (220, 40, 40), "ink": (40, 110, 230), "other": (150, 150, 150),
+DEFAULT_COLORS = {     # 和顏色選單裡的標準色一致
+    "highlight": (255, 255, 0), "underline": (0, 112, 192), "strike": (255, 0, 0), "textbox": (0, 0, 0),
+    "note": (255, 192, 0), "line": (255, 0, 0), "arrow": (255, 0, 0), "rect": (255, 0, 0),
+    "ellipse": (255, 0, 0), "ink": (0, 112, 192), "other": (150, 150, 150),
 }
 _SUBTYPES = {"Highlight": "highlight", "Underline": "underline", "StrikeOut": "strike", "FreeText": "textbox",
              "Text": "note", "Line": "line", "Square": "rect", "Circle": "ellipse", "Ink": "ink"}
@@ -41,7 +41,7 @@ class Annot:
     text: str = ""
     font: str = ""                  # 字型代號(fonts.FontFace.id)
     font_size: float = 12.0
-    fill: bool = False              # 方框、圓形:True 是半透明填色,False 是外框
+    background: tuple = ()          # 文字框的背景、方框與圓形的填滿顏色;空的表示沒有底色
     origin: int = -1                # 原檔這一頁 /Annots 的第幾個;-1 是在編輯器裡新增的
     subtype: str = ""               # 原檔的註解類型名稱
 
@@ -172,8 +172,8 @@ def styled(annot, **settings):
         allowed.add("opacity")
     if annot.kind in SHAPES or annot.kind == "textbox":
         allowed.add("width")
-    if annot.kind in ("rect", "ellipse"):
-        allowed.add("fill")
+    if annot.kind in ("rect", "ellipse", "textbox"):
+        allowed.add("background")
     if annot.kind == "textbox":
         allowed |= {"font", "font_size"}
     changes = {key: value for key, value in settings.items() if key in allowed}
@@ -258,7 +258,13 @@ def parse(obj, index, to_page):
             size = re.search(r"([\d.]+)\s+Tf", appearance)
             rgb = re.search(r"([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+rg", appearance)
             common["color"] = _color(rgb.groups(), (20, 20, 20)) if rgb else (20, 20, 20)
+            # 文字框的底色:PDF 規格是放在 /C,但我們自己存的檔另外記在 /NaizBG,才不會和文字顏色混在一起
+            if "/NaizFont" in obj:
+                background = _color(obj.get("/NaizBG"), ()) if "/NaizBG" in obj else ()
+            else:
+                background = _color(obj.get("/C"), ()) if "/C" in obj else ()
             return Annot(kind, box=box, width=_border_width(obj, 0.0), font=str(obj.get("/NaizFont", "")),
+                         background=background,
                          font_size=_number(size.group(1), 12.0) if size else 12.0, **common)
         if kind == "note":
             x0, y0 = box[0], box[1]
@@ -277,7 +283,8 @@ def parse(obj, index, to_page):
             x0, y0, x1, y1 = box
             if x1 - x0 > inset * 2 and y1 - y0 > inset * 2:
                 box = (x0 + inset, y0 + inset, x1 - inset, y1 - inset)
-            return Annot(kind, box=box, width=width, fill="/IC" in obj, **common)
+            background = _color(obj.get("/IC"), ()) if "/IC" in obj else ()
+            return Annot(kind, box=box, width=width, background=background, **common)
         if kind == "ink":
             strokes = []
             for stroke in obj.InkList:

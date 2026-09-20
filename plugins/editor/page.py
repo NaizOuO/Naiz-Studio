@@ -43,6 +43,7 @@ class EditorPage(Page):
         accent = tool.accent
         self.path = None
         self.docs = {}
+        self.data = {}              # 路徑 → 讀進記憶體的檔案內容;這樣編輯時不會鎖住原檔
         self.passwords = {}
         self.history = model.History()
         self.selected = set()
@@ -167,7 +168,7 @@ class EditorPage(Page):
     def open_file(self, path, password=None, keep_view=False):
         path = Path(path)
         try:
-            doc, pages = ops.open_pdf(path, password)
+            doc, pages, data = ops.open_pdf(path, password)
         except ops.PasswordRequired as exc:
             self._ask_password(path, lambda text: self.open_file(path, text, keep_view), str(exc) if password else "")
             return False
@@ -177,6 +178,8 @@ class EditorPage(Page):
         view_state = (self.zoom_mode, self.zoom, self.view.scroll, self.current_index()) if keep_view else None
         self.close_documents()
         self.docs[str(path)] = doc
+        if data is not None:
+            self.data[str(path)] = data
         if password:
             self.passwords[str(path)] = password
         self.path = str(path)
@@ -216,6 +219,7 @@ class EditorPage(Page):
             except Exception:
                 pass
         self.docs.clear()
+        self.data.clear()
         self.passwords.clear()
 
     def _ask_password(self, path, retry, error=""):
@@ -341,8 +345,10 @@ class EditorPage(Page):
                     if key in self.docs:
                         added = ops.page_refs(self.docs[key], key, self.passwords.get(key))
                     else:
-                        doc, added = ops.open_pdf(path, password)
+                        doc, added, data = ops.open_pdf(path, password)
                         self.docs[key] = doc
+                        if data is not None:
+                            self.data[key] = data
                         if password:
                             self.passwords[key] = password
                     refs.extend(added)
@@ -365,8 +371,9 @@ class EditorPage(Page):
             return
         pages = [self.pages[i] for i in indexes]
         out = ops.default_output(output_dir(), self.path, "_extract")
-        flatten = self.flatten
-        self._run(f"擷取 {len(pages)} 頁中...", lambda: ops.build(pages, out, self.passwords, flatten=flatten),
+        flatten, sources = self.flatten, dict(self.data)
+        self._run(f"擷取 {len(pages)} 頁中...",
+                  lambda: ops.build(pages, out, self.passwords, flatten=flatten, sources=sources),
                   lambda path: self.notify(f"已擷取 {len(pages)} 頁，存成「{path.name}」", theme.ACCENT))
 
     def _drop_pages(self, indexes, insert_at):
@@ -386,7 +393,7 @@ class EditorPage(Page):
             self.notify("不能覆蓋正在編輯的原檔，請換一個檔名", theme.DANGER)
             return
         pages = list(self.pages)
-        flatten = self.flatten
+        flatten, sources = self.flatten, dict(self.data)
 
         def done(path):
             self.history.mark_saved()
@@ -396,7 +403,8 @@ class EditorPage(Page):
             if then is not None:
                 then()
 
-        self._run("儲存中...", lambda: ops.build(pages, out, self.passwords, flatten=flatten), done)
+        self._run("儲存中...",
+                  lambda: ops.build(pages, out, self.passwords, flatten=flatten, sources=sources), done)
 
     def save_as(self):
         if self.path is None or self.busy:

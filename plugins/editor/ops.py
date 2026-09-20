@@ -12,6 +12,7 @@ from core.files import atomic_path, free_path
 from . import annots, model, pdfwrite
 
 IMAGE_DPI = 96      # 插入圖片時,每 96 像素算 1 英吋(和圖片工具轉 PDF 一樣)
+MEMORY_LIMIT = 400 * 1024 * 1024    # 超過這個大小的 PDF 不讀進記憶體,改成直接開檔
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 try:
     import pillow_heif
@@ -31,26 +32,36 @@ class Damaged(Exception):
 
 
 def open_pdf(path, password=None):
-    """回傳 (PDFium 文件, 頁面清單)。需要密碼或密碼錯誤時丟 PasswordRequired,檔案壞掉時丟 Damaged。"""
+    """回傳 (PDFium 文件, 頁面清單, 檔案內容)。需要密碼或密碼錯誤時丟 PasswordRequired,檔案壞掉時丟 Damaged。
+
+    檔案會先讀進記憶體再交給 PDFium,編輯期間不會鎖住原檔(可以刪除、改名、移動);
+    太大的檔案讀進記憶體不划算,改用原本的開檔方式,這時回傳的內容是 None。
+    """
     path = Path(path)
+    data = None
     try:
-        doc = pdfium.open_document(path, password)
+        if path.stat().st_size <= MEMORY_LIMIT:
+            data = path.read_bytes()
+    except OSError:
+        data = None
+    try:
+        doc = pdfium.open_document(data if data is not None else path, password)
     except pdfium.error_type() as exc:
         if "password" in str(exc).lower():
             raise PasswordRequired("密碼錯誤" if password else "這份檔案需要密碼才能開啟") from exc
         raise Damaged("檔案可能損壞，沒辦法開啟") from exc
-    pages = page_refs(doc, path, password)
+    pages = page_refs(doc, path, password, data)
     if not pages:
         pdfium.close(doc)
         raise Damaged("這份檔案沒有任何頁面")
-    return doc, pages
+    return doc, pages, data
 
 
-def read_annotations(path, password, infos):
+def read_annotations(path, password, infos, data=None):
     """每一頁原本就有的註解;infos 是 PDFium 讀到的 [(寬高, 旋轉, 頁面框原點)]。讀不到時當作沒有註解。"""
     found = [()] * len(infos)
     try:
-        with pikepdf.open(path, password=password or "") as pdf:
+        with pikepdf.open(io.BytesIO(data) if data is not None else path, password=password or "") as pdf:
             if len(pdf.pages) != len(infos):
                 return found
             for index, page in enumerate(pdf.pages):
@@ -62,10 +73,10 @@ def read_annotations(path, password, infos):
     return found
 
 
-def page_refs(doc, path, password=None):
+def page_refs(doc, path, password=None, data=None):
     """PDF 每一頁的頁面資料(含原本的註解)。"""
     infos = [pdfium.page_info(doc, index) for index in range(pdfium.page_count(doc))]
-    found = read_annotations(path, password, infos)
+    found = read_annotations(path, password, infos, data)
     return [model.new_ref("pdf", source=str(path), index=index, size=size, base_rotation=rotation, origin=origin,
                           annots=found[index], originals=found[index])
             for index, (size, rotation, origin) in enumerate(infos)]
@@ -100,9 +111,9 @@ def _image_pdf(path):
     return pikepdf.open(io.BytesIO(buffer.getvalue()))
 
 
-def build(pages, out_path, passwords=None, progress=None, cancel=None, flatten=False):
+def build(pages, out_path, passwords=None, progress=None, cancel=None, flatten=False, sources=None):
     """依頁面清單產生新的 PDF;先寫暫存檔,完成才換成正式檔名。存檔後不會保留原檔的密碼。
-    flatten 為 True 時把註解合併到頁面內容。"""
+    flatten 為 True 時把註解合併到頁面內容;sources 是已經讀進記憶體的來源檔(路徑 → 內容)。"""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     passwords = passwords or {}
@@ -117,7 +128,10 @@ def build(pages, out_path, passwords=None, progress=None, cancel=None, flatten=F
                 if ref.kind == "pdf":
                     src = opened.get(ref.source)
                     if src is None:
-                        src = opened[ref.source] = pikepdf.open(ref.source, password=passwords.get(ref.source, ""))
+                        data = (sources or {}).get(ref.source)
+                        src = opened[ref.source] = pikepdf.open(
+                            io.BytesIO(data) if data is not None else ref.source,
+                            password=passwords.get(ref.source, ""))
                     # 同一頁加兩次時 pikepdf 會各自複製一份,之後分別旋轉不會互相影響(已實測)
                     dst.pages.append(src.pages[ref.index])
                 elif ref.kind == "image":

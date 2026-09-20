@@ -239,6 +239,10 @@ def _appearance(pdf, annot, embedder):
                 canvas.add(red, green, blue, "RG", thickness, "w", lx0, y, "m", lx1, y, "l S")
     elif kind == "textbox":
         face, result = text_layout(annot)
+        if annot.background:
+            bx0, by1 = local((annot.box[0], annot.box[1]))
+            bx1, by0 = local((annot.box[2], annot.box[3]))
+            canvas.add(*_rgb(annot.background), "rg", bx0, by0, bx1 - bx0, by1 - by0, "re f")
         if annot.width:
             bx0, by1 = local((annot.box[0], annot.box[1]))
             bx1, by0 = local((annot.box[2], annot.box[3]))
@@ -284,15 +288,16 @@ def _appearance(pdf, annot, embedder):
     elif kind in ("rect", "ellipse"):
         bx0, by1 = local((annot.box[0], annot.box[1]))
         bx1, by0 = local((annot.box[2], annot.box[3]))
-        if annot.fill:
-            canvas.add(red, green, blue, "rg")
-        else:
+        if annot.background:
+            canvas.add(*_rgb(annot.background), "rg")
+        if annot.width:
             canvas.add(red, green, blue, "RG", annot.width, "w")
         if kind == "rect":
             canvas.add(bx0, by0, bx1 - bx0, by1 - by0, "re")
         else:
             _ellipse(canvas, bx0, by0, bx1, by1)
-        canvas.add("f" if annot.fill else "S")
+        # 有底色就填,有粗細就描邊,兩個都有時一次做完
+        canvas.add("B" if annot.background and annot.width else ("f" if annot.background else "S"))
     elif kind == "ink":
         canvas.add(red, green, blue, "RG", annot.width, "w 1 J 1 j")
         for stroke in annot.points:
@@ -353,8 +358,15 @@ def build_annot(pdf, page, ref, annot, embedder):
         obj.InkList = [[round(v, 3) for p in stroke for v in user(p)] for stroke in annot.points]
     if kind in ("line", "arrow", "rect", "ellipse", "ink", "textbox"):
         obj.BS = pikepdf.Dictionary(Type=pikepdf.Name.Border, W=round(annot.width, 3), S=pikepdf.Name.S)
-    if kind in ("rect", "ellipse") and annot.fill:
-        obj.IC = _rgb(annot.color)
+    if kind in ("rect", "ellipse") and annot.background:
+        obj.IC = _rgb(annot.background)
+    if kind == "textbox":
+        # PDF 規格裡 FreeText 的 /C 是底色;自己的檔案另外用 /NaizBG 記,讀回來才不會和文字顏色搞混
+        obj.NaizBG = _rgb(annot.background) if annot.background else pikepdf.Array([])
+        if annot.background:
+            obj.C = _rgb(annot.background)
+        elif "/C" in obj:
+            del obj["/C"]
     for key, value in extra.items():
         obj[f"/{key}"] = value
     return pdf.make_indirect(obj)

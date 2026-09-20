@@ -6,7 +6,7 @@ import unicodedata
 from pathlib import Path
 
 import pikepdf
-from PIL import Image
+from PIL import Image, ImageOps
 from pikepdf import Name, PdfImage
 
 from core import pdfium
@@ -21,6 +21,17 @@ COMPRESS_MODES = {
 }
 
 SPLIT_FORMATS = {"pdf": "PDF", "png": "PNG 圖片", "jpg": "JPG 圖片"}
+MERGE_SIZES = {"keep": "保持原樣", "a4": "統一成 A4", "first": "統一成第一頁"}
+A4_SIZE = (595.276, 841.89)
+IMAGE_DPI = 96
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+try:
+    import pillow_heif
+
+    pillow_heif.register_heif_opener()
+    IMAGE_EXTS |= {".heic", ".heif"}
+except ImportError:
+    pass
 
 
 class Cancelled(Exception):
@@ -387,8 +398,32 @@ def _pages_to_images(input_path, output_dir, stem, pages, fmt, dpi, progress, ca
 
 # ---------------------------------------------------------------- 合併
 
-def merge(input_paths, output_path, *, compress_after=False, quality=70, max_dim=2000,
+def _image_pdf(path):
+    """把圖片轉成單頁 PDF(每 96 像素算 1 英吋,和圖片工具轉 PDF 一樣)。"""
+    buffer = io.BytesIO()
+    with Image.open(path) as image:
+        image = ImageOps.exif_transpose(image)
+        if image.mode in ("RGBA", "LA", "P", "PA") or "transparency" in image.info:
+            rgba = image.convert("RGBA")
+            ground = Image.new("RGB", rgba.size, (255, 255, 255))
+            ground.paste(rgba, mask=rgba.getchannel("A"))
+            image = ground
+        image.convert("RGB").save(buffer, "PDF", resolution=IMAGE_DPI)
+    return pikepdf.open(io.BytesIO(buffer.getvalue()))
+
+
+def shown_size(page) -> tuple:
+    """一頁看起來的寬高(點),已經算進頁面本身的旋轉。"""
+    box = [float(v) for v in (page.obj.get("/CropBox") or page.mediabox)]
+    width, height = abs(box[2] - box[0]), abs(box[3] - box[1])
+    rotate = int(page.obj.get("/Rotate", 0)) % 360
+    return (height, width) if rotate in (90, 270) else (width, height)
+
+
+def merge(input_paths, output_path, *, page_size="keep", compress_after=False, quality=70, max_dim=2000,
           progress=None, cancel=None) -> dict:
+    """合併 PDF 與圖片。page_size:keep 保持原樣、a4 統一成 A4、first 統一成第一頁的大小;
+    統一大小時等比縮放置中,不裁切,直向橫向各自對齊。"""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     paths = [Path(p) for p in input_paths]
@@ -396,13 +431,24 @@ def merge(input_paths, output_path, *, compress_after=False, quality=70, max_dim
 
     merged = pikepdf.Pdf.new()
     pages = 0
+    target = A4_SIZE if page_size == "a4" else None
     try:
         # 合併、壓縮都做完才換成正式檔名
         with atomic_path(output_path) as staging:
             for index, path in enumerate(paths, start=1):
                 _check(cancel)
-                with pikepdf.open(path) as src:
-                    merged.pages.extend(src.pages)
+                src = _image_pdf(path) if path.suffix.lower() in IMAGE_EXTS else pikepdf.open(path)
+                with src:
+                    if page_size == "keep":
+                        merged.pages.extend(src.pages)
+                    else:
+                        for page in src.pages:
+                            width, height = shown_size(page)
+                            if target is None:
+                                target = (width, height)
+                            size = target if (width >= height) == (target[0] >= target[1]) else target[::-1]
+                            destination = merged.add_blank_page(page_size=size)
+                            destination.add_overlay(page)   # 等比縮放置中
                     pages += len(src.pages)
                 _report(progress, index, len(paths), f"併入 {path.name}")
 
