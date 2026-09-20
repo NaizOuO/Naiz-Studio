@@ -9,7 +9,7 @@ from PIL import Image, ImageOps
 from core import pdfium
 from core.files import atomic_path, free_path
 
-from . import model
+from . import annots, model, pdfwrite
 
 IMAGE_DPI = 96      # 插入圖片時,每 96 像素算 1 英吋(和圖片工具轉 PDF 一樣)
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
@@ -39,14 +39,36 @@ def open_pdf(path, password=None):
         if "password" in str(exc).lower():
             raise PasswordRequired("密碼錯誤" if password else "這份檔案需要密碼才能開啟") from exc
         raise Damaged("檔案可能損壞，沒辦法開啟") from exc
-    pages = []
-    for index in range(pdfium.page_count(doc)):
-        pages.append(model.new_ref("pdf", source=str(path), index=index, size=pdfium.page_size(doc, index),
-                                   base_rotation=pdfium.page_rotation(doc, index)))
+    pages = page_refs(doc, path, password)
     if not pages:
         pdfium.close(doc)
         raise Damaged("這份檔案沒有任何頁面")
     return doc, pages
+
+
+def read_annotations(path, password, infos):
+    """每一頁原本就有的註解;infos 是 PDFium 讀到的 [(寬高, 旋轉, 頁面框原點)]。讀不到時當作沒有註解。"""
+    found = [()] * len(infos)
+    try:
+        with pikepdf.open(path, password=password or "") as pdf:
+            if len(pdf.pages) != len(infos):
+                return found
+            for index, page in enumerate(pdf.pages):
+                if "/Annots" in page.obj:
+                    size, rotation, origin = infos[index]
+                    found[index] = annots.read_page(page.obj, size, rotation, origin)
+    except Exception:
+        pass
+    return found
+
+
+def page_refs(doc, path, password=None):
+    """PDF 每一頁的頁面資料(含原本的註解)。"""
+    infos = [pdfium.page_info(doc, index) for index in range(pdfium.page_count(doc))]
+    found = read_annotations(path, password, infos)
+    return [model.new_ref("pdf", source=str(path), index=index, size=size, base_rotation=rotation, origin=origin,
+                          annots=found[index], originals=found[index])
+            for index, (size, rotation, origin) in enumerate(infos)]
 
 
 def load_image(path):
@@ -78,13 +100,15 @@ def _image_pdf(path):
     return pikepdf.open(io.BytesIO(buffer.getvalue()))
 
 
-def build(pages, out_path, passwords=None, progress=None, cancel=None):
-    """依頁面清單產生新的 PDF;先寫暫存檔,完成才換成正式檔名。存檔後不會保留原檔的密碼。"""
+def build(pages, out_path, passwords=None, progress=None, cancel=None, flatten=False):
+    """依頁面清單產生新的 PDF;先寫暫存檔,完成才換成正式檔名。存檔後不會保留原檔的密碼。
+    flatten 為 True 時把註解合併到頁面內容。"""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     passwords = passwords or {}
     opened, extra = {}, []
     dst = pikepdf.Pdf.new()
+    embedder = pdfwrite.FontEmbedder(dst)
     try:
         with atomic_path(out_path) as temp:
             for number, ref in enumerate(pages, start=1):
@@ -104,8 +128,13 @@ def build(pages, out_path, passwords=None, progress=None, cancel=None):
                     dst.add_blank_page(page_size=ref.size)
                 # 旋轉用 PDFium 讀到的角度重新設定,連從上層繼承來的旋轉也算進去
                 dst.pages[-1].obj.Rotate = (ref.base_rotation + ref.rotation) % 360
+                pdfwrite.write_page(dst, dst.pages[-1], ref, embedder)
                 if progress:
                     progress(number, len(pages))
+            embedder.finish()
+            if flatten:
+                for page in dst.pages:
+                    pdfwrite.flatten_page(dst, page)
             dst.save(temp, compress_streams=True, object_stream_mode=pikepdf.ObjectStreamMode.generate)
     finally:
         dst.close()

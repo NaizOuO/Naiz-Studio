@@ -14,6 +14,7 @@ from core.widgets import Button, Dropdown, TextInput, draw_text, rounded_panel
 from . import model, ops
 from .dialog import Dialog
 from .render import MAX_PIXELS, PageRenderer
+from .tools import BAR_H, AnnotController
 
 SIDEBAR_W = 196
 THUMB_BOX = (128, 150)
@@ -66,6 +67,9 @@ class EditorPage(Page):
         self.thumb_area = pygame.Rect(0, 0, 0, 0)
         self.thumb_slots = []
         self.page_hits = []
+        self.view_offset = (0, 0)       # 頁面內容座標換成畫面位置要加上的位移
+        self.flatten = False            # 儲存時把註解合併到頁面
+        self.flatten_rect = pygame.Rect(0, 0, 0, 0)
 
         self.btn_open = Button("開啟", filled=False, size=13)
         self.btn_undo = Button("復原", filled=False, size=13)
@@ -84,6 +88,7 @@ class EditorPage(Page):
         self.btn_extract = Button("擷取選取的頁面", filled=False, size=13)
         self.btn_save_as = Button("選擇位置儲存", filled=False, size=13)
         self.btn_empty_open = Button("選擇 PDF 檔案", accent=accent, size=15)
+        self.annot = AnnotController(self)
 
     # ------------------------------------------------------------ 資料
 
@@ -112,7 +117,7 @@ class EditorPage(Page):
         self.message = (text, color, pygame.time.get_ticks())
 
     def has_unsaved(self):
-        return self.path is not None and self.history.dirty
+        return self.path is not None and (self.history.dirty or self.annot.editing is not None)
 
     def leave(self, proceed):
         """回首頁、關閉程式前呼叫;確定離開後關掉目前的文件,重新進來時是空白畫面,可以直接拖入新檔。"""
@@ -124,6 +129,7 @@ class EditorPage(Page):
 
     def ask_unsaved(self, proceed):
         """有未儲存的變更時先詢問(儲存、不儲存、取消),確定後才呼叫 proceed()。"""
+        self.annot.finish_editing()
         if not self.has_unsaved():
             proceed()
             return
@@ -197,6 +203,7 @@ class EditorPage(Page):
         self.view.scroll = self.thumb_view.scroll = self.scroll_x = 0
         self.zoom_mode = "fit_width"
         self.message = None
+        self.annot.reset()
         self.deactivate()
 
     def close_documents(self):
@@ -257,6 +264,7 @@ class EditorPage(Page):
                 self.notify(str(value), theme.DANGER)
             else:
                 self.notify(f"失敗：{value}", theme.DANGER)
+        self.annot.update()
         self.view.update(mouse)
         self.thumb_view.update(mouse)
         delta = self.drag.update(self.thumb_area)
@@ -331,12 +339,7 @@ class EditorPage(Page):
                 key = str(path)
                 try:
                     if key in self.docs:
-                        doc = self.docs[key]
-                        from core import pdfium
-
-                        added = [model.new_ref("pdf", source=key, index=n, size=pdfium.page_size(doc, n),
-                                               base_rotation=pdfium.page_rotation(doc, n))
-                                 for n in range(pdfium.page_count(doc))]
+                        added = ops.page_refs(self.docs[key], key, self.passwords.get(key))
                     else:
                         doc, added = ops.open_pdf(path, password)
                         self.docs[key] = doc
@@ -356,12 +359,14 @@ class EditorPage(Page):
         step(0)
 
     def extract(self):
+        self.annot.finish_editing()
         indexes = self.selected_indexes()
         if not indexes or self.busy:
             return
         pages = [self.pages[i] for i in indexes]
         out = ops.default_output(output_dir(), self.path, "_extract")
-        self._run(f"擷取 {len(pages)} 頁中...", lambda: ops.build(pages, out, self.passwords),
+        flatten = self.flatten
+        self._run(f"擷取 {len(pages)} 頁中...", lambda: ops.build(pages, out, self.passwords, flatten=flatten),
                   lambda path: self.notify(f"已擷取 {len(pages)} 頁，存成「{path.name}」", theme.ACCENT))
 
     def _drop_pages(self, indexes, insert_at):
@@ -374,21 +379,24 @@ class EditorPage(Page):
     def save(self, target=None, then=None):
         if self.path is None or self.busy:
             return
+        self.annot.finish_editing()
         out = Path(target) if target else ops.default_output(output_dir(), self.path)
         sources = {Path(page.source).resolve() for page in self.pages if page.source}
         if out.exists() and out.resolve() in sources:
             self.notify("不能覆蓋正在編輯的原檔，請換一個檔名", theme.DANGER)
             return
         pages = list(self.pages)
+        flatten = self.flatten
 
         def done(path):
             self.history.mark_saved()
             if self.open_file(path, keep_view=True):
-                self.notify(f"已儲存成「{path.name}」，接下來編輯這份新檔", theme.ACCENT)
+                merged = "，註解已合併到頁面" if flatten else ""
+                self.notify(f"已儲存成「{path.name}」{merged}，接下來編輯這份新檔", theme.ACCENT)
             if then is not None:
                 then()
 
-        self._run("儲存中...", lambda: ops.build(pages, out, self.passwords), done)
+        self._run("儲存中...", lambda: ops.build(pages, out, self.passwords, flatten=flatten), done)
 
     def save_as(self):
         if self.path is None or self.busy:
@@ -443,6 +451,10 @@ class EditorPage(Page):
                       steps[-1])
         self.set_zoom(target, anchor)
 
+    def view_scale(self):
+        """主畫面上 1 點是幾個像素。"""
+        return POINT_PX * self.zoom
+
     def scroll_to_page(self, index):
         index = max(0, min(len(self.pages) - 1, index))
         for i, rect in self.layout:
@@ -489,12 +501,19 @@ class EditorPage(Page):
         x += 108
         self.btn_zoom_in.draw(screen, pygame.Rect(x, y, 32, h), mouse_pos)
         x += 48
-        if has_doc:
+        save_w = 70
+        room = rect.right - save_w - 12
+        if has_doc and x + 50 <= room:
             if not self.page_input.focused:
                 self.page_input.set_text(str(self.current_index() + 1))
             self.page_input.draw(screen, pygame.Rect(x, y, 50, h), mouse_pos)
-            draw_text(screen, f"/ {len(self.pages)} 頁", (x + 58, rect.centery - 9), 13, theme.TEXT_DIM)
-        save_w = 70
+            count = f"/ {len(self.pages)} 頁"
+            if x + 58 + theme.font(13).size(count)[0] <= room:
+                draw_text(screen, count, (x + 58, rect.centery - 9), 13, theme.TEXT_DIM)
+        else:
+            # 視窗太窄時不顯示頁碼,避免和「儲存」重疊
+            self.page_input.blur()
+            self.page_input.rect = pygame.Rect(0, 0, 0, 0)
         self.btn_save.enabled = has_doc and not self.busy
         self.btn_save.draw(screen, pygame.Rect(rect.right - save_w, y, save_w, h), mouse_pos)
         self.zoom_menu.draw_menu(screen, mouse_pos)
@@ -506,10 +525,14 @@ class EditorPage(Page):
             self._draw_empty(body, mouse_pos)
         else:
             self.sidebar_rect = pygame.Rect(body.x, body.y, SIDEBAR_W, body.height)
-            self.view_rect = pygame.Rect(body.x + SIDEBAR_W, body.y, body.width - SIDEBAR_W, body.height)
+            bar = pygame.Rect(body.x + SIDEBAR_W, body.y, body.width - SIDEBAR_W, BAR_H)
+            self.view_rect = pygame.Rect(body.x + SIDEBAR_W, body.y + BAR_H, body.width - SIDEBAR_W, body.height - BAR_H)
             self._draw_view(mouse_pos)
             self._draw_sidebar(mouse_pos)
+            self.annot.draw_bar(bar, mouse_pos)
         self._draw_status(pygame.Rect(rect.x, rect.bottom - STATUS_H, rect.width, STATUS_H), mouse_pos)
+        if self.path is not None:
+            self.annot.draw_menus(mouse_pos)
         if self.busy:
             veil = pygame.Surface(body.size, pygame.SRCALPHA)
             veil.fill((8, 10, 14, 110))
@@ -526,8 +549,8 @@ class EditorPage(Page):
             pygame.draw.line(screen, theme.PANEL_EDGE, (sheet.x + 12, sheet.y + 22 + i * 14),
                              (sheet.right - 12, sheet.y + 22 + i * 14), 3)
         draw_text(screen, "把 PDF 拖曳到這個視窗開始編輯", (cx, cy + 66), 16, theme.TEXT_DIM, center=True)
-        draw_text(screen, "可以調整頁面順序、旋轉、刪除、插入空白頁或其他檔案", (cx, cy + 92), 13, theme.TEXT_FAINT,
-                  center=True)
+        draw_text(screen, "可以調整頁面順序、旋轉、刪除、插入頁面，也可以加上螢光筆、文字框、便利貼等註解", (cx, cy + 92), 13,
+                  theme.TEXT_FAINT, center=True)
         self.btn_empty_open.draw(screen, pygame.Rect(cx - 80, cy + 124, 160, 40), mouse_pos)
 
     def _layout_pages(self):
@@ -555,6 +578,7 @@ class EditorPage(Page):
         self.scroll_x = max(0, min(self.scroll_x, max_x))
         offset_x = area.x + (max(0, (area.width - 12 - self.content_w) / 2)) - self.scroll_x
         scale = POINT_PX * self.zoom
+        self.view_offset = (round(offset_x), area.y - self.view.scroll)
         selected = set(self.selected_indexes())
         requests, thumb_requests = [], []
         self.page_hits = []
@@ -569,8 +593,9 @@ class EditorPage(Page):
             pygame.draw.rect(screen, (10, 12, 16), shadow)
             pygame.draw.rect(screen, (255, 255, 255), screen_rect)
             full_pixels = screen_rect.width * screen_rect.height
+            hidden = self.annot.extra_hidden(page)
             if full_pixels <= MAX_PIXELS:
-                key = self.renderer.key(page, scale)
+                key = self.renderer.key(page, scale, extra=hidden)
                 surface = self.renderer.get(key)
                 if surface is None:
                     requests.append((key, page, scale, None))
@@ -587,17 +612,19 @@ class EditorPage(Page):
                 x1 = min(width_pt, (int(((visible.right - screen_rect.x) / scale) // grid) + 1) * grid)
                 y1 = min(height_pt, (int(((visible.bottom - screen_rect.y) / scale) // grid) + 1) * grid)
                 crop = (x0, height_pt - y1, width_pt - x1, y0)
-                key = self.renderer.key(page, scale, crop)
+                key = self.renderer.key(page, scale, crop, hidden)
                 surface = self.renderer.get(key)
                 if surface is None:
                     requests.append((key, page, scale, crop))
                     self._blit_fallback(page, screen_rect)
                 else:
                     screen.blit(surface, (screen_rect.x + round(x0 * scale), screen_rect.y + round(y0 * scale)))
-            if self.renderer.failed(self.renderer.key(page, scale)):
+            self.annot.draw_page(index, screen_rect, scale)
+            if self.renderer.failed(self.renderer.key(page, scale, extra=hidden)):
                 draw_text(screen, "這一頁無法顯示", screen_rect.center, 14, theme.DANGER, center=True)
             if index in selected and len(self.pages) > 1:
                 pygame.draw.rect(screen, self.tool.accent, screen_rect.inflate(6, 6), 2, border_radius=3)
+        self.annot.draw_view_overlay()
         screen.set_clip(None)
         self._thumb_requests_main = requests
         self.view.draw(screen, mouse_pos)
@@ -650,7 +677,7 @@ class EditorPage(Page):
             elif slot.collidepoint(mouse_pos) and area.collidepoint(mouse_pos):
                 rounded_panel(screen, slot, theme.PANEL_LIGHT, radius=8)
             scale = self._thumb_scale(page)
-            key = self.renderer.key(page, scale)
+            key = self.renderer.key(page, scale, extra=self.annot.extra_hidden(page))
             surface = self.renderer.get(key)
             width, height = page.shown_size
             box = pygame.Rect(0, 0, round(width * scale), round(height * scale))
@@ -660,6 +687,7 @@ class EditorPage(Page):
                 screen.blit(surface, surface.get_rect(center=box.center))
             else:
                 thumb_requests.append((key, page, scale, None))
+            self.annot.draw_thumb(index, page, box, scale)
             if dragging:
                 shade = pygame.Surface(box.size, pygame.SRCALPHA)
                 shade.fill((20, 24, 30, 150))
@@ -710,10 +738,22 @@ class EditorPage(Page):
         self.btn_save_as.draw(screen, pygame.Rect(right - 118, rect.y + 7, 118, 32), mouse_pos)
         hint = draw_text(screen, "「儲存」預設存到 output\\editor\\", (right - 130, rect.y + 23), 12,
                          theme.TEXT_FAINT, right=True)
+        label = "儲存時合併註解到頁面"
+        label_w = theme.font(12).size(label)[0]
+        self.flatten_rect = pygame.Rect(hint.x - 24 - label_w - 22, rect.y + 12, label_w + 22, 22)
+        box = pygame.Rect(self.flatten_rect.x, rect.centery - 7, 14, 14)
+        if self.flatten:
+            pygame.draw.rect(screen, self.tool.accent, box, border_radius=3)
+            pygame.draw.lines(screen, theme.BG_DEEP, False, [(box.x + 3, box.centery), (box.x + 6, box.bottom - 4),
+                                                            (box.right - 3, box.y + 4)], 2)
+        else:
+            edge = theme.TEXT_FAINT if self.flatten_rect.collidepoint(mouse_pos) else theme.PANEL_EDGE
+            pygame.draw.rect(screen, edge, box, 1, border_radius=3)
+        draw_text(screen, label, (box.right + 8, rect.centery - theme.font(12).get_height() // 2), 12, theme.TEXT_DIM)
         if self.message is not None:
             text, color, at = self.message
             if pygame.time.get_ticks() - at < MESSAGE_MS:
-                width = hint.x - 24 - (name.right + 200)
+                width = self.flatten_rect.x - 24 - (name.right + 200)
                 if width > 80:
                     draw_text(screen, widgets.clip_text(text, 13, width), (name.right + 200, rect.y + 14), 13, color)
             else:
@@ -739,15 +779,22 @@ class EditorPage(Page):
     # ------------------------------------------------------------ 事件
 
     def modal_open(self):
-        return self.dialog.is_open
+        return self.dialog.is_open or self.annot.picker.is_open
 
     def draw_modal(self, mouse_pos):
-        self.dialog.draw(mouse_pos)
+        if self.annot.picker.is_open:
+            self.annot.picker.draw(mouse_pos)
+        else:
+            self.dialog.draw(mouse_pos)
 
     def handle_modal_event(self, event, mouse_pos):
-        self.dialog.handle_event(event, mouse_pos)
+        if self.annot.picker.is_open:
+            self.annot.picker.handle_event(event, mouse_pos)
+        else:
+            self.dialog.handle_event(event, mouse_pos)
 
     def deactivate(self):
+        self.annot.deactivate()
         self.view.reset()
         self.thumb_view.reset()
         self.drag.cancel()
@@ -776,6 +823,9 @@ class EditorPage(Page):
         if self.path is not None:
             self.page_input.handle(event, mouse_pos)
         if self.page_input.focused:
+            return
+        if self.path is not None and self.annot.handle_event(event, mouse_pos):
+            self._pending_single = None
             return
         if self.drag.handle(event, mouse_pos):
             self._pending_single = None
@@ -897,6 +947,9 @@ class EditorPage(Page):
                 self.ask_open_file()
             elif self.btn_open.clicked(pos, True):
                 self.ask_open_file()
+            return
+        if self.flatten_rect.collidepoint(pos):
+            self.flatten = not self.flatten
             return
         actions = [
             (self.btn_open, self.ask_open_file),

@@ -20,6 +20,9 @@ class PageRef:
     base_rotation: int = 0      # 來源頁面本身設定的旋轉角度
     rotation: int = 0           # 編輯時另外轉的角度
     uid: int = 0                # 每一頁獨一無二的編號;複製出來的頁面也是新的編號
+    origin: tuple = (0.0, 0.0)  # 頁面框左下角在 PDF 裡的座標(大多是 0, 0)
+    annots: tuple = ()          # 目前的註解(annots.Annot),座標見 geometry 的說明
+    originals: tuple = ()       # 開檔時讀到的註解;沒被改過的原註解儲存時原封不動保留
 
     @property
     def shown_size(self):
@@ -55,6 +58,10 @@ def duplicate(pages, indexes):
             result.append(replace(page, uid=next(_ids)))
             copies.append(len(result) - 1)
     return result, copies
+
+
+def set_annots(pages, index, annots):
+    return [replace(page, annots=tuple(annots)) if i == index else page for i, page in enumerate(pages)]
 
 
 def insert(pages, at, refs):

@@ -11,7 +11,7 @@ from PIL import Image
 
 from core import pdfium
 
-from . import ops
+from . import annots, ops
 
 CACHE_BYTES = 200 * 1024 * 1024
 MAX_PIXELS = 8_000_000      # 整頁畫出來超過這麼多像素(約 30MB)時,改成只畫看得到的範圍;A4 放大到 300% 左右開始
@@ -38,8 +38,12 @@ class PageRenderer:
         threading.Thread(target=self._worker, daemon=True).start()
 
     @staticmethod
-    def key(ref, scale, crop=None):
-        return identity(ref) + (round(scale, 4), crop)
+    def key(ref, scale, crop=None, extra=()):
+        # 被改過或刪掉的原註解不給 PDFium 畫(extra 是正在拖曳、編輯的);藏起來的註解不同時要重畫
+        hidden = annots.hidden_origins(ref)
+        if extra:
+            hidden = tuple(sorted(set(hidden) | set(extra)))
+        return identity(ref) + (round(scale, 4), crop, hidden)
 
     def clear(self):
         """換檔案時清掉所有圖;還在畫的舊圖畫完也不會放進來。"""
@@ -75,7 +79,7 @@ class PageRenderer:
         ident = identity(ref)
         best = None
         for key, surface in self._surfaces.items():
-            if key[:len(ident)] == ident and key[-1] is None:
+            if key[:len(ident)] == ident and key[len(ident) + 1] is None:
                 if best is None or surface.get_width() > best.get_width():
                     best = surface
         return best
@@ -103,10 +107,10 @@ class PageRenderer:
         self._images.move_to_end(path)
         return image
 
-    def _draw(self, ref, scale, crop):
+    def _draw(self, ref, scale, crop, hidden=()):
         if ref.kind == "pdf":
             return pdfium.render(self.docs[ref.source], ref.index, scale, rotation=ref.rotation,
-                                 crop=crop or (0, 0, 0, 0))
+                                 crop=crop or (0, 0, 0, 0), hidden=hidden)
         shown_w, shown_h = ref.shown_size
         left, bottom, right, top = crop or (0, 0, 0, 0)
         size = (max(1, round((shown_w - left - right) * scale)), max(1, round((shown_h - top - bottom) * scale)))
@@ -131,7 +135,7 @@ class PageRenderer:
                 self._busy = key
                 generation = self._generation
             try:
-                image = self._draw(ref, scale, crop)
+                image = self._draw(ref, scale, crop, key[-1])
                 result = (image.width, image.height, image.convert("RGB").tobytes())
                 with self._cond:
                     if generation == self._generation:

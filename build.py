@@ -17,7 +17,8 @@ NAME = "Naiz Studio"
 EXTRA_IMPORTS = ["pypdfium2", "resvg_py", "pikepdf", "opencc", "pillow_heif", "vtracer", "queue"]
 # 已經不用的套件:開發環境裡可能還裝著,明確排除才不會被一起打包
 EXCLUDE = ["tkinter", "pymupdf", "fitz"]
-COLLECT = ["core", "PIL"]
+# fontTools 讀字型表格時是依名稱動態匯入模組,要整包收進去
+COLLECT = ["core", "PIL", "fontTools"]
 
 
 def plugin_modules():

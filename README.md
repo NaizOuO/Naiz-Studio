@@ -12,7 +12,11 @@
 ### PDF 編輯器
 - **檢視**：左側頁面縮圖，右側所有頁面連續捲動，可縮放（適合寬度、整頁、50%～400%）
 - **頁面管理**：拖曳排序、旋轉、刪除、複製、插入空白頁，把其他 PDF 或圖片拖進來插入，擷取選取的頁面
-- **復原與重做**：每一步頁面操作都可以復原
+- **標記與註解**：螢光筆、底線、刪除線（在文字上拖曳，自動對齊文字行）、文字框（直接在頁面上打字，支援注音）、便利貼、直線、箭頭、方框、圓形、手繪；可以調整顏色、粗細、透明度、字型與字級
+- **修改註解**：新增的註解和檔案原本就有的註解，都能移動、調整大小、改顏色或刪除
+- **儲存註解**：存成標準的 PDF 註解，用其他閱讀器也看得到、改得了；也可以勾選「儲存時合併註解到頁面」，合併後就不能再當成註解修改
+- **字型**：可以用開源字型包、電腦上的字型，或自己加入字型檔；選的字型裡沒有的字（例如英文字型裡的中文）會自動用中文字型補上。電腦上的字型會依字型檔的授權設定判斷能不能嵌入
+- **復原與重做**：每一步頁面操作、註解修改都可以復原
 - **儲存**：另存新檔，不覆蓋原檔；也可以自己選擇存檔位置
 - **有密碼的 PDF**：輸入密碼後開啟（儲存的新檔不會保留密碼）
 - **修復損壞的 PDF**：開不了的檔案可以嘗試修復，救回還能讀取的頁面
@@ -59,7 +63,7 @@ python naiz_studio.py
 
 - 目前只在 **Windows 11 64 位元** 上測試過
 - 螢幕至少能顯示 960 × 640 的視窗
-- **PDF 工具、PDF 編輯器、圖片工具**：一般電腦即可，不需要額外下載任何東西
+- **PDF 工具、PDF 編輯器、圖片工具**：一般電腦即可，不需要額外下載任何東西（PDF 編輯器的開源字型包可以自己選擇要不要下載）
 - **影音轉檔**：需要下載 FFmpeg。NVIDIA 顯示卡實測可以加速（RTX 5060 Ti 轉 30 秒 1080p 影片約 2 秒）；AMD、Intel 顯示卡程式會自動偵測，但還沒有實測
 - **錄音轉逐字稿**：需要下載語音辨識元件，速度取決於顯示卡
 
@@ -76,7 +80,7 @@ python naiz_studio.py
 
 ## 需要時才下載的元件
 
-用到的功能缺少元件時，程式會先說明用途與大小，經過同意才下載，下載後會以 SHA-256 驗證檔案是否完整。元件放在 exe 旁邊的 `bin`、`models` 資料夾。
+用到的功能缺少元件時，程式會先說明用途與大小，經過同意才下載，下載後會以 SHA-256 驗證檔案是否完整。元件放在 exe 旁邊的 `bin`、`models`、`fonts` 資料夾。
 
 | 元件 | 用途 | 下載大小 | 安裝後大小 |
 |---|---|---|---|
@@ -92,6 +96,20 @@ python naiz_studio.py
 
 辨識模型只需要下載用到的那一個。
 
+### PDF 編輯器的開源字型包
+
+文字框可以使用的免費字型，每一套分開下載，在字型選單選到時才下載。Windows 內建的微軟正黑體、標楷體等可以直接使用，不一定要下載。
+
+| 字型 | 適合 | 下載大小 |
+|---|---|---|
+| Noto Sans TC 黑體 | 繁體中文，簡報、螢幕閱讀 | 約 11.4 MB |
+| Noto Serif TC 明體 | 繁體中文，文書、報告 | 約 16.1 MB |
+| 霞鶩文楷 TC（一般、粗體） | 繁體中文楷體，風格接近標楷體 | 各約 14.5 MB |
+| Noto Sans SC 黑体、Noto Serif SC 宋体 | 簡體中文 | 約 16.9 MB、24.0 MB |
+| Carlito（一般、粗體、斜體、粗斜體） | 英文，字寬和 Calibri 一樣 | 每種約 0.6～0.8 MB |
+| Liberation Sans、Liberation Serif（各 4 種樣式） | 英文，字寬和 Arial、Times New Roman 一樣 | 全部一起下載約 2.3 MB |
+| Noto Sans Mono | 英文等寬，程式碼、數據 | 約 1.6 MB |
+
 ## 檔案位置
 
 以下都在 exe（或原始碼版的 `naiz_studio.py`）所在的資料夾：
@@ -104,6 +122,8 @@ python naiz_studio.py
 | `output\media\` | 影音轉檔的結果 |
 | `output\transcripts\` | 逐字稿 |
 | `bin\`、`models\` | 下載的元件 |
+| `fonts\downloads\` | 下載的開源字型包 |
+| `fonts\custom\` | 自己加入的字型（也可以直接把字型檔放進來） |
 | `images\` | 介面圖片；也可以放自己的圖片當作背景 |
 | `config.json` | 設定（背景、修正錯字規則等） |
 | `error.log` | 發生錯誤時的紀錄 |
@@ -122,7 +142,8 @@ python naiz_studio.py
 |---|---|---|
 | [pygame-ce](https://github.com/pygame-community/pygame-ce) | 介面 | LGPL-2.1 |
 | [pypdfium2](https://github.com/pypdfium2-team/pypdfium2)（[PDFium](https://pdfium.googlesource.com/pdfium/)） | PDF 轉圖片、頁面縮圖 | Apache-2.0 / BSD-3-Clause |
-| [pikepdf](https://github.com/pikepdf/pikepdf) | PDF 壓縮、拆分、合併，圖片合成 PDF | MPL-2.0 |
+| [pikepdf](https://github.com/pikepdf/pikepdf) | PDF 壓縮、拆分、合併，圖片合成 PDF，儲存註解 | MPL-2.0 |
+| [fontTools](https://github.com/fonttools/fonttools) | 讀取字型、嵌入字型子集 | MIT |
 | [resvg](https://github.com/linebender/resvg)（[resvg-py](https://github.com/baseplate-admin/resvg-py)） | 讀取 SVG | Apache-2.0 / MIT |
 | [Pillow](https://github.com/python-pillow/Pillow) | 圖片處理 | MIT-CMU |
 | [pillow-heif](https://github.com/bigcat88/pillow_heif) | HEIC 讀寫 | BSD-3-Clause（附帶 libheif、libde265 為 LGPL-3.0，x265 為 GPL-2.0 以上） |
@@ -134,3 +155,7 @@ python naiz_studio.py
 | [Silero VAD](https://github.com/snakers4/silero-vad) | 人聲偵測模型 | MIT |
 | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | 說話者分離 | Apache-2.0 |
 | [3D-Speaker CAM++](https://github.com/modelscope/3D-Speaker) | 聲音特徵模型 | Apache-2.0 |
+| [Noto 字型](https://github.com/notofonts/noto-cjk)（[Google Fonts](https://github.com/google/fonts)） | 字型包：Noto Sans / Serif TC、SC，Noto Sans Mono | OFL-1.1 |
+| [霞鶩文楷 TC](https://github.com/lxgw/LxgwWenkaiTC) | 字型包：楷體 | OFL-1.1 |
+| [Carlito](https://github.com/googlefonts/carlito) | 字型包：英文（Calibri 字寬） | OFL-1.1 |
+| [Liberation Fonts](https://github.com/liberationfonts/liberation-fonts) | 字型包：英文（Arial、Times New Roman 字寬） | OFL-1.1 |

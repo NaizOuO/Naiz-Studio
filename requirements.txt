@@ -1,3 +1,4 @@
+fonttools
 opencc-python-reimplemented
 pikepdf
 Pillow

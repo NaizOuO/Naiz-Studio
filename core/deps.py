@@ -84,7 +84,7 @@ class Dependency:
            (例如 "bin/ffmpeg.exe");直接下載單一檔案時值填 None。
            有設定 folder 時,files 只用來判斷是否已安裝。
     folder: 把整個壓縮檔解壓到這個子資料夾(自動去掉共同的最上層資料夾),適合需要一堆 DLL 的程式。
-    location: "bin" 放執行檔,"models" 放模型。
+    location: "bin" 放執行檔,"models" 放模型,"fonts" 放下載的字型(fonts/downloads/)。
     check_args: 安裝後用這些參數執行第一個檔案,回傳碼為 0 才算安裝成功。
     sha256: 固定版本的 SHA-256;有填就不再另外抓驗證檔。
     sha256_url: 官方公布的 SHA-256 檔案;有填就會在安裝前驗證下載內容。
@@ -106,6 +106,8 @@ class Dependency:
 
     @property
     def base_dir(self):
+        if self.location == "fonts":
+            return paths.FONTS_DIR / "downloads"
         return paths.MODELS_DIR if self.location == "models" else paths.BIN_DIR
 
     def path(self, filename=None):
