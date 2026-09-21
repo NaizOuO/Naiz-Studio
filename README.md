@@ -21,6 +21,12 @@
 - **有密碼的 PDF**：輸入密碼後開啟（儲存的新檔不會保留密碼）
 - **修復損壞的 PDF**：開不了的檔案可以嘗試修復，救回還能讀取的頁面
 
+### 文件轉檔
+- **互相轉換**：Word、PowerPoint、Excel、ODF（odt、odp、ods）、RTF、純文字、網頁、CSV、PDF
+- **兩種方式**：電腦上有裝 Office 就用它（排版最準），沒有就用 LibreOffice（需要時才下載）
+- **PDF 取出文字**：PDF 轉純文字用程式自己的 PDF 元件，比整份重新排版乾淨，也不用下載任何東西
+- **PDF 轉 Word**：程式自己重建成真正的段落與表格，文字、字型、大小、顏色、圖片與分欄都會保留，可以直接接著編輯；用線條畫出來的圖表會整塊變成圖片，沒有文字的掃描檔會把整頁放成圖片
+
 ### 圖片工具
 - **格式轉換**：JPG、PNG、WebP、AVIF、HEIC、GIF、SVG、ICO、BMP、TIFF 互相轉換，另可合成 PDF（拖曳清單調整順序）
 - **壓縮**：預設保持原圖品質，也可自行調整品質、限制尺寸、PNG 減少顏色
@@ -64,6 +70,7 @@ python naiz_studio.py
 - 目前只在 **Windows 11 64 位元** 上測試過
 - 螢幕至少能顯示 960 × 640 的視窗
 - **PDF 工具、PDF 編輯器、圖片工具**：一般電腦即可，不需要額外下載任何東西（PDF 編輯器的開源字型包可以自己選擇要不要下載）
+- **文件轉檔**：有裝 Office 就直接可用；沒有的話需要下載 LibreOffice
 - **影音轉檔**：需要下載 FFmpeg。NVIDIA 顯示卡實測可以加速（RTX 5060 Ti 轉 30 秒 1080p 影片約 2 秒）；AMD、Intel 顯示卡程式會自動偵測，但還沒有實測
 - **錄音轉逐字稿**：需要下載語音辨識元件，速度取決於顯示卡
 
@@ -85,6 +92,7 @@ python naiz_studio.py
 | 元件 | 用途 | 下載大小 | 安裝後大小 |
 |---|---|---|---|
 | FFmpeg | 影音轉檔，以及讀取錄音與影片中的聲音 | 約 106 MB | 約 196 MB |
+| LibreOffice | 文件轉檔（電腦上沒有 Office，或指定要用它時） | 約 357 MB | 約 1.6 GB |
 | Whisper 語音辨識（CPU 版） | 把語音轉成文字 | 約 8 MB | 約 21 MB |
 | Whisper 語音辨識（NVIDIA 顯示卡版） | 用顯示卡加速辨識 | 約 643 MB | 約 1.1 GB |
 | 人聲偵測模型 | 跳過沒有人說話的片段 | 約 1 MB | 約 1 MB |
@@ -136,6 +144,7 @@ python naiz_cli.py images-to-pdf --output 報告.pdf 照片1.jpg 照片2.jpg
 | `output\pdf\` | PDF 工具的結果 |
 | `output\editor\` | PDF 編輯器儲存、擷取、修復的檔案 |
 | `output\images\` | 圖片工具的結果 |
+| `output\documents\` | 文件轉檔的結果 |
 | `output\media\` | 影音轉檔的結果 |
 | `output\transcripts\` | 逐字稿 |
 | `bin\`、`models\` | 下載的元件 |
@@ -161,12 +170,14 @@ python naiz_cli.py images-to-pdf --output 報告.pdf 照片1.jpg 照片2.jpg
 | [pypdfium2](https://github.com/pypdfium2-team/pypdfium2)（[PDFium](https://pdfium.googlesource.com/pdfium/)） | PDF 轉圖片、頁面縮圖 | Apache-2.0 / BSD-3-Clause |
 | [pikepdf](https://github.com/pikepdf/pikepdf) | PDF 壓縮、拆分、合併，圖片合成 PDF，儲存註解 | MPL-2.0 |
 | [fontTools](https://github.com/fonttools/fonttools) | 讀取字型、嵌入字型子集 | MIT |
+| [python-docx](https://github.com/python-openxml/python-docx) | 產生 Word 檔（PDF 轉 Word） | MIT |
 | [resvg](https://github.com/linebender/resvg)（[resvg-py](https://github.com/baseplate-admin/resvg-py)） | 讀取 SVG | Apache-2.0 / MIT |
 | [Pillow](https://github.com/python-pillow/Pillow) | 圖片處理 | MIT-CMU |
 | [pillow-heif](https://github.com/bigcat88/pillow_heif) | HEIC 讀寫 | BSD-3-Clause（附帶 libheif、libde265 為 LGPL-3.0，x265 為 GPL-2.0 以上） |
 | [vtracer](https://github.com/visioncortex/vtracer) | 圖片轉 SVG | MIT |
 | [OpenCC](https://github.com/yichen0831/opencc-python) | 繁簡轉換 | Apache-2.0 |
 | [FFmpeg](https://ffmpeg.org/)（[gyan.dev](https://www.gyan.dev/ffmpeg/builds/) 版本） | 影音轉檔、讀取影音 | GPL-3.0 |
+| [LibreOffice](https://www.libreoffice.org/) | 文件轉檔 | MPL-2.0 |
 | [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | 語音辨識 | MIT |
 | [Whisper 模型](https://github.com/openai/whisper) | 語音辨識模型 | MIT |
 | [Silero VAD](https://github.com/snakers4/silero-vad) | 人聲偵測模型 | MIT |

@@ -12,6 +12,7 @@ import tarfile
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from . import paths
 
@@ -40,7 +41,7 @@ def _check_space(dep, folder, total):
     """下載檔和解出來的檔案會同時存在,至少要有兩倍大小再多留一點;不夠就在下載前停下來。"""
     if not total:
         return
-    need = total * 2 + SPACE_MARGIN
+    need = total + max(total, dep.install_size) + SPACE_MARGIN
     free = shutil.disk_usage(folder).free
     if free < need:
         raise DiskSpaceError(f"磁碟空間不足：下載 {dep.name} 約需要 {human_size(need)}，"
@@ -103,6 +104,8 @@ class Dependency:
     sha256_name: str = ""
     folder: str = ""
     location: str = "bin"
+    installer: str = ""         # "msi":下載的是 Windows 安裝檔,用系統的 msiexec 解出檔案,不會真的安裝到系統
+    install_size: int = 0       # 解開後大約多大(位元組);沒填就以下載大小推估
 
     @property
     def base_dir(self):
@@ -180,6 +183,29 @@ def _extract_folder(dep: Dependency, archive_path):
     staging.replace(destination)
 
 
+def _extract_msi(dep: Dependency, archive_path):
+    """用 Windows 內建的 msiexec 把安裝檔的內容解出來(/a 是管理員安裝,只解檔案,不寫登錄檔、不需要系統管理員)。"""
+    destination = dep.base_dir / dep.folder
+    staging = dep.base_dir / f".{dep.folder}.part"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+    result = run(["msiexec", "/a", str(Path(archive_path).resolve()), "/qn",
+                  f"TARGETDIR={staging.resolve()}"], capture_output=True, timeout=1800)
+    if result.returncode != 0:
+        raise RuntimeError(f"{dep.name} 解壓縮失敗(msiexec 代碼 {result.returncode})")
+    for leftover in staging.glob("*.msi"):      # 解出來的安裝檔副本用不到
+        leftover.unlink(missing_ok=True)
+    if not any((staging / name).exists() for name in dep.files):
+        # 有些安裝檔會多包一層資料夾,往下找一層
+        inner = [p for p in staging.iterdir() if p.is_dir()]
+        if len(inner) == 1 and any((inner[0] / name).exists() for name in dep.files):
+            for item in list(inner[0].iterdir()):
+                item.replace(staging / item.name)
+            inner[0].rmdir()
+    shutil.rmtree(destination, ignore_errors=True)
+    staging.replace(destination)
+
+
 def _extract_files(dep: Dependency, download):
     base = dep.base_dir
     archive, entries = (None, [])
@@ -233,7 +259,9 @@ def install(dep: Dependency, progress=None, cancel=None):
         if expected is not None and digest.hexdigest() != expected:
             raise ChecksumError(f"下載的 {dep.name} 驗證失敗(SHA-256 不符)，已刪除，請重試")
 
-        if dep.folder:
+        if dep.installer == "msi":
+            _extract_msi(dep, download)
+        elif dep.folder:
             _extract_folder(dep, download)
         else:
             _extract_files(dep, download)
