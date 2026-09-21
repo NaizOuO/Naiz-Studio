@@ -242,20 +242,28 @@ def convert_libre(sources, target, kind, out_dir, cancel=None):
     return results
 
 
-def pdf_to_text(source, out_dir):
-    """PDF 取出文字:用程式自己的 PDF 元件,比整份重新排版乾淨。"""
+def pdf_to_text(source, out_dir, ocr=None, cancel=None):
+    """PDF 取出文字:用程式自己的 PDF 元件,比整份重新排版乾淨。有給 ocr 時,沒有文字的掃描頁會辨識出文字。"""
     from core import pdfium
 
     doc = pdfium.open_document(Path(source).read_bytes())
     try:
         pages = []
         for index in range(pdfium.page_count(doc)):
+            _check(cancel)
+            image = None
             with pdfium.LOCK:
                 page = doc[index]
                 try:
                     text = page.get_textpage().get_text_range()
+                    if ocr is not None and not text.strip():
+                        bitmap = page.render(scale=ocr.DPI / 72)
+                        image = bitmap.to_pil().convert("RGB").copy()
+                        bitmap.close()
                 finally:
                     page.close()
+            if image is not None:
+                text = ocr.text_of(ocr.recognize(image))
             pages.append(text.replace("\r\n", "\n").strip())
     finally:
         pdfium.close(doc)
@@ -272,11 +280,17 @@ def office_format(kind, target) -> str:
     return target.key
 
 
-def convert_all(files, target_key, out_dir, preferred="auto", progress=None, cancel=None):
+def convert_all(files, target_key, out_dir, preferred="auto", progress=None, cancel=None,
+                layout="flow", use_ocr=False):
     """把一批檔案轉成同一種格式。回傳 [(來源, 產生的檔案或 None, 訊息)],順序和傳進來的一樣。
 
     同一種轉檔方式的檔案會合併成一次呼叫:Office 只開一次程式,LibreOffice 也只啟動一次。
+    layout 是 PDF 轉 Word 的版面("flow" 重新排版、"exact" 照原樣);
+    use_ocr 為真而且元件已經下載時,掃描頁會辨識成文字。
     """
+    ocr = ocr_module() if use_ocr else None
+    if ocr is not None and not ocr.ready():
+        ocr = None
     target = TARGET_BY_KEY[target_key]
     out_dir = Path(out_dir)
     files = [Path(f) for f in files]
@@ -310,7 +324,9 @@ def convert_all(files, target_key, out_dir, preferred="auto", progress=None, can
             _check(cancel)
             report(path.name)
             try:
-                done[path] = (pdf_to_text(path, out_dir), "")
+                done[path] = (pdf_to_text(path, out_dir, ocr, cancel), "")
+            except Cancelled:
+                raise
             except Exception as exc:
                 done[path] = (None, f"{exc}")
             finished += 1
@@ -322,9 +338,13 @@ def convert_all(files, target_key, out_dir, preferred="auto", progress=None, can
             _check(cancel)
             report(path.name)
             try:
-                done[path] = (pdf_to_docx.convert(path, out_dir, cancel=cancel), "")
-            except Cancelled:
-                raise
+                def page_progress(number, pages, message, name=path.name):
+                    if progress:
+                        progress(finished, total, f"{name}：{message}")
+
+                done[path] = (pdf_to_docx.convert(path, out_dir, page_progress, cancel, layout, ocr), "")
+            except (Cancelled, InterruptedError) as exc:
+                raise Cancelled() from exc
             except Exception as exc:
                 done[path] = (None, f"{exc}")
             finished += 1
@@ -369,21 +389,64 @@ def convert_all(files, target_key, out_dir, preferred="auto", progress=None, can
     return [(path, *done.get(path, (None, "沒有處理到"))) for path in files]
 
 
+def _load_module(name):
+    """載入同一個資料夾的模組;單獨載入 ops.py 時(命令列、測試)沒有上層套件,改用路徑載入。"""
+    if __package__:
+        import importlib
+
+        try:
+            return importlib.import_module(f"{__package__}.{name}")
+        except ImportError:
+            pass
+    import importlib.util
+
+    key = f"naiz_documents_{name}"
+    if key in sys.modules:
+        return sys.modules[key]
+    spec = importlib.util.spec_from_file_location(key, Path(__file__).with_name(f"{name}.py"))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _load_rebuilder():
-    """載入自製的 PDF 轉 Word;單獨載入這個檔案時(命令列、測試)沒有上層套件,改用路徑載入。"""
+    return _load_module("pdf_to_docx")
+
+
+def ocr_module():
+    return _load_module("ocr")
+
+
+def has_scanned_pages(path) -> bool:
+    """PDF 裡有沒有整頁都沒有文字的頁面(掃描檔);有的話才需要文字辨識。"""
+    from core import pdfium
+
     try:
-        from . import pdf_to_docx
+        doc = pdfium.open_document(Path(path).read_bytes())
+    except Exception:
+        return False
+    try:
+        for index in range(pdfium.page_count(doc)):
+            with pdfium.LOCK:
+                page = doc[index]
+                try:
+                    text = page.get_textpage()
+                    empty = text.count_chars() == 0
+                    text.close()
+                finally:
+                    page.close()
+            if empty:
+                return True
+        return False
+    finally:
+        pdfium.close(doc)
 
-        return pdf_to_docx
-    except ImportError:
-        import importlib.util
 
-        path = Path(__file__).with_name("pdf_to_docx.py")
-        spec = importlib.util.spec_from_file_location("naiz_pdf_to_docx", path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
-        return module
+def needs_ocr(files, target, preferred="auto") -> bool:
+    """這次轉換會不會用到文字辨識:PDF 轉 Word 或純文字,而且檔案裡有掃描頁。"""
+    return any(kind_of(path) == "pdf" and pick_engine("pdf", target, preferred) in ("rebuild", "pdfium")
+               and has_scanned_pages(path) for path in files)
 
 
 def output_dir():

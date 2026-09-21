@@ -25,7 +25,9 @@
 - **互相轉換**：Word、PowerPoint、Excel、ODF（odt、odp、ods）、RTF、純文字、網頁、CSV、PDF
 - **兩種方式**：電腦上有裝 Office 就用它（排版最準），沒有就用 LibreOffice（需要時才下載）
 - **PDF 取出文字**：PDF 轉純文字用程式自己的 PDF 元件，比整份重新排版乾淨，也不用下載任何東西
-- **PDF 轉 Word**：程式自己重建成真正的段落與表格，文字、字型、大小、顏色、圖片與分欄都會保留，可以直接接著編輯；用線條畫出來的圖表會整塊變成圖片，沒有文字的掃描檔會把整頁放成圖片
+- **PDF 轉 Word**：程式自己重建成真正的段落與表格，文字、字型、大小、顏色、圖片與分欄都會保留，可以直接接著編輯；用線條畫出來的圖表會整塊變成圖片
+- **兩種版面**：「重新排版」變成一般的段落與表格，最好編輯；「照原樣」每一行都固定在原本的位置，最像原檔
+- **掃描檔文字辨識**：整頁都是圖片的 PDF 會辨識成文字（繁體中文、英文），文字以外的照片、圖表保留成圖片；也可以關閉，整頁放成圖片
 
 ### 圖片工具
 - **格式轉換**：JPG、PNG、WebP、AVIF、HEIC、GIF、SVG、ICO、BMP、TIFF 互相轉換，另可合成 PDF（拖曳清單調整順序）
@@ -70,7 +72,7 @@ python naiz_studio.py
 - 目前只在 **Windows 11 64 位元** 上測試過
 - 螢幕至少能顯示 960 × 640 的視窗
 - **PDF 工具、PDF 編輯器、圖片工具**：一般電腦即可，不需要額外下載任何東西（PDF 編輯器的開源字型包可以自己選擇要不要下載）
-- **文件轉檔**：有裝 Office 就直接可用；沒有的話需要下載 LibreOffice
+- **文件轉檔**：有裝 Office 就直接可用；沒有的話需要下載 LibreOffice。掃描檔文字辨識需要下載 Tesseract，一頁約 3 秒
 - **影音轉檔**：需要下載 FFmpeg。NVIDIA 顯示卡實測可以加速（RTX 5060 Ti 轉 30 秒 1080p 影片約 2 秒）；AMD、Intel 顯示卡程式會自動偵測，但還沒有實測
 - **錄音轉逐字稿**：需要下載語音辨識元件，速度取決於顯示卡
 
@@ -93,6 +95,7 @@ python naiz_studio.py
 |---|---|---|---|
 | FFmpeg | 影音轉檔，以及讀取錄音與影片中的聲音 | 約 106 MB | 約 196 MB |
 | LibreOffice | 文件轉檔（電腦上沒有 Office，或指定要用它時） | 約 357 MB | 約 1.6 GB |
+| Tesseract 文字辨識 | 掃描檔辨識成文字（含繁體中文、英文語言檔） | 約 78 MB | 約 144 MB |
 | Whisper 語音辨識（CPU 版） | 把語音轉成文字 | 約 8 MB | 約 21 MB |
 | Whisper 語音辨識（NVIDIA 顯示卡版） | 用顯示卡加速辨識 | 約 643 MB | 約 1.1 GB |
 | 人聲偵測模型 | 跳過沒有人說話的片段 | 約 1 MB | 約 1 MB |
@@ -178,6 +181,8 @@ python naiz_cli.py images-to-pdf --output 報告.pdf 照片1.jpg 照片2.jpg
 | [OpenCC](https://github.com/yichen0831/opencc-python) | 繁簡轉換 | Apache-2.0 |
 | [FFmpeg](https://ffmpeg.org/)（[gyan.dev](https://www.gyan.dev/ffmpeg/builds/) 版本） | 影音轉檔、讀取影音 | GPL-3.0 |
 | [LibreOffice](https://www.libreoffice.org/) | 文件轉檔 | MPL-2.0 |
+| [Tesseract](https://github.com/tesseract-ocr/tesseract)（[UB Mannheim](https://github.com/UB-Mannheim/tesseract) Windows 版本） | 掃描檔文字辨識 | Apache-2.0 |
+| [tessdata_best](https://github.com/tesseract-ocr/tessdata_best) | 文字辨識的語言資料 | Apache-2.0 |
 | [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | 語音辨識 | MIT |
 | [Whisper 模型](https://github.com/openai/whisper) | 語音辨識模型 | MIT |
 | [Silero VAD](https://github.com/snakers4/silero-vad) | 人聲偵測模型 | MIT |

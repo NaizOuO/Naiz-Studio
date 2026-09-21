@@ -33,6 +33,7 @@ EMU_PER_POINT = 12700
 SCAN_DPI = 150              # 沒有文字的頁面(掃描檔)直接放整頁圖片時用的解析度
 MIN_MARGIN = 14.0           # 邊界至少留這麼多點,避免文字貼著紙邊
 COLUMN_TOLERANCE = 8.0      # 左邊界差這麼多點以內就當成同一欄
+OCR_SPLIT_GAP = 1.5         # 辨識出來的詞之間空到這麼多個字寬,就當成表格或分欄的不同格
 VECTOR_DPI = 200            # 圖表(用線條畫出來的)整塊截圖時的解析度
 VECTOR_GAP = 8.0            # 線條相距這麼多點以內就當成同一張圖
 VECTOR_MIN_PATHS = 8        # 這麼多條線以上才當成圖表,不然只是表格框線
@@ -183,7 +184,7 @@ def _drop_extra_spaces(chars) -> list:
     return kept
 
 
-def _group_lines(chars) -> list:
+def _group_lines(chars, split_gap=2.5) -> list:
     """把字合併成行。
 
     用文字底線判斷,不用方框:像「一」「，」這種又扁又低的字,方框和整行重疊很少,
@@ -204,7 +205,7 @@ def _group_lines(chars) -> list:
         # 同一條底線上中間空一大段,多半是分欄或表格的不同格子,拆開才不會讀錯順序
         current = [line.chars[0]]
         for previous, char in zip(line.chars, line.chars[1:]):
-            if char.left - previous.right > max(previous.size, char.size) * 2.5:
+            if char.left - previous.right > max(previous.size, char.size) * split_gap:
                 result.append(Line(current))
                 current = []
             current.append(char)
@@ -566,12 +567,21 @@ def _write_block(container, block, layout, state):
         # Word 本來就會空一行的高度,只要再補上多出來的距離,不然每段都會多佔一行
         extra = block.lines[0].baseline - state["baseline"] - pitch
         spacing.space_before = Pt(max(0.0, min(48.0, round(extra, 1))))
+    _write_runs(paragraph, block)
+    state["baseline"] = block.lines[-1].baseline
+
+
+def _write_runs(paragraph, block, breaks=False):
+    """把段落的字依樣式分段寫進去;breaks 為真時照原檔換行(照原樣模式),否則讓 Word 自己折行。"""
     default_size = block.lines[0].size
     for index, line in enumerate(block.lines):
         if index and line.chars:
-            previous = block.lines[index - 1].text.strip()[-1:]
-            if previous and not (is_cjk(previous) or is_cjk(line.text.strip()[:1] or " ")):
-                paragraph.add_run(" ")
+            if breaks:
+                paragraph.add_run().add_break()
+            else:
+                previous = block.lines[index - 1].text.strip()[-1:]
+                if previous and not (is_cjk(previous) or is_cjk(line.text.strip()[:1] or " ")):
+                    paragraph.add_run(" ")
         buffer, style = "", None
         for char in line.chars:
             if style is None or char.style == style:
@@ -582,7 +592,6 @@ def _write_block(container, block, layout, state):
             buffer, style = char.text, char.style
         if buffer and style is not None:
             _apply_style(paragraph.add_run(buffer), style, default_size)
-    state["baseline"] = block.lines[-1].baseline
 
 
 def _write_table(word, group, layout, state, bordered):
@@ -617,16 +626,9 @@ def _write_table(word, group, layout, state, bordered):
     state["baseline"] = group[-1]["bottom"]
 
 
-def _write_page(word, number, width, height, chars, images, scan, rulings=()):
-    section = word.sections[0] if number == 0 else word.add_section(WD_SECTION.NEW_PAGE)
-    section.page_width, section.page_height = Emu(round(width * EMU_PER_POINT)), Emu(round(height * EMU_PER_POINT))
 
-    if scan is not None:
-        section.left_margin = section.right_margin = section.top_margin = section.bottom_margin = Emu(0)
-        word.add_picture(io.BytesIO(scan), width=Emu(round(width * EMU_PER_POINT)))
-        return
 
-    blocks = _group_paragraphs(_group_lines(chars)) + list(images)
+def _page_margins(section, width, blocks):
     if blocks:
         content_left = min(b.left for b in blocks)
         content_right = max(b.right for b in blocks)
@@ -637,7 +639,12 @@ def _write_page(word, number, width, height, chars, images, scan, rulings=()):
     section.right_margin = Emu(round(max(MIN_MARGIN, width - content_right) * EMU_PER_POINT))
     section.top_margin = Emu(round(max(MIN_MARGIN, content_top) * EMU_PER_POINT))
     section.bottom_margin = Emu(round(MIN_MARGIN * EMU_PER_POINT))
+    return content_left, content_right
 
+
+def _write_flow(word, width, section, blocks, rulings):
+    """重新排版:輸出成一般的段落與表格,最好編輯。"""
+    content_left, content_right = _page_margins(section, width, blocks)
     layout = {"left": content_left, "right": content_right, "pitch": _page_pitch(blocks),
               "slack": round(max(6.0, (content_right - content_left) * 0.05), 1)}
     state = {"baseline": None}
@@ -656,8 +663,217 @@ def _write_page(word, number, width, height, chars, images, scan, rulings=()):
             previous_was_table = True
 
 
-def convert(source, out_dir, progress=None, cancel=None) -> Path:
-    """把 PDF 轉成 Word;回傳產生的檔案。"""
+def _twips(points) -> str:
+    return str(max(0, round(points * 20)))
+
+
+def _frame(paragraph, left, top, width):
+    """把段落固定在頁面上的位置(Word 的「框架」);不佔版面,也不會被其他內容推走。"""
+    frame = OxmlElement("w:framePr")
+    frame.set(qn("w:w"), _twips(width))
+    frame.set(qn("w:x"), _twips(left))
+    frame.set(qn("w:y"), _twips(top))
+    frame.set(qn("w:hAnchor"), "page")
+    frame.set(qn("w:vAnchor"), "page")
+    frame.set(qn("w:wrap"), "around")
+    paragraph._p.get_or_add_pPr().insert(0, frame)
+
+
+def _write_exact(word, width, section, blocks):
+    """照原樣:每一行字、每張圖都固定在原檔的位置;最像原檔,但改字時不會自動重排。
+
+    每一行各自是一個框架:同一段的行左緣常常不一樣(縮排、項目符號),合成一個框架反而會對不齊。
+    """
+    for margin in ("left_margin", "right_margin", "top_margin", "bottom_margin"):
+        setattr(section, margin, Emu(round(MIN_MARGIN * EMU_PER_POINT)))
+    page_pitch = _page_pitch(blocks)
+    for block in sorted(blocks, key=lambda b: (_block_span(b)[0], b.left)):
+        if block.kind == "image":
+            paragraph = word.add_paragraph()
+            spacing = paragraph.paragraph_format
+            spacing.space_before = spacing.space_after = Pt(0)
+            _frame(paragraph, block.left, block.top, block.width)
+            paragraph.add_run().add_picture(io.BytesIO(block.image), width=Emu(round(block.width * EMU_PER_POINT)))
+            continue
+        pitch = _line_pitch(block, page_pitch)
+        for line in block.lines:
+            if not line.text.strip():
+                continue
+            paragraph = word.add_paragraph()
+            spacing = paragraph.paragraph_format
+            spacing.space_before = spacing.space_after = Pt(0)
+            spacing.line_spacing = Pt(round(pitch, 1))
+            # 固定行高時,字的底線大約落在這一行由上往下 80% 的地方
+            _frame(paragraph, line.left, line.baseline - pitch * 0.8, max(line.right - line.left, width - line.left - 2))
+            _write_runs(paragraph, Block("text", line.top, line.left, line.right, lines=[line]))
+    # 每頁最後放一個不佔空間的空段落,換頁的設定才不會掛在框架上
+    tail = word.add_paragraph().paragraph_format
+    tail.space_before = tail.space_after = Pt(0)
+    tail.line_spacing = Pt(1)
+
+
+def _write_page(word, number, width, height, chars, images, scan, rulings=(), layout="flow", split_gap=2.5):
+    section = word.sections[0] if number == 0 else word.add_section(WD_SECTION.NEW_PAGE)
+    section.page_width, section.page_height = Emu(round(width * EMU_PER_POINT)), Emu(round(height * EMU_PER_POINT))
+
+    if scan is not None:
+        section.left_margin = section.right_margin = section.top_margin = section.bottom_margin = Emu(0)
+        word.add_picture(io.BytesIO(scan), width=Emu(round(width * EMU_PER_POINT)))
+        return
+
+    blocks = _group_paragraphs(_group_lines(chars, split_gap)) + list(images)
+    if layout == "exact":
+        _write_exact(word, width, section, blocks)
+    else:
+        _write_flow(word, width, section, blocks, rulings)
+
+
+# ---------------------------------------------------------------- 掃描檔(文字辨識)
+
+def _is_scan(chars, images, width, height) -> bool:
+    """整頁沒有文字,而且只有蓋住大半頁的圖(或什麼都沒有):多半是掃描檔。"""
+    if chars:
+        return False
+    covered = sum(image.width * image.height for image in images)
+    return not images or covered >= width * height * 0.6
+
+
+def _ocr_size(line_words) -> float:
+    """推估一行的字級(像素)。
+
+    中文字是全形,相鄰兩個字左緣的距離正好是一個字寬,也就是字級,這個最準;
+    沒有相鄰的中文字時才用字高推估(中文字的方框約是字級的 0.88 倍,英文約 0.72 倍)。
+    """
+    ordered = sorted(line_words, key=lambda w: w.left)
+    advances = []
+    for word, after in zip(ordered, ordered[1:]):
+        if all(is_cjk(c) for c in word.text) and is_cjk(after.text[0]):
+            step = (after.left - word.left) / len(word.text)
+            if step <= (word.bottom - word.top) * 1.6:      # 中間隔一段空白的不算
+                advances.append(step)
+    if len(advances) >= 2:
+        return statistics.median(advances)
+    heights = [w.bottom - w.top for w in line_words if any(is_cjk(c) for c in w.text)]
+    if heights:
+        return statistics.median(heights) / 0.88
+    return statistics.median(w.bottom - w.top for w in line_words) / 0.72
+
+
+def _ocr_chars(words, scale) -> list:
+    """把辨識出來的詞換成和 PDF 文字一樣的 Char,後面分行、分段、表格的流程就能共用。"""
+    chars = []
+    by_line = {}
+    for word in words:
+        by_line.setdefault(word.line, []).append(word)
+    rows = []
+    for line_words in by_line.values():
+        # 辨識時左右並排、高低不同的字可能被湊成同一行,依上下範圍再拆開
+        groups = []
+        for word in sorted(line_words, key=lambda w: w.bottom - w.top, reverse=True):
+            middle = (word.top + word.bottom) / 2
+            group = next((g for g in groups if g["top"] <= middle <= g["bottom"]), None)
+            if group is None:
+                groups.append({"top": word.top, "bottom": word.bottom, "words": [word]})
+            else:
+                group["words"].append(word)
+        rows += [(g["bottom"], g["words"]) for g in groups]
+    for bottom, line_words in rows:
+        size = max(4.0, round(_ocr_size(line_words) * scale * 2) / 2)
+        font = CJK_FALLBACK["serif"]
+        previous = None
+        for word in sorted(line_words, key=lambda w: w.left):
+            baseline = bottom * scale
+            # 只在一般字距時補空白;空得很開的是表格的不同格,補了空白就分不開了
+            if previous is not None and (word.left - previous.right) * scale < size * OCR_SPLIT_GAP:
+                chars.append(Char(" ", previous.right * scale, word.top * scale, word.left * scale,
+                                  word.bottom * scale, baseline, size, font, False, False, (0, 0, 0), True))
+            step = (word.right - word.left) / len(word.text)
+            for index, text in enumerate(word.text):
+                left = (word.left + step * index) * scale
+                chars.append(Char(text, left, word.top * scale, left + step * scale, word.bottom * scale,
+                                  baseline, size, font, False, False, (0, 0, 0)))
+            previous = word
+    return chars
+
+
+def _inside_any(char, figures) -> bool:
+    """字有一半以上落在某張圖裡;圖裡的標籤已經在截圖上了,不要再變成段落。"""
+    area = max(1e-6, (char.right - char.left) * (char.bottom - char.top))
+    for f in figures:
+        overlap_x = min(char.right, f.right) - max(char.left, f.left)
+        overlap_y = min(char.bottom, f.top + f.height) - max(char.top, f.top)
+        if overlap_x > 0 and overlap_y > 0 and overlap_x * overlap_y >= area * 0.5:
+            return True
+    return False
+
+
+def _scan_figures(image, words, scale) -> list:
+    """掃描頁上文字以外的圖(照片、圖表、印章):把文字塗白,剩下成塊的深色區域切出來當圖片。"""
+    from PIL import Image, ImageDraw
+
+    gray = image.convert("L")
+    draw = ImageDraw.Draw(gray)
+    for word in words:
+        pad = max(2, (word.bottom - word.top) // 4)
+        draw.rectangle((word.left - pad, word.top - pad, word.right + pad, word.bottom + pad), fill=255)
+    cell = 8                                    # 縮小 8 倍再找,速度快,也順便忽略掃描的小雜點
+    small = gray.resize((max(1, gray.width // cell), max(1, gray.height // cell)), Image.Resampling.BOX)
+    w, h = small.size
+    data = small.tobytes()
+    # 比紙張顏色深一點就算:淺色底的區塊(投影片的圖框、色塊)連同裡面的標籤會整塊變成圖片,不會被拆散;
+    # 紙色用出現最多的亮度,泛黃的掃描紙也不會整頁被當成圖
+    histogram = small.histogram()
+    paper = max(range(256), key=lambda value: histogram[value])
+    ink = bytearray(1 if value < paper - 8 else 0 for value in data)
+    boxes = []
+    for start in range(w * h):
+        if not ink[start]:
+            continue
+        ink[start] = 0
+        stack = [start]
+        left = right = start % w
+        top = bottom = start // w
+        count = 0
+        while stack:
+            at = stack.pop()
+            cx, cy = at % w, at // w
+            count += 1
+            left, right, top, bottom = min(left, cx), max(right, cx), min(top, cy), max(bottom, cy)
+            for ny in range(max(0, cy - 2), min(h, cy + 3)):     # 隔一兩格也算相連,圖裡的細線才不會斷開
+                row = ny * w
+                for nx in range(max(0, cx - 2), min(w, cx + 3)):
+                    if ink[row + nx]:
+                        ink[row + nx] = 0
+                        stack.append(row + nx)
+        boxes.append((left, top, right + 1, bottom + 1, count))
+    figures = []
+    min_side = 36 / scale / cell                # 小於半英吋的都當成雜點或殘留的筆畫
+    # 被另一塊整個包住的(例如框裡的照片和外框之間隔著一圈白邊)已經在外框的截圖裡了
+    boxes = [box for box in boxes
+             if not any(other is not box and other[0] <= box[0] and other[1] <= box[1]
+                        and other[2] >= box[2] and other[3] >= box[3] for other in boxes)]
+    for left, top, right, bottom, count in boxes:
+        if right - left < min_side or bottom - top < min_side or count < 12:
+            continue
+        if (right - left) * (bottom - top) > w * h * 0.7:
+            continue                            # 幾乎整頁:多半是紙張底色不均,不是圖
+        crop = image.crop((left * cell, top * cell, right * cell, bottom * cell)).convert("RGB")
+        buffer = io.BytesIO()
+        crop.save(buffer, "JPEG", quality=88)
+        figures.append(Block("image", top * cell * scale, left * cell * scale, right * cell * scale,
+                             image=buffer.getvalue(), width=(right - left) * cell * scale,
+                             height=(bottom - top) * cell * scale))
+    return figures
+
+
+# ---------------------------------------------------------------- 主流程
+
+def convert(source, out_dir, progress=None, cancel=None, layout="flow", ocr=None) -> Path:
+    """把 PDF 轉成 Word;回傳產生的檔案。
+
+    layout:"flow" 重新排版(好編輯)、"exact" 照原樣(每塊固定在原位)。
+    ocr:文字辨識模組(plugins/documents/ocr.py);有給就會辨識掃描頁,沒給則把掃描頁整頁放成圖片。
+    """
     source = Path(source)
     document = pdfium.open_document(source.read_bytes())
     word = Document()
@@ -669,6 +885,8 @@ def convert(source, out_dir, progress=None, cancel=None) -> Path:
                 raise InterruptedError("已取消")
             if progress:
                 progress(number, total, f"第 {number + 1} 頁")
+            scan = page_image = None
+            split_gap = 2.5
             with pdfium.LOCK:
                 page = document[number]
                 try:
@@ -679,20 +897,37 @@ def convert(source, out_dir, progress=None, cancel=None) -> Path:
                     finally:
                         text_page.close()
                     images = _read_images(document, page, height)
-                    charts, chars = _vector_pictures(page, chars, width, height)
-                    images += charts
                     rulings = _read_rulings(page, height)
-                    scan = None
-                    if not chars and not images:
-                        # 整頁沒有文字也沒有圖片(掃描檔常見):直接把整頁畫成圖片
-                        bitmap = page.render(scale=SCAN_DPI / 72)
-                        buffer = io.BytesIO()
-                        bitmap.to_pil().convert("RGB").save(buffer, "JPEG", quality=85)
+                    if _is_scan(chars, images, width, height):
+                        dpi = ocr.DPI if ocr is not None else SCAN_DPI
+                        bitmap = page.render(scale=dpi / 72)
+                        page_image = bitmap.to_pil().convert("RGB").copy()
                         bitmap.close()
-                        scan = buffer.getvalue()
+                    else:
+                        charts, chars = _vector_pictures(page, chars, width, height)
+                        images += charts
                 finally:
                     page.close()
-            _write_page(word, number, width, height, chars, images, scan, rulings)
+            if page_image is not None:
+                words = []
+                if ocr is not None:
+                    if progress:
+                        progress(number, total, f"辨識第 {number + 1} 頁的文字")
+                    words = ocr.recognize(page_image)
+                if words:
+                    scale = 72 / ocr.DPI
+                    images = _scan_figures(page_image, words, scale)
+                    chars = [c for c in _ocr_chars(words, scale) if not _inside_any(c, images)]
+                    rulings = []
+                    split_gap = OCR_SPLIT_GAP
+                else:
+                    # 沒有辨識(或辨識不到字):整頁照樣放成圖片
+                    if ocr is not None:
+                        page_image = page_image.resize((round(width * SCAN_DPI / 72), round(height * SCAN_DPI / 72)))
+                    buffer = io.BytesIO()
+                    page_image.save(buffer, "JPEG", quality=85)
+                    scan = buffer.getvalue()
+            _write_page(word, number, width, height, chars, images, scan, rulings, layout, split_gap)
     finally:
         pdfium.close(document)
     out = free_path(Path(out_dir), source.stem, ".docx")

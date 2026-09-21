@@ -104,8 +104,9 @@ class Dependency:
     sha256_name: str = ""
     folder: str = ""
     location: str = "bin"
-    installer: str = ""         # "msi":下載的是 Windows 安裝檔,用系統的 msiexec 解出檔案,不會真的安裝到系統
+    installer: str = ""         # "msi"/"nsis":下載的是 Windows 安裝檔,只解出檔案,不會真的安裝到系統
     install_size: int = 0       # 解開後大約多大(位元組);沒填就以下載大小推估
+    keep: tuple = ()            # 安裝檔裡只留這些檔案(安裝後的相對路徑);沒填就全部留下
 
     @property
     def base_dir(self):
@@ -206,6 +207,102 @@ def _extract_msi(dep: Dependency, archive_path):
     staging.replace(destination)
 
 
+def _nsis_entries(data):
+    """讀 NSIS 3(Unicode、整包 LZMA 壓縮)安裝檔的內容:回傳 (解開的資料, 暫存檔, [(安裝後路徑, 資料位置)])。
+
+    不執行安裝程式,直接照安裝腳本找出「把哪個檔案放到安裝資料夾的哪裡」,
+    所以不會寫登錄檔、不會出現系統管理員權限的詢問。
+    """
+    import lzma
+    import mmap
+    import struct
+    import tempfile
+
+    start = data.find(b"\xef\xbe\xad\xdeNullsoftInst")
+    if start < 4:
+        raise ValueError("不是可以辨識的安裝檔")
+    body = start + 24
+    props, dict_size = data[body], struct.unpack_from("<I", data, body + 1)[0]
+    if props != 0x5D:
+        raise ValueError("安裝檔的壓縮方式不支援")
+    decoder = lzma.LZMADecompressor(lzma.FORMAT_RAW, filters=[
+        {"id": lzma.FILTER_LZMA1, "lc": 3, "lp": 0, "pb": 2, "dict_size": dict_size}])
+    # 解開後有好幾百 MB,寫到暫存檔再對應回來,不要整個放在記憶體裡
+    stream = tempfile.TemporaryFile()
+    view = memoryview(data)[body + 5:]
+    for offset in range(0, len(view), 4 * 1024 * 1024):
+        stream.write(decoder.decompress(view[offset:offset + 4 * 1024 * 1024]))
+    stream.flush()
+    s = mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ)
+    header_len = struct.unpack_from("<I", s, 0)[0]
+    header = s[4:4 + header_len]
+    blocks = [struct.unpack_from("<II", header, 4 + i * 8) for i in range(8)]
+    entries_at, entry_count = blocks[2]
+    strings_at = blocks[3][0]
+    names = {21: "$INSTDIR"}
+
+    def text(index):
+        at, chars = strings_at + index * 2, []
+        while True:
+            code = struct.unpack_from("<H", header, at)[0]
+            at += 2
+            if code == 0:
+                return "".join(chars)
+            if code in (1, 2, 3, 4):        # 語言字串、系統資料夾、變數、跳脫字元,後面跟一個參數
+                value = struct.unpack_from("<H", header, at)[0]
+                at += 2
+                if code == 4:
+                    chars.append(chr(value))
+                else:
+                    number = (value & 0x7F) | (((value >> 8) & 0x7F) << 7)
+                    chars.append(names.get(number, f"${number}") if code == 3 else f"<{number}>")
+            else:
+                chars.append(chr(code))
+
+    files, out_dir = [], None
+    for index in range(entry_count):
+        opcode, *parms = struct.unpack_from("<7I", header, entries_at + index * 28)
+        if opcode == 11 and parms[1]:       # 切換輸出資料夾
+            out_dir = text(parms[0])
+        elif opcode == 20 and out_dir and out_dir.startswith("$INSTDIR"):   # 放一個檔案
+            folder = out_dir[len("$INSTDIR"):].strip("\\")
+            relative = "/".join(part for part in (folder.replace("\\", "/"), text(parms[1])) if part)
+            files.append((relative, 4 + header_len + parms[2]))
+    return s, stream, files
+
+
+def _extract_nsis(dep: Dependency, archive_path):
+    """從 NSIS 安裝檔解出 dep.keep 列出的檔案(沒列就全部)到 dep.folder。"""
+    import struct
+
+    destination = dep.base_dir / dep.folder
+    staging = dep.base_dir / f".{dep.folder}.part"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+    root = staging.resolve()
+    keep = {name.lower() for name in dep.keep}
+    with open(archive_path, "rb") as fp:
+        data = fp.read()
+    s, stream, files = _nsis_entries(data)
+    try:
+        for relative, at in files:
+            if keep and relative.lower() not in keep:
+                continue
+            target = (staging / relative).resolve()
+            if root not in target.parents:
+                raise ValueError(f"下載的 {dep.name} 內容異常，已停止安裝")
+            size = struct.unpack_from("<I", s, at)[0] & 0x7FFFFFFF
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(s[at + 4:at + 4 + size])
+    finally:
+        s.close()
+        stream.close()
+    if keep and {p.relative_to(staging).as_posix().lower() for p in staging.rglob("*") if p.is_file()} != keep:
+        raise ValueError(f"下載的 {dep.name} 少了需要的檔案，已停止安裝")
+    shutil.rmtree(destination, ignore_errors=True)
+    staging.replace(destination)
+
+
 def _extract_files(dep: Dependency, download):
     base = dep.base_dir
     archive, entries = (None, [])
@@ -261,6 +358,8 @@ def install(dep: Dependency, progress=None, cancel=None):
 
         if dep.installer == "msi":
             _extract_msi(dep, download)
+        elif dep.installer == "nsis":
+            _extract_nsis(dep, download)
         elif dep.folder:
             _extract_folder(dep, download)
         else:

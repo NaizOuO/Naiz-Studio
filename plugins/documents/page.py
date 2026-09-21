@@ -19,6 +19,16 @@ ENGINE_NOTES = {
     "office": "只用電腦上已經安裝的 Word、PowerPoint、Excel",
     "libre": "一律用 LibreOffice，不會開到你的 Office；PDF 轉 Word 會變成文字方塊",
 }
+LAYOUTS = [("flow", "重新排版"), ("exact", "照原樣")]
+LAYOUT_NOTES = {
+    "flow": "變成一般的段落與表格，最好編輯；排版可能和原檔有些差距",
+    "exact": "每一行都固定在原本的位置，最像原檔；但改字時不會自動重排",
+}
+OCR_MODES = [("auto", "自動"), ("off", "關閉")]
+OCR_NOTES = {
+    "auto": "沒有文字的掃描頁會辨識成文字（繁體中文、英文），一頁約 3 秒",
+    "off": "掃描頁整頁放成圖片，不辨識文字",
+}
 
 
 class DocumentsPage(Page):
@@ -31,11 +41,17 @@ class DocumentsPage(Page):
         self.result_lines = []
         self.runner = tasks.TaskRunner()
         self.list_view = ScrollView(accent=accent)
+        # 設定面板:選項多(PDF 會多出版面與文字辨識),小視窗放不下時可以捲動
+        self.options_view = ScrollView(accent=accent)
+        self.options_area = pygame.Rect(0, 0, 0, 0)
+        self.options_h = 0
         self.list_area = pygame.Rect(0, 0, 0, 0)
         self.row_buttons = []
 
         self.formats = ChoiceGrid([(target.key, target.label) for target in ops.TARGETS], columns=3, accent=accent)
         self.engine = SegmentedControl(ENGINES, accent=accent)
+        self.layout = SegmentedControl(LAYOUTS, accent=accent)
+        self.ocr_mode = SegmentedControl(OCR_MODES, accent=accent)
         self.btn_run = Button("開始轉換", accent=accent)
         self.btn_cancel = Button("取消", accent=theme.DANGER, filled=False)
         self.btn_clear = Button("清空清單", filled=False, size=14)
@@ -91,6 +107,13 @@ class DocumentsPage(Page):
         if ops.needs_libreoffice(files, self.target, preferred) and not ops.libre_ready():
             self.app.consent.open("文件轉檔", [ops.LIBREOFFICE], on_done=self.start_job)
             return
+        use_ocr = self.ocr_mode.value == "auto"
+        if use_ocr and ops.needs_ocr(files, self.target, preferred):
+            missing = ops.ocr_module().missing()
+            if missing:
+                self.app.consent.open("文件轉檔", missing, on_done=self.start_job)
+                return
+        layout = self.layout.value
 
         out_dir = ops.output_dir()
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -100,7 +123,8 @@ class DocumentsPage(Page):
             def progress(done, total, message):
                 runner.report(done, max(1, total), message)
 
-            rows = ops.convert_all(files, target_key, out_dir, preferred, progress, runner.cancel_event)
+            rows = ops.convert_all(files, target_key, out_dir, preferred, progress, runner.cancel_event,
+                                   layout, use_ocr)
             for source, produced, message in rows:
                 if produced is not None:
                     runner.log(f"{source.name} → {produced.name}（{deps.human_size(produced.stat().st_size)}）")
@@ -117,9 +141,11 @@ class DocumentsPage(Page):
                 self.result_lines = lines
                 self.status = "完成" if not error else "發生錯誤"
         self.list_view.update(pygame.mouse.get_pos())
+        self.options_view.update(pygame.mouse.get_pos())
 
     def deactivate(self):
         self.list_view.reset()
+        self.options_view.reset()
 
     # ------------------------------------------------------------ 繪製
 
@@ -194,13 +220,37 @@ class DocumentsPage(Page):
         detail = ("電腦上可以用：" + "、".join(names)) if names else "電腦上沒有偵測到 Office，會改用 LibreOffice"
         return detail + ("；LibreOffice 已下載" if ops.libre_ready() else "")
 
+    def pdf_options(self):
+        """要顯示哪些 PDF 專用的選項:(版面, 文字辨識)。"""
+        if not any(item["kind"] == "pdf" for item in self.files):
+            return False, False
+        rebuild = ops.pick_engine("pdf", self.target, self.engine.value) == "rebuild"
+        text = ops.pick_engine("pdf", self.target, self.engine.value) == "pdfium"
+        return rebuild, rebuild or text
+
+    def draw_choice(self, title, control, note, x, y, inner, mouse_pos):
+        draw_text(self.screen, title, (x, y), 14, theme.TEXT)
+        y += 24
+        control.draw(self.screen, pygame.Rect(x, y, inner, 34), mouse_pos)
+        y += 42
+        for line in widgets.wrap_text(note, 12, inner, max_lines=2):
+            draw_text(self.screen, line, (x, y), 12, theme.TEXT_FAINT)
+            y += 18
+        return y + 10
+
     def draw_options(self, rect, mouse_pos):
         screen = self.screen
         rounded_panel(screen, rect, theme.PANEL, radius=12, alpha=228, border=theme.PANEL_EDGE)
         draw_text(screen, "轉換設定", (rect.x + 18, rect.y + 14), 15, theme.TEXT, bold=True)
         pygame.draw.line(screen, theme.PANEL_EDGE, (rect.x + 12, rect.y + 44), (rect.right - 12, rect.y + 44))
-        x, inner = rect.x + 18, rect.width - 36
-        y = rect.y + 60
+        area = pygame.Rect(rect.x + 2, rect.y + 46, rect.width - 4, rect.height - 54)
+        self.options_area = area
+        self.options_view.layout(area, self.options_h)
+        previous_clip = screen.get_clip()
+        screen.set_clip(area)
+        x, inner = rect.x + 18, rect.width - 36 - (10 if self.options_view.max_scroll else 0)
+        y = area.y + 14 - self.options_view.scroll
+        start = y
         draw_text(screen, "輸出格式", (x, y), 14, theme.TEXT)
         y += 24
         rows = (len(ops.TARGETS) + 2) // 3
@@ -223,21 +273,32 @@ class DocumentsPage(Page):
             y += 18
         y += 10
 
+        show_layout, show_ocr = self.pdf_options()
+        if show_layout or show_ocr:
+            pygame.draw.line(screen, theme.PANEL_EDGE, (x, y - 4), (x + inner, y - 4))
+            y += 8
+        if show_layout:
+            y = self.draw_choice("PDF 轉 Word 的版面", self.layout, LAYOUT_NOTES[self.layout.value],
+                                 x, y, inner, mouse_pos)
+        if show_ocr:
+            y = self.draw_choice("掃描檔文字辨識", self.ocr_mode, OCR_NOTES[self.ocr_mode.value],
+                                 x, y, inner, mouse_pos)
+
         files = self.ready_files()
         if files and ops.needs_libreoffice(files, self.target, self.engine.value) and not ops.libre_ready():
             for line in widgets.wrap_text("這次的轉換需要 LibreOffice，按下開始後會先詢問是否下載（約 357 MB）",
                                           12, inner, max_lines=2):
                 draw_text(screen, line, (x, y), 12, theme.WARN)
                 y += 18
-        elif self.target.key in ("docx", "rtf", "odf") and any(item["kind"] == "pdf" for item in self.files):
-            if self.target.key == "docx" and self.engine.value != "libre":
-                note = ("PDF 轉 Word 是重新排出來的：文字、字型、顏色、圖片、表格與分欄都會保留，"
-                        "圖表會整塊變成圖片；排版可能和原檔有些差距")
-            else:
-                note = "PDF 轉回可編輯的文件時，版面會跑掉（文字會被切成一塊一塊），適合用來取出內容再自己排版"
+        elif self.target.key in ("docx", "rtf", "odf") and not show_layout and \
+                any(item["kind"] == "pdf" for item in self.files):
+            note = "PDF 轉回可編輯的文件時，版面會跑掉（文字會被切成一塊一塊），適合用來取出內容再自己排版"
             for line in widgets.wrap_text(note, 12, inner, max_lines=3):
                 draw_text(screen, line, (x, y), 12, theme.WARN)
                 y += 18
+        screen.set_clip(previous_clip)
+        self.options_h = y - start + 8
+        self.options_view.draw(screen, mouse_pos)
 
     def draw_footer(self, rect, mouse_pos):
         screen = self.screen
@@ -278,6 +339,8 @@ class DocumentsPage(Page):
             return
         if self.files and self.list_view.handle_event(event, mouse_pos):
             return
+        if self.options_view.handle_event(event, mouse_pos):
+            return
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             self.handle_click(mouse_pos)
 
@@ -297,8 +360,14 @@ class DocumentsPage(Page):
             self.list_view.scroll = 0
             self.result_lines = []
             return
-        self.formats.clicked(mouse_pos, True)
-        self.engine.clicked(mouse_pos, True)
+        if self.options_area.collidepoint(mouse_pos):   # 捲到面板外、被遮住的選項不能點
+            self.formats.clicked(mouse_pos, True)
+            self.engine.clicked(mouse_pos, True)
+            show_layout, show_ocr = self.pdf_options()
+            if show_layout:
+                self.layout.clicked(mouse_pos, True)
+            if show_ocr:
+                self.ocr_mode.clicked(mouse_pos, True)
         if self.runner.running:
             if self.btn_cancel.clicked(mouse_pos, True):
                 self.runner.request_cancel()
