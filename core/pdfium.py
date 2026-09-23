@@ -104,6 +104,22 @@ def render(doc, index, scale, rotation=0, crop=(0, 0, 0, 0), hidden=()):
             page.close()
 
 
+def char_size(text_handle, index):
+    """一個字實際的字級(點)。PDFium 回報的字級沒有算進頁面的縮放:例如 Chrome 產生的 PDF
+    整頁縮小成 0.75 倍,回報 13.44 的字實際只有 10.08,所以要再乘上這個字的變換矩陣的縮放比例。"""
+    import ctypes
+
+    import pypdfium2.raw as raw
+
+    size = abs(raw.FPDFText_GetFontSize(text_handle, index))
+    matrix = raw.FS_MATRIX()
+    if raw.FPDFText_GetMatrix(text_handle, index, ctypes.byref(matrix)):
+        scale = abs(matrix.a * matrix.d - matrix.b * matrix.c) ** 0.5
+        if scale > 1e-6:
+            size *= scale
+    return size
+
+
 class TextLookup:
     """查詢一頁的文字位置(螢光筆、底線對齊文字行用);座標是 PDF 使用者座標。用完要 close()。"""
 
@@ -166,7 +182,7 @@ class TextLookup:
                     continue
                 x, y = ctypes.c_double(), ctypes.c_double()
                 raw.FPDFText_GetCharOrigin(handle, index, ctypes.byref(x), ctypes.byref(y))
-                size = abs(raw.FPDFText_GetFontSize(handle, index)) or 10.0
+                size = char_size(handle, index) or 10.0
                 left, bottom, right, top = self.text.get_charbox(index)
                 chars.append((x.value, y.value, size, right, code == 32))
         lines = []
@@ -200,7 +216,7 @@ class TextLookup:
 
         with LOCK:
             handle = self.text.raw
-            size = abs(raw.FPDFText_GetFontSize(handle, index))
+            size = char_size(handle, index)
             red, green, blue, alpha = (ctypes.c_uint() for _ in range(4))
             raw.FPDFText_GetFillColor(handle, index, *[ctypes.byref(v) for v in (red, green, blue, alpha)])
             buffer = ctypes.create_string_buffer(256)

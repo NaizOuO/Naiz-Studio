@@ -12,7 +12,7 @@ import pygame
 from core import pdfium, theme, widgets, winfile
 from core.widgets import Dropdown, draw_text, rounded_panel
 
-from . import annot_view, annots, fonts, geometry, model, pdfwrite, signature
+from . import annot_view, annots, fonts, geometry, model, paragraphs, pdffonts, pdfwrite, signature
 from .font_picker import FontPicker
 from .signature import IMAGE_FILTER, SignaturePanel
 from .palette import ColorPalette
@@ -33,13 +33,13 @@ DEFAULTS = {
     "line": dict(width=2.0, opacity=1.0), "arrow": dict(width=2.0, opacity=1.0),
     "rect": dict(width=2.0, opacity=1.0, background=()), "ellipse": dict(width=2.0, opacity=1.0, background=()),
     "ink": dict(width=2.0, opacity=1.0),
-    "replace": dict(font="", font_size=12.0, opacity=1.0, background=(255, 255, 255)),
+    "replace": dict(font="", font_size=12.0, opacity=1.0, background=(255, 255, 255), width=0.0),
     "image": dict(opacity=1.0), "signature": dict(opacity=1.0),
 }
 IMAGE_DPI = 150             # 放進來的圖片預設以這個解析度換算大小
 SIGNATURE_W = 150.0         # 簽名預設寬度(點)
 TOOL_HINTS = {
-    "replace": "在要修改的文字上拖曳選取，放開後直接輸入新的文字；清空文字就是刪除。儲存時原字會真正刪掉",
+    "replace": "點一下文字修改整段，拖曳選取只改其中幾個字；清空文字就是刪除。儲存時原字會真正刪掉",
     "image": "在頁面上點一下放置圖片，或拖曳出想要的大小",
     "signature": "在頁面上點一下放置簽名，或拖曳出想要的大小",
 }
@@ -88,6 +88,8 @@ class AnnotController:
         self._ime_rect = None
         self._note_popup = None
         self.pending = None         # 選好、還沒放到頁面上的圖片或簽名:dict(kind, image, pixels)
+        self._paragraph_cache = {}  # (來源, 第幾頁) → 那一頁的段落
+        self._sources = {}          # 來源檔 → pikepdf 開啟的檔案(取出原字型用)
         self.signatures = SignaturePanel(page, self.accent)
 
     # ------------------------------------------------------------ 資料
@@ -134,9 +136,9 @@ class AnnotController:
         face, result = pdfwrite.text_layout(annot)
         if result is None:
             return annot
-        if annot.kind == "replace":
+        if annot.kind == "replace" and not annot.wrap:
             natural = fonts.layout(annot.text, face, annot.font_size, None, fonts.CATALOG.fallback()).width
-            need = natural + annots.TEXT_PAD * 2 + 1
+            need = natural + annots.TEXT_PAD * 2 + annot.width * 2 + 1
             if annot.box[2] - annot.box[0] < need:
                 annot = replace(annot, box=(annot.box[0], annot.box[1], annot.box[0] + need, annot.box[3]))
                 face, result = pdfwrite.text_layout(annot)
@@ -493,6 +495,13 @@ class AnnotController:
             return True
         point = self.mapper(index).to_page(pos)
         self.selected = None
+        if self.tool == "replace":
+            tolerance = 3 / self.scale()
+            done = next((a for a in reversed(self.pages[index].annots)
+                         if a.kind == "replace" and annots.hit(a, point, tolerance)), None)
+            if done is not None:            # 已經改過的段落(還沒存檔):接著編輯它,不要從頁面上的舊字重來
+                self.start_editing(index, done)
+                return True
         if self.tool in annots.MARKUP or self.tool == "replace":
             self._press_markup(index, point)
         elif self.tool in annots.IMAGES and self.pending is None:
@@ -592,9 +601,11 @@ class AnnotController:
                 self.replace_annot(index, action["annot"], action["preview"], message)
         elif kind == "markup":
             if self.tool == "replace":
-                if not action["moved"]:
+                made = self._make_paragraph(index, action) if not action["moved"] else None
+                if made is None and not action["moved"]:
                     self._update_markup(action["point"], action)
-                made = self._make_replace(index, action) if action["rects"] else None
+                if made is None:
+                    made = self._make_replace(index, action) if action["rects"] else None
                 action["lookup"].close()
                 if made is not None:
                     self.start_editing(index, made, new=True)
@@ -618,10 +629,10 @@ class AnnotController:
         lookup, ref = action["lookup"], self.pages[index]
         first, last = sorted((action["start"], action["end"]))
         text = lookup.text_of(first, last)
-        size, color, font_name, serif, bold, baseline = lookup.char_style(first)
+        size, color, _, _, _, baseline = lookup.char_style(first)
         size = round(size * 2) / 2 or 12.0
-        face = fonts.match_pdf_font(font_name, serif, bold, cjk=any(ord(ch) > 0x2E80 for ch in text))
-        if face is None:
+        chosen = self._text_fonts(ref, lookup, [c for c in paragraphs.read_chars(lookup) if first <= c.index <= last])
+        if chosen is None:
             self.page.notify("找不到可以用的字型，請先選擇或下載字型", theme.WARN)
             return None
         rects = action["rects"]
@@ -632,9 +643,104 @@ class AnnotController:
             if ref.base_rotation % 180 == 0 else min(r[1] for r in rects) + size * 0.88
         top = first_line - annots.TEXT_PAD - size * fonts.BASELINE
         box = (x0 - annots.TEXT_PAD, top, max(x1, x0 + size) + annots.TEXT_PAD + 1, top + 10)
-        style = dict(self.style("replace"), font=face.id, font_size=size, color=tuple(color))
+        style = dict(self.style("replace"), font_size=size, color=tuple(color), **chosen)
         style["background"] = self._paper_color(index, rects) or style["background"]
         return self.fit(annots.create("replace", rects=rects, box=box, text=text, **style))
+
+    # ------------------------------------------------------------ 整段修改
+
+    def _text_fonts(self, ref, lookup, chars):
+        """這些字要用的字型設定:中文字、英數字各自沿用原檔字型(和 Word 一樣分開);回傳 dict,找不到字型時回傳 None。"""
+        found = paragraphs.script_fonts(chars)
+        faces = {}
+        for script, (name, sample) in found.items():
+            _, _, _, serif, bold, _ = lookup.char_style(sample)
+            faces[script] = self._fonts_for(ref, name, serif, bold, script == "cjk")
+        main = faces.get("cjk") or faces.get("latin")
+        if main is None or main[0] is None:
+            return None
+        style = dict(font=main[0].id, fallback=main[1])
+        if "cjk" in faces and "latin" in faces and faces["latin"][0] is not None:
+            style.update(latin=faces["latin"][0].id, latin_fallback=faces["latin"][1])
+        return style
+
+    def _fonts_for(self, ref, font_name, serif, bold, cjk):
+        """(主字型, 補字字型代號):盡量用 PDF 裡的原字型;原字型只有原檔用到的字,沒有的字用相近的字型補。"""
+        matched = fonts.match_pdf_font(font_name, serif, bold, cjk=cjk)
+        original = None
+        pdf = self._source_pdf(ref)
+        if pdf is not None:
+            original = pdffonts.face_for(ref.source, pdf, ref.index, font_name)
+        if original is not None:
+            return original, (matched.id if matched is not None else "")
+        return matched, ""
+
+    def _source_pdf(self, ref):
+        if ref.kind != "pdf":
+            return None
+        if ref.source not in self._sources:
+            import io
+
+            import pikepdf
+
+            try:
+                data = self.page.data.get(ref.source)
+                self._sources[ref.source] = pikepdf.open(io.BytesIO(data) if data is not None else ref.source,
+                                                         password=self.page.passwords.get(ref.source, ""))
+            except Exception:
+                self._sources[ref.source] = None
+        return self._sources[ref.source]
+
+    def paragraphs_of(self, index):
+        ref = self.pages[index]
+        doc = self.page.docs.get(ref.source) if ref.kind == "pdf" else None
+        if doc is None:
+            return []
+        key = (ref.source, ref.index)
+        if key not in self._paragraph_cache:
+            lookup = pdfium.TextLookup(doc, ref.index)
+            try:
+                self._paragraph_cache[key] = paragraphs.find_paragraphs(lookup)
+            finally:
+                lookup.close()
+        return self._paragraph_cache[key]
+
+    def paragraph_at(self, index, point):
+        """頁面座標的這個點落在哪一段文字上。"""
+        ref = self.pages[index]
+        if ref.base_rotation % 360:
+            return None             # 本身轉過的頁面,文字方向和頁面不同,只提供拖曳選字
+        x, y = geometry.apply(geometry.ref_to_user(ref), point)
+        for paragraph in self.paragraphs_of(index):
+            if any(x0 - 1 <= x <= x1 + 1 and y0 - 1 <= y <= y1 + 1 for x0, y0, x1, y1 in paragraph.boxes()):
+                return paragraph
+        return None
+
+    def _make_paragraph(self, index, action):
+        """點一下文字:整段變成可以修改,保留對齊方式、縮排、行距與原字型。"""
+        ref = self.pages[index]
+        paragraph = self.paragraph_at(index, action["point"])
+        if paragraph is None:
+            return None
+        to_page = geometry.ref_from_user(ref)
+        rects = tuple(geometry.transform_box(to_page, box) for box in paragraph.boxes())
+        _, color = paragraph.style()
+        size = round(paragraph.size * 2) / 2 or 12.0
+        chosen = self._text_fonts(ref, action["lookup"], paragraph.chars)
+        if chosen is None:
+            self.page.notify("找不到可以用的字型，請先選擇或下載字型", theme.WARN)
+            return None
+        first = paragraph.lines[0]
+        left, baseline = geometry.apply(to_page, (paragraph.left, first.baseline))
+        right = geometry.apply(to_page, (paragraph.right, first.baseline))[0]
+        top = baseline - annots.TEXT_PAD - size * fonts.BASELINE
+        # 右邊多留一點:換用的補字字型可能寬一點點,不要為了差一點就多折一行
+        box = (left - annots.TEXT_PAD, top, right + annots.TEXT_PAD + size * 0.05, top + 10)
+        style = dict(self.style("replace"), font_size=size, color=tuple(color), **chosen)
+        style["background"] = self._paper_color(index, rects) or style["background"]
+        return self.fit(annots.create("replace", rects=rects, box=box, text=paragraph.text,
+                                      align=paragraph.align, line_height=paragraph.pitch, offsets=paragraph.offsets,
+                                      wrap=len(paragraph.lines) > 1, **style))    # 只有一行的(標題、項目)加字時往右延伸
 
     def _paper_color(self, index, rects):
         """原字周圍最常見的顏色(大多是紙的白色,有底色的表格就是那個底色)。"""
@@ -732,6 +838,11 @@ class AnnotController:
         self.selected = None
         self.tool = "select"
         self.pending = None
+        self._paragraph_cache.clear()
+        for pdf in self._sources.values():
+            if pdf is not None:
+                pdf.close()
+        self._sources.clear()
         self.cache.clear()
         self.picker.close()
         self.signatures.close()
@@ -911,6 +1022,8 @@ class AnnotController:
                     preview = self._created(action)
                     if preview is not None:
                         annot_view.draw_annot(screen, mapper, preview, self.cache)
+        if self.tool == "replace" and action is None and self.editing is None:
+            self._draw_paragraph_hover(index, mapper)
         found = self.selected_annot()
         if self.editing is not None and self.editing["page_uid"] == ref.uid:
             if self.editing["annot"].kind in annots.TEXTS:
@@ -919,6 +1032,25 @@ class AnnotController:
             shown = next((a for a in items if a.uid == found[1].uid), found[1])
             annot_view.draw_selection(screen, mapper, shown, self.accent,
                                       handles=annots.editable(shown) and action is None)
+
+    def _draw_paragraph_hover(self, index, mapper):
+        """改字工具:滑鼠移到文字上時框出會被修改的那一段。"""
+        mouse = pygame.mouse.get_pos()
+        if not mapper.rect.collidepoint(mouse) or not self.page.view_rect.collidepoint(mouse):
+            return
+        point = mapper.to_page(mouse)
+        done = next((a for a in reversed(self.pages[index].annots)
+                     if a.kind == "replace" and annots.hit(a, point, 3 / mapper.scale)), None)
+        if done is not None:
+            pygame.draw.rect(self.page.screen, self.accent, mapper.box(annots.bounds(done)).inflate(6, 6), 1,
+                             border_radius=3)
+            return
+        paragraph = self.paragraph_at(index, point)
+        if paragraph is None:
+            return
+        box = geometry.transform_box(geometry.ref_from_user(self.pages[index]), paragraph.bounds())
+        rect = mapper.box(box).inflate(6, 6)
+        pygame.draw.rect(self.page.screen, self.accent, rect, 1, border_radius=3)
 
     def _draw_caret(self, a, b, layout_rows):
         screen = self.page.screen

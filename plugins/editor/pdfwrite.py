@@ -79,7 +79,9 @@ class FontEmbedder:
         from fontTools import subset
         from fontTools.ttLib import TTFont
 
-        font = TTFont(str(face.path), fontNumber=face.index)
+        # 不要重算字形外框:標楷體、細明體的組合字要靠字型裡的微調程式拼筆畫,
+        # 依外框重算出來的左側間距是錯的,嵌入後筆畫會錯位(實測)
+        font = TTFont(str(face.path), fontNumber=face.index, recalcBBoxes=False)
         options = subset.Options()
         options.retain_gids = True
         options.notdef_outline = True
@@ -258,7 +260,11 @@ def text_layout(annot):
     if face is None:
         return None, None
     width = max(1.0, annot.box[2] - annot.box[0] - annots.TEXT_PAD * 2 - annot.width * 2)
-    return face, fonts.layout(annot.text, face, annot.font_size, width, fonts.CATALOG.fallback())
+    fallback = [fonts.CATALOG.get(annot.fallback) if annot.fallback else None, fonts.CATALOG.fallback()]
+    latin = [fonts.CATALOG.get(annot.latin), fonts.CATALOG.get(annot.latin_fallback) if annot.latin_fallback else None] \
+        if annot.latin else None
+    return face, fonts.layout(annot.text, face, annot.font_size, width, fallback, annot.align, annot.offsets,
+                              annot.line_height, latin)
 
 
 def textbox_height(annot, result):
@@ -472,8 +478,7 @@ def _replace_text(pdf, page, ref, items, embedder):
             commands.append(f"q {' '.join(_num(v) for v in _rgb(annot.background))} rg {fill} f Q")
         if not annot.text.strip():
             continue
-        text = annots.Annot("textbox", color=annot.color, width=0.0, box=annot.box, text=annot.text,
-                            font=annot.font, font_size=annot.font_size, opacity=annot.opacity)
+        text = replace(annot, kind="textbox", width=0.0, background=(), rects=())
         content, resources, box, _ = _appearance(pdf, text, embedder)
         form = pikepdf.Stream(pdf, content)
         form.Type, form.Subtype = pikepdf.Name.XObject, pikepdf.Name.Form

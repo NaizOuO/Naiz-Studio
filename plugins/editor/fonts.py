@@ -371,6 +371,8 @@ class Catalog:
     def get(self, face_id):
         if not face_id:
             return None
+        if face_id.startswith("pdf:"):
+            return self._pdf_face(face_id)
         if face_id.startswith("pack:"):
             return next((face for face in self.packs() if face.id == face_id), None)
         if face_id.startswith("custom:"):
@@ -386,6 +388,18 @@ class Catalog:
                 if str(number) == index:
                     return FontFace(face_id, name, "system", path, number, embed_status(fs_type))
         return None
+
+    def _pdf_face(self, face_id):
+        """從 PDF 取出的原字型(見 pdffonts),存在 fonts\\pdf\\。"""
+        face = self._custom_cache.get(face_id)
+        if face is None:
+            path = paths.FONTS_DIR / "pdf" / face_id[4:]
+            if not path.is_file():
+                return None
+            found = read_faces(path)
+            name = found[0][1] if found else path.stem
+            face = self._custom_cache[face_id] = FontFace(face_id, f"{name}(原檔字型)", "pdf", path)
+        return face
 
     def system_file(self, filename, index=0):
         for folder in SYSTEM_DIRS:
@@ -532,38 +546,91 @@ def _wordish(ch):
     return ch.isascii() and (ch.isalnum() or ch in "'-_")
 
 
-def pick_faces(text, face, fallback):
-    """每個字用哪個字型:主字型沒有的字改用補字字型(兩個都沒有時仍用主字型)。"""
-    main = data(face)
-    backup = data(fallback) if fallback is not None and fallback.id != face.id else None
+def _backups(face, fallback):
+    items = fallback if isinstance(fallback, (list, tuple)) else [fallback]
+    seen, result = {face.id}, []
+    for item in items:
+        if item is not None and item.id not in seen:
+            seen.add(item.id)
+            result.append(item)
+    return result
+
+
+def _cjk(ch):
+    code = ord(ch)
+    return 0x2E80 <= code <= 0xA4CF or 0xF900 <= code <= 0xFAFF or 0xFE30 <= code <= 0xFE4F \
+        or 0xFF00 <= code <= 0xFF60 or code >= 0x20000
+
+
+def pick_faces(text, face, fallback, latin=None):
+    """每個字用哪個字型:依序找第一個有這個字的字型(fallback 可以是一個或好幾個;都沒有時仍用主字型)。
+    latin 是英數字、符號優先用的字型(一個或好幾個),和 Word 一樣中文、英文可以用不同字型。
+    空白也要找有的字型:原檔字型常常沒有空白,直接用會畫出方格。"""
+    main = [(face, data(face))] + [(item, data(item)) for item in _backups(face, fallback)]
+    western = [(item, data(item)) for item in (latin if isinstance(latin, (list, tuple)) else [latin])
+               if item is not None]
     chosen = []
     for ch in text:
-        if backup is not None and not ch.isspace() and not main.has(ch) and backup.has(ch):
-            chosen.append(fallback)
-        else:
-            chosen.append(face)
+        probe = " " if ch in "\t\n" else ch
+        candidates = western + main if western and not _cjk(ch) else main
+        chosen.append(next((item for item, loaded in candidates if loaded.has(probe)), candidates[0][0]))
     return chosen
 
 
-def layout(text, face, size, max_width=None, fallback=None):
-    faces = pick_faces(text, face, fallback)
+def layout(text, face, size, max_width=None, fallback=None, align="", offsets=(0.0, 0.0), line_height=0.0,
+           latin=None):
+    """排版。align:left、center、right、justify(兩端對齊);offsets:第一行、其他行離左邊多遠(首行縮排、
+    凸排);line_height 給 0 時用字級的 LINE_HEIGHT 倍。"""
+    faces = pick_faces(text, face, fallback, latin)
     advances = [0.0 if ch == "\n" else data(f).advance(" " if ch == "\t" else ch) * size
                 for ch, f in zip(text, faces)]
-    return Layout(arrange(text, advances, faces, max_width), size, size * LINE_HEIGHT)
+    lines = arrange(text, advances, faces, max_width, offsets)
+    if max_width and (align in ("center", "right", "justify") or any(offsets)):
+        _align(lines, text, faces, max_width, align, offsets)
+    return Layout(lines, size, line_height or size * LINE_HEIGHT)
 
 
-def arrange(text, advances, faces=None, max_width=None):
-    """依每個字的寬度自動換行,回傳 [Line];faces 是每個字用的字型(不需要時給 None)。"""
+def _align(lines, text, faces, width, align, offsets):
+    """把每一行依對齊方式與縮排移到該在的位置;兩端對齊時把多出來的寬度平均分給字和字之間。"""
+    for row, line in enumerate(lines):
+        offset = offsets[0] if row == 0 else offsets[1]
+        room = width - offset - line.width
+        count = line.end - line.start
+        ends_paragraph = row == len(lines) - 1 or line.end < len(text) and text[line.end] == "\n"
+        gap = 0.0
+        if align == "justify" and not ends_paragraph and count > 1 and room > 0:
+            gap = room / (count - 1)
+            shift = offset
+        elif align == "center":
+            shift = offset + max(0.0, room) / 2
+        elif align == "right":
+            shift = offset + max(0.0, room)
+        else:
+            shift = offset
+        if not shift and not gap:
+            continue
+        line.xs = [x + shift + gap * min(i, count - 1) for i, x in enumerate(line.xs)]
+        if gap:
+            line.runs = [(faces[i], text[i].replace("\t", " "), line.xs[i - line.start])
+                         for i in range(line.start, line.end)]
+        else:
+            line.runs = [(f, t, rx + shift) for f, t, rx in line.runs]
+
+
+def arrange(text, advances, faces=None, max_width=None, offsets=(0.0, 0.0)):
+    """依每個字的寬度自動換行,回傳 [Line];faces 是每個字用的字型(不需要時給 None)。
+    offsets 是第一行、其他行離左邊的距離,可以放的寬度會跟著變窄。"""
     faces = faces or [None] * len(text)
     breaks, start, i, x = [], 0, 0, 0.0
     while i < len(text):
         ch = text[i]
+        limit = max_width - (offsets[0] if not breaks else offsets[1]) if max_width else None
         if ch == "\n":
             breaks.append((start, i))
             i += 1
             start, x = i, 0.0
             continue
-        if max_width and x + advances[i] > max_width and i > start:
+        if limit and x + advances[i] > limit and i > start:
             cut = i
             if _wordish(ch) and _wordish(text[i - 1]):
                 space = text.rfind(" ", start, i)
@@ -620,6 +687,6 @@ def draw_layout(draw, result, origin, scale, fill):
 def missing_chars(text, face, fallback):
     """主字型和補字字型都沒有的字。"""
     main = data(face)
-    backup = data(fallback) if fallback is not None else None
+    backups = [data(item) for item in _backups(face, fallback)]
     return "".join(sorted({ch for ch in text if not ch.isspace() and not main.has(ch)
-                           and (backup is None or not backup.has(ch))}))
+                           and not any(backup.has(ch) for backup in backups)}))

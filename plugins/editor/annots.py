@@ -46,6 +46,13 @@ class Annot:
     font_size: float = 12.0
     background: tuple = ()          # 文字框的背景、方框與圓形的填滿顏色;空的表示沒有底色。改字是蓋住原字的顏色
     image: bytes = b""              # 圖片、簽名:PNG 檔的內容
+    align: str = ""                 # 改字整段編輯:left、center、right、justify
+    line_height: float = 0.0        # 改字整段編輯:原檔的行距(相鄰兩行底線的距離);0 表示用預設
+    offsets: tuple = (0.0, 0.0)     # 改字整段編輯:第一行、其他行的縮排
+    fallback: str = ""              # 主字型(原檔字型只有用到的字)沒有的字,先用這個字型補
+    latin: str = ""                 # 英數字、符號用的字型(像 Word 一樣中文和英文分開設定);空的表示和主字型相同
+    latin_fallback: str = ""        # 英數字的原檔字型沒有的字,用這個補
+    wrap: bool = False              # 改字:True 是整段編輯(自動換行),False 是只改幾個字(框跟著字變寬)
     pixels: tuple = ()              # 圖片的像素寬高;改大小時維持這個比例
     origin: int = -1                # 原檔這一頁 /Annots 的第幾個;-1 是在編輯器裡新增的
     subtype: str = ""               # 原檔的註解類型名稱

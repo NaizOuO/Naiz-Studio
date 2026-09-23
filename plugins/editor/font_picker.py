@@ -1,11 +1,13 @@
-"""文字框的字型選單:開源字型包(需要時才下載)、自己加入的字型、電腦上的字型。"""
+"""文字框的字型選單:常用(最近用過的)、本地(電腦上的字型)、個人(自己加入的)、開源字型包(需要時才下載)。"""
 
+import json
 from pathlib import Path
 
 import pygame
 from PIL import Image, ImageDraw
 
-from core import theme, widgets, winfile
+from core import paths, theme, widgets, winfile
+from core.scroll import ScrollView
 from core.widgets import Button, TextInput, draw_text, rounded_panel
 
 from . import fonts
@@ -22,6 +24,31 @@ def _glyph(font, ch):
     return image.tobytes()
 
 
+RECENT_MAX = 8
+
+
+def _recent_path():
+    return paths.FONTS_DIR / "recent.json"
+
+
+def recent_ids():
+    try:
+        items = json.loads(_recent_path().read_text(encoding="utf-8"))
+        return [item for item in items if isinstance(item, str)][:RECENT_MAX]
+    except (OSError, ValueError):
+        return []
+
+
+def remember(face_id):
+    """記住最近選過的字型,常用區依時間先後列出。"""
+    items = [face_id] + [item for item in recent_ids() if item != face_id]
+    try:
+        paths.FONTS_DIR.mkdir(parents=True, exist_ok=True)
+        _recent_path().write_text(json.dumps(items[:RECENT_MAX], ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
 EMBED_NOTES = {"preview": "只能預覽列印：存檔後別人只能檢視、列印，不能修改", "no": "字型檔不允許嵌入，沒辦法使用"}
 
 
@@ -32,7 +59,7 @@ class FontPicker:
         self.is_open = False
         self.current = ""
         self.on_pick = None
-        self.scroll = 0
+        self.view = ScrollView(accent=accent, wheel_step=ROW_H)
         self.message = ("", theme.TEXT_DIM)
         self.search = TextInput(placeholder="搜尋字型名稱", accent=accent, size=14)
         self.btn_add = Button("加入字型檔", filled=False, size=13)
@@ -43,7 +70,7 @@ class FontPicker:
 
     def open(self, current, on_pick):
         self.current, self.on_pick = current or "", on_pick
-        self.scroll = 0
+        self.view.reset()
         self.message = ("", theme.TEXT_DIM)
         self.search.set_text("")
         self.is_open = True
@@ -51,6 +78,7 @@ class FontPicker:
 
     def close(self):
         self.search.blur()
+        self.view.reset()
         self.is_open = False
         controller = getattr(self.page, "annot", None)
         if controller is not None and controller.editing is not None:
@@ -60,19 +88,22 @@ class FontPicker:
 
     def rows(self):
         query = self.search.text.strip().lower()
+        recent = [face for face in (fonts.CATALOG.get(face_id) for face_id in recent_ids()) if face is not None]
         sections = [
-            ("開源字型包", "需要時才下載，可以自由嵌入 PDF", fonts.CATALOG.packs(), "pack"),
-            ("自己加入的字型", "放在 fonts\\custom\\；也可以把字型檔直接拖進這個視窗", fonts.CATALOG.custom(), "custom"),
-            ("電腦上的字型", "依字型檔的授權設定判斷能不能嵌入", fonts.CATALOG.system, "system"),
+            ("常用", "最近用過的字型", recent, "recent", "還沒有用過的字型"),
+            ("本地", "電腦上的字型，依字型檔的授權設定判斷能不能嵌入", fonts.CATALOG.system, "system", "沒有字型"),
+            ("個人", "自己加入的字型，放在 fonts\\custom\\；也可以把字型檔直接拖進這個視窗",
+             fonts.CATALOG.custom(), "custom", "還沒有加入字型"),
+            ("開源", "開源字型包，需要時才下載，可以自由嵌入 PDF", fonts.CATALOG.packs(), "pack", "沒有字型"),
         ]
         rows = []
-        for title, note, faces, group in sections:
+        for title, note, faces, group, empty in sections:
             matched = [face for face in faces if query in face.name.lower()] if query else faces
             rows.append(("header", (title, note), HEADER_H))
             if group == "system" and fonts.CATALOG.scan_state != "ready":
                 rows.append(("info", "正在讀取電腦上的字型...", INFO_H))
             elif not matched:
-                rows.append(("info", "沒有符合的字型" if query else "還沒有加入字型", INFO_H))
+                rows.append(("info", "沒有符合的字型" if query else empty, INFO_H))
             else:
                 rows += [("face", face, ROW_H) for face in matched]
         return rows
@@ -110,6 +141,7 @@ class FontPicker:
             self.page.app.consent.open(face.name, [face.dependency], on_done=lambda: self.choose(face))
             return
         action = self.on_pick
+        remember(face.id)
         self.close()
         if action is not None:
             action(face.id)
@@ -130,7 +162,7 @@ class FontPicker:
             self.message = (f"已加入 {len(added)} 個字型" + ("" if usable else "，但字型檔不允許嵌入，沒辦法使用"),
                             theme.ACCENT if usable else theme.WARN)
             self.search.set_text("")
-            self.scroll = 0
+            self.view.reset()
         return added
 
     # ------------------------------------------------------------ 事件
@@ -142,11 +174,10 @@ class FontPicker:
         if event.type == pygame.DROPFILE:
             self.add_files([event.file])
             return
-        if event.type == pygame.MOUSEWHEEL:
-            self.scroll = max(0, self.scroll - event.y * ROW_H)
+        if self.view.handle_event(event, pos):     # 滾輪、拖曳捲動條、中鍵自動捲動
             return
         if self.search.handle(event, pos):
-            self.scroll = 0
+            self.view.set_scroll(0)
         if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
             return
         if self.btn_cancel.clicked(pos, True):
@@ -198,12 +229,13 @@ class FontPicker:
         area = self.list_rect
         rows = self.rows()
         total = sum(h for _, _, h in rows)
-        self.scroll = max(0, min(self.scroll, max(0, total - area.height)))
+        self.view.layout(area, total)
+        self.view.update(mouse_pos)
         rounded_panel(screen, area, theme.BG_DEEP, radius=10, alpha=200)
         previous = screen.get_clip()
         screen.set_clip(area)
         self._hits = []
-        y = area.y - self.scroll
+        y = area.y - self.view.scroll
         for kind, item, h in rows:
             if y + h < area.y or y > area.bottom:
                 y += h
@@ -217,15 +249,10 @@ class FontPicker:
             elif kind == "info":
                 draw_text(screen, item, (area.x + 24, y + 7), 12, theme.TEXT_FAINT)
             else:
-                self._draw_face(screen, item, pygame.Rect(area.x + 6, y + 2, area.width - 18, h - 4), mouse_pos)
+                self._draw_face(screen, item, pygame.Rect(area.x + 6, y + 2, area.width - 26, h - 4), mouse_pos)
             y += h
         screen.set_clip(previous)
-        if total > area.height:
-            track = pygame.Rect(area.right - 6, area.y + 6, 3, area.height - 12)
-            bar_h = max(24, track.height * area.height // total)
-            top = track.y + (track.height - bar_h) * self.scroll // max(1, total - area.height)
-            pygame.draw.rect(screen, theme.PANEL_EDGE, track, border_radius=2)
-            pygame.draw.rect(screen, self.accent, (track.x, top, 3, bar_h), border_radius=2)
+        self.view.draw(screen, mouse_pos)
 
     def _draw_face(self, screen, face, rect, mouse_pos):
         self._hits.append((face, rect))
@@ -242,6 +269,8 @@ class FontPicker:
                 (f"下載 {face.dependency.size_text}", self.accent)
         elif face.group == "custom":
             label, label_color = "自己加入", theme.TEXT_FAINT
+        elif face.group == "pdf":
+            label, label_color = "原檔字型", theme.TEXT_FAINT
         else:
             label, label_color = "", theme.TEXT_FAINT
         label_rect = draw_text(screen, label, (right, rect.centery), 12, label_color, right=True) if label else \

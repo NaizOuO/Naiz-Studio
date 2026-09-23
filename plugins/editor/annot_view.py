@@ -7,6 +7,7 @@
 import io
 import math
 from collections import OrderedDict
+from dataclasses import replace
 
 import pygame
 from PIL import Image, ImageDraw
@@ -146,8 +147,7 @@ def draw_annot(screen, mapper, annot, cache):
                 if area.width > 0 and area.height > 0:
                     screen.fill(tuple(annot.background), area)
         if annot.text:
-            text = annots.Annot("textbox", color=annot.color, width=0.0, box=annot.box, text=annot.text,
-                                font=annot.font, font_size=annot.font_size)
+            text = replace(annot, kind="textbox", width=0.0, background=(), rects=())
             surface = _textbox_surface(mapper, text, cache)
             if surface is not None:
                 screen.blit(surface, mapper.box(annot.box).topleft)

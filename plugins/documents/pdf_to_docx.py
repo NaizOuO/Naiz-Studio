@@ -161,7 +161,7 @@ def _read_chars(text_page, height) -> list:
         origin_x, origin_y = ctypes.c_double(), ctypes.c_double()
         raw.FPDFText_GetCharOrigin(text_page, index, ctypes.byref(origin_x), ctypes.byref(origin_y))
         chars.append(Char(chr(code), left.value, height - top.value, right.value, height - bottom.value,
-                          height - origin_y.value, abs(raw.FPDFText_GetFontSize(text_page, index)), font,
+                          height - origin_y.value, pdfium.char_size(text_page, index), font,
                           bool(flags.value & _FLAG_BOLD) or "Bold" in name,
                           bool(flags.value & _FLAG_ITALIC) or "Italic" in name or "Oblique" in name,
                           (red.value, green.value, blue.value), generated))
