@@ -20,7 +20,7 @@ from .textarea import TextEditor, simple_layout
 
 BAR_H = 86
 TOOLS = [("select", "選取"), ("highlight", "螢光筆"), ("underline", "底線"), ("strike", "刪除線"), ("textbox", "文字框"),
-         ("replace", "改字"), ("note", "便利貼"), ("line", "直線"), ("arrow", "箭頭"), ("rect", "方框"),
+         ("replace", "改字"), ("redact", "塗黑"), ("note", "便利貼"), ("line", "直線"), ("arrow", "箭頭"), ("rect", "方框"),
          ("ellipse", "圓形"), ("ink", "手繪"), ("image", "圖片"), ("signature", "簽名")]
 WIDTH_OPTIONS = [(f"{v:g}", f"{v:g} pt") for v in (1, 2, 3, 5, 8)]
 SHAPE_WIDTH_OPTIONS = [("0", "無線條")] + WIDTH_OPTIONS
@@ -34,12 +34,13 @@ DEFAULTS = {
     "rect": dict(width=2.0, opacity=1.0, background=()), "ellipse": dict(width=2.0, opacity=1.0, background=()),
     "ink": dict(width=2.0, opacity=1.0),
     "replace": dict(font="", font_size=12.0, opacity=1.0, background=(255, 255, 255), width=0.0),
-    "image": dict(opacity=1.0), "signature": dict(opacity=1.0),
+    "image": dict(opacity=1.0), "signature": dict(opacity=1.0), "redact": {},
 }
 IMAGE_DPI = 150             # 放進來的圖片預設以這個解析度換算大小
 SIGNATURE_W = 150.0         # 簽名預設寬度(點)
 TOOL_HINTS = {
     "replace": "點一下文字修改整段，拖曳選取只改其中幾個字；清空文字就是刪除。儲存時原字會真正刪掉",
+    "redact": "在文字上拖曳選取要塗黑的字，或在其他地方拉出範圍(照片、簽名也行)；儲存時底下的字和圖會真正刪掉",
     "image": "在頁面上點一下放置圖片，或拖曳出想要的大小",
     "signature": "在頁面上點一下放置簽名，或拖曳出想要的大小",
 }
@@ -502,7 +503,7 @@ class AnnotController:
             if done is not None:            # 已經改過的段落(還沒存檔):接著編輯它,不要從頁面上的舊字重來
                 self.start_editing(index, done)
                 return True
-        if self.tool in annots.MARKUP or self.tool == "replace":
+        if self.tool in annots.MARKUP or self.tool in ("replace", "redact"):
             self._press_markup(index, point)
         elif self.tool in annots.IMAGES and self.pending is None:
             self.set_tool(self.tool)
@@ -527,9 +528,9 @@ class AnnotController:
         if start is None:
             if lookup is not None:
                 lookup.close()
-            if self.tool == "highlight":
-                # 沒有文字的地方(例如掃描的頁面)改成拖曳出一塊範圍
-                self.action = dict(type="create", kind="highlight", index=index, start=point, current=point,
+            if self.tool in ("highlight", "redact"):
+                # 沒有文字的地方(例如掃描的頁面、照片)改成拖曳出一塊範圍
+                self.action = dict(type="create", kind=self.tool, index=index, start=point, current=point,
                                    stroke=[point])
             elif self.tool == "replace":
                 self.page.notify("這裡沒有可以修改的文字；掃描的頁面可以用「文字框」加上背景色蓋住再打字", theme.WARN)
@@ -548,7 +549,7 @@ class AnnotController:
         action["end"] = end
         to_page = geometry.ref_from_user(ref)
         # 改字用自己算的範圍(PDFium 的字框在某些字型會大很多,會把旁邊的字一起蓋掉)
-        found = action["lookup"].line_boxes(action["start"], end) if self.tool == "replace" \
+        found = action["lookup"].line_boxes(action["start"], end) if self.tool in ("replace", "redact") \
             else action["lookup"].rects(action["start"], end)
         action["rects"] = tuple(geometry.transform_box(to_page, rect) for rect in found)
 
@@ -771,8 +772,8 @@ class AnnotController:
         make = annots.create if final else annots.Annot
         if not final:
             style = dict(style, uid=0)
-        if kind == "highlight":
-            return make("highlight", rects=(box,), **style) if big_enough else None
+        if kind in ("highlight", "redact"):
+            return make(kind, rects=(box,), **style) if big_enough else None
         if kind in ("line", "arrow"):
             return make(kind, points=(action["start"], action["current"]), **style) \
                 if math.hypot(x1 - x0, y1 - y0) * scale >= 6 else None
@@ -950,7 +951,7 @@ class AnnotController:
             self._menus.append((self.width_menu, "width"))
             x += menu_w + 12
         if kind != "note":
-            if kind != "replace":
+            if kind not in ("replace", "redact"):          # 塗黑一定要完全不透明
                 x = self._label("透明度", x, cy).right + 6
                 self._sync(self.opacity_menu, OPACITY_OPTIONS, values["opacity"],
                            lambda v: f"{round((1 - v) * 100)}%")
@@ -1012,7 +1013,8 @@ class AnnotController:
         if action is not None and action["index"] == index:
             if action["type"] == "markup":
                 annot_view.draw_markup_preview(screen, mapper, self.tool, action["rects"],
-                                               self.accent if self.tool == "replace" else self.settings[self.tool]["color"])
+                                               self.accent if self.tool in ("replace", "redact")
+                                               else self.settings[self.tool]["color"])
             elif action["type"] == "create":
                 if action["kind"] == "textbox":
                     (x0, y0), (x1, y1) = action["start"], action["current"]

@@ -5,6 +5,9 @@
 並補上相同寬度的間距,同一行其他的字才會留在原位。
 
 字寬算不準的字型(少見的編碼、直書)不冒險改,只統計數量回報;這些字仍會被白底蓋住。
+
+塗黑個資時連圖片也要處理(images=True):範圍內的像素直接塗掉、換成新的圖片,
+只在上面疊一層黑框的話,別人把黑框移開,底下的照片還看得到。
 """
 
 import re
@@ -36,6 +39,14 @@ def _mul(a, b):
 
 def _apply(m, x, y):
     return x * m[0] + y * m[2] + m[4], x * m[1] + y * m[3] + m[5]
+
+
+def _invert(m):
+    a, b, c, d, e, f = m
+    det = a * d - b * c
+    if abs(det) < 1e-12:
+        return IDENTITY
+    return (d / det, -b / det, -c / det, a / det, (c * f - d * e) / det, (b * e - a * f) / det)
 
 
 def _num(value, fallback=0.0):
@@ -230,12 +241,16 @@ class _State:
 
 
 class Redactor:
-    def __init__(self, pdf, areas, tolerance=0.5):
+    def __init__(self, pdf, areas, tolerance=0.5, images=False, fill=(0, 0, 0)):
         self.pdf = pdf
         self.areas = [tuple(a) for a in areas]
         self.tolerance = tolerance
+        self.images = images
+        self.fill = tuple(fill)
         self.removed = 0
         self.skipped = 0
+        self.images_changed = 0
+        self.replaced = set()        # 換成新版本的圖片、表單物件名稱
         self._fonts = {}
 
     def _inside(self, x, y):
@@ -378,12 +393,62 @@ class Redactor:
                     continue
             elif op == "Do" and operands and depth < MAX_FORM_DEPTH:
                 replacement = self._form(resources, operands[0], state.ctm, depth)
+                if replacement is None and self.images:
+                    replacement = self._image(resources, operands[0], state.ctm)
                 if replacement is not None:
                     changed = True
                     result.append(([replacement], operator))
                     continue
             result.append((operands, operator))
         return result, changed
+
+    def _image(self, resources, name, ctm):
+        """圖片和範圍重疊的地方,像素直接塗成指定的顏色,換成一張新圖片。"""
+        xobjects = resources.get("/XObject") if resources is not None else None
+        image = xobjects.get(name) if xobjects is not None else None
+        if not isinstance(image, pikepdf.Stream) or str(image.get("/Subtype", "")) != "/Image":
+            return None
+        corners = [_apply(ctm, x, y) for x, y in ((0, 0), (1, 0), (0, 1), (1, 1))]
+        box = (min(c[0] for c in corners), min(c[1] for c in corners),
+               max(c[0] for c in corners), max(c[1] for c in corners))
+        hits = [a for a in self.areas if a[0] < box[2] and a[2] > box[0] and a[1] < box[3] and a[3] > box[1]]
+        if not hits:
+            return None
+        try:
+            from PIL import ImageDraw
+
+            picture = pikepdf.PdfImage(image).as_pil_image()
+            if picture.mode not in ("RGB", "L"):
+                picture = picture.convert("RGB")
+        except Exception:
+            self.skipped += 1           # 讀不了的圖片格式:只會被上面的色塊蓋住
+            return None
+        width, height = picture.size
+        inverse = _invert(ctm)
+        draw = ImageDraw.Draw(picture)
+        color = self.fill if picture.mode == "RGB" else round(sum(self.fill) / 3)
+        for x0, y0, x1, y1 in hits:
+            points = [_apply(inverse, x, y) for x, y in ((x0, y0), (x1, y0), (x0, y1), (x1, y1))]
+            us, vs = [u for u, _ in points], [v for _, v in points]
+            # 圖片空間:(0,0) 是左下、(1,1) 是右上;像素的第一列在上面
+            left, right = max(0.0, min(us)) * width, min(1.0, max(us)) * width
+            top, bottom = (1 - min(1.0, max(vs))) * height, (1 - max(0.0, min(vs))) * height
+            if right > left and bottom > top:
+                draw.rectangle((int(left), int(top), int(right + 0.999) - 1, int(bottom + 0.999) - 1), fill=color)
+        import zlib
+
+        stream = pikepdf.Stream(self.pdf, zlib.compress(picture.tobytes(), 9))
+        stream.Type, stream.Subtype = pikepdf.Name.XObject, pikepdf.Name.Image
+        stream.Width, stream.Height, stream.BitsPerComponent = width, height, 8
+        stream.ColorSpace = pikepdf.Name.DeviceRGB if picture.mode == "RGB" else pikepdf.Name.DeviceGray
+        stream.Filter = pikepdf.Name.FlateDecode
+        if "/SMask" in image:
+            stream.SMask = image.SMask
+        self.replaced.add(str(name))
+        new_name = pikepdf.Name(f"{name}_naizr{self.images_changed}")
+        xobjects[new_name] = self.pdf.make_indirect(stream)
+        self.images_changed += 1
+        return new_name
 
     def _form(self, resources, name, ctm, depth):
         """頁面用到的表單物件(一組可以重複使用的內容)裡也有字時,複製一份改好再換上去。"""
@@ -404,6 +469,7 @@ class Redactor:
         for key in form.keys():
             if key not in ("/Length", "/Filter", "/DecodeParms"):
                 copy[key] = form[key]
+        self.replaced.add(str(name))
         new_name = pikepdf.Name(f"{name}_naiz{self.removed}")
         xobjects[new_name] = self.pdf.make_indirect(copy)
         return new_name
@@ -423,14 +489,22 @@ def _own_resources(pdf, page):
     return page.obj.Resources
 
 
-def redact_page(pdf, page, areas):
-    """刪掉頁面上落在 areas(使用者座標的 (左, 下, 右, 上))裡的字;回傳 (刪掉的字數, 沒把握而保留的段數)。"""
+def redact_page(pdf, page, areas, images=False, fill=(0, 0, 0)):
+    """刪掉頁面上落在 areas(使用者座標的 (左, 下, 右, 上))裡的字;images 為真時圖片的那一塊也塗掉。
+    回傳 (刪掉的字數, 沒把握而保留的段數)。"""
     if not areas:
         return 0, 0
     resources = _own_resources(pdf, page)
-    redactor = Redactor(pdf, areas)
+    redactor = Redactor(pdf, areas, images=images, fill=fill)
     operations = pikepdf.parse_content_stream(page)
     rewritten, changed = redactor.rewrite(operations, resources)
     if changed:
         page.obj.Contents = pdf.make_stream(pikepdf.unparse_content_stream(rewritten))
+        # 被換掉的舊圖片、舊表單物件(裡面還有原本的字和像素)不能留在頁面上,不然存檔後還取得出來
+        used = {str(operands[0]) for operands, operator in rewritten if str(operator) == "Do" and operands}
+        xobjects = resources.get("/XObject")
+        if xobjects is not None:
+            for name in list(xobjects.keys()):
+                if name in redactor.replaced and name not in used:
+                    del xobjects[name]
     return redactor.removed, redactor.skipped

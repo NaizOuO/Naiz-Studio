@@ -23,7 +23,7 @@ DEFAULT_COLORS = {     # 和顏色選單裡的標準色一致
     "highlight": (255, 255, 0), "underline": (0, 112, 192), "strike": (255, 0, 0), "textbox": (0, 0, 0),
     "note": (255, 192, 0), "line": (255, 0, 0), "arrow": (255, 0, 0), "rect": (255, 0, 0),
     "ellipse": (255, 0, 0), "ink": (0, 112, 192), "other": (150, 150, 150),
-    "image": (0, 0, 0), "signature": (0, 0, 0), "replace": (0, 0, 0),
+    "image": (0, 0, 0), "signature": (0, 0, 0), "replace": (0, 0, 0), "redact": (0, 0, 0),
 }
 _SUBTYPES = {"Highlight": "highlight", "Underline": "underline", "StrikeOut": "strike", "FreeText": "textbox",
              "Text": "note", "Line": "line", "Square": "rect", "Circle": "ellipse", "Ink": "ink"}
@@ -69,7 +69,7 @@ def arrow_size(width):
 
 def raw_box(annot):
     """不含線條粗細的範圍;改字是文字框的範圍(不含蓋住的原字)。"""
-    if annot.kind in MARKUP:
+    if annot.kind in MARKUP or annot.kind == "redact":
         return geometry.bbox([p for x0, y0, x1, y1 in annot.rects for p in ((x0, y0), (x1, y1))])
     if annot.kind in ("line", "arrow"):
         return geometry.bbox(annot.points)
@@ -100,7 +100,7 @@ def _inside(box, point, tolerance=0.0):
 def hit(annot, point, tolerance=3.0):
     if annot.kind == "replace":
         return _inside(annot.box, point, tolerance) or any(_inside(rect, point, tolerance) for rect in annot.rects)
-    if annot.kind in MARKUP:
+    if annot.kind in MARKUP or annot.kind == "redact":
         return any(_inside(rect, point, tolerance) for rect in annot.rects)
     reach = tolerance + annot.width / 2
     if annot.kind in ("line", "arrow"):
@@ -382,4 +382,4 @@ def read_page(page_obj, size, base_rotation, origin):
 
 LABELS = {"highlight": "螢光筆", "underline": "底線", "strike": "刪除線", "textbox": "文字框", "note": "便利貼",
           "line": "直線", "arrow": "箭頭", "rect": "方框", "ellipse": "圓形", "ink": "手繪", "other": "其他註解",
-          "image": "圖片", "signature": "簽名", "replace": "改字"}
+          "image": "圖片", "signature": "簽名", "replace": "改字", "redact": "塗黑"}

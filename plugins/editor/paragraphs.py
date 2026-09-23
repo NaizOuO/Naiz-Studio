@@ -4,25 +4,14 @@
 """
 
 import ctypes
-import re
 import statistics
 from collections import Counter
 from dataclasses import dataclass, field
 
 import pypdfium2.raw as raw
 
-from core import pdfium
-
-# 項目編號:一、 (一) （一） 1. 1、 (1) ① • - 等開頭的行是新的一段
-LIST_START = re.compile(r"^\s*([一二三四五六七八九十百]+[、.．]|[(（][一二三四五六七八九十\d]+[)）]|\d+[.、．)）]\s*\S"
-                        r"|[①-⑳]|[•●○◆■▪\-–—]\s)")
-ENDINGS = "。！？：；.!?:;」』）)"
-CJK = ((0x2E80, 0xA4CF), (0xF900, 0xFAFF), (0xFE30, 0xFE4F), (0xFF00, 0xFF60), (0x20000, 0x3FFFF))
-
-
-def is_cjk(ch):
-    code = ord(ch)
-    return any(low <= code <= high for low, high in CJK)
+from core import pdfium, textrules
+from core.textrules import is_cjk
 
 
 @dataclass
@@ -207,13 +196,9 @@ def group_lines(chars):
 def _same_paragraph(paragraph, line, column_right):
     last = paragraph[-1]
     size = last.size
-    if LIST_START.match(line.text):
+    if textrules.starts_list(line.text):
         return False
-    # 上一行沒寫滿:以句號、冒號結尾,或明顯比下一行短,就是一段的結尾
-    short = last.right < column_right - size * 2
-    if short and last.text.rstrip()[-1:] in ENDINGS:
-        return False
-    if last.right < line.right - size * 2:
+    if textrules.ends_paragraph(last.text, last.right, line.right, column_right, size):
         return False
     if abs(line.size - size) > size * 0.15:
         return False
@@ -257,12 +242,11 @@ def _layout(lines):
 
 def find_paragraphs(lookup):
     lines = group_lines(read_chars(lookup))
-    rights = sorted(line.right for line in lines)
-    column_right = rights[int(len(rights) * 0.9)] if rights else 0.0      # 大部分文字的右邊界
+    columns = dict(zip(map(id, lines), textrules.column_rights([(l.left, l.right, l.size) for l in lines])))
     paragraphs = []
     current = []
     for line in lines:
-        if current and _same_paragraph(current, line, max(column_right, max(l.right for l in current))):
+        if current and _same_paragraph(current, line, columns[id(current[-1])]):
             current.append(line)
             continue
         if current:

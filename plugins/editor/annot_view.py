@@ -140,6 +140,12 @@ def draw_annot(screen, mapper, annot, cache):
                 surface.set_alpha(round(255 * annot.opacity))
             screen.blit(surface, mapper.box(annot.box).topleft)
         return
+    if kind == "redact":
+        for rect in annot.rects:
+            area = mapper.box(rect).clip(screen.get_clip())
+            if area.width > 0 and area.height > 0:
+                screen.fill(color, area)
+        return
     if kind == "replace":
         if annot.background:
             for rect in pdfwrite.cover_areas(annot):

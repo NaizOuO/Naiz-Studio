@@ -493,12 +493,29 @@ def _replace_text(pdf, page, ref, items, embedder):
         page.contents_add(pikepdf.Stream(pdf, ("Q\n" + "\n".join(commands) + "\n").encode("latin-1")), prepend=False)
 
 
+def _redact(pdf, page, ref, items, embedder):
+    """塗黑個資:範圍裡的字真正刪掉、圖片的那一塊像素塗掉,再畫上色塊(不是註解,別人拿不掉)。"""
+    to_user = geometry.ref_to_user(ref)
+    commands = []
+    for annot in items:
+        areas = [geometry.transform_box(to_user, rect) for rect in annot.rects]
+        _, skipped = redact.redact_page(pdf, page, areas, images=True, fill=annot.color)
+        embedder.kept_text += skipped
+        fill = " ".join(f"{_num(x0)} {_num(y0)} {_num(x1 - x0)} {_num(y1 - y0)} re" for x0, y0, x1, y1 in areas)
+        commands.append(f"q {' '.join(_num(v) for v in _rgb(annot.color))} rg {fill} f Q")
+    page.contents_add(pikepdf.Stream(pdf, b"q\n"), prepend=True)
+    page.contents_add(pikepdf.Stream(pdf, ("Q\n" + "\n".join(commands) + "\n").encode("latin-1")), prepend=False)
+
+
 def write_page(pdf, page, ref, embedder):
     """把頁面上的註解整理好:沒改過的原註解照原樣保留,改過或刪掉的拿掉,新的註解依目前資料產生。
     改字不是註解,直接改寫頁面內容。"""
     replaced = [annot for annot in ref.annots if annot.kind == "replace"]
     if replaced:
         _replace_text(pdf, page, ref, replaced, embedder)
+    blacked = [annot for annot in ref.annots if annot.kind == "redact"]
+    if blacked:
+        _redact(pdf, page, ref, blacked, embedder)
     existing = page.obj.get("/Annots")
     existing = list(existing) if existing is not None else []
     known = {annot.origin for annot in ref.originals}
@@ -524,7 +541,7 @@ def write_page(pdf, page, ref, embedder):
             parent.Popup = popup
             result.append(popup)
     for annot in ref.annots:
-        if annot.kind in ("other", "replace") or (annot.origin >= 0 and annot.origin in kept_origins):
+        if annot.kind in ("other", "replace", "redact") or (annot.origin >= 0 and annot.origin in kept_origins):
             continue
         result.append(build_annot(pdf, page, ref, annot, embedder))
     if result:

@@ -26,7 +26,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Emu, Pt, RGBColor
 
-from core import pdfium
+from core import pdfium, textrules
 from core.files import free_path
 
 EMU_PER_POINT = 12700
@@ -47,6 +47,13 @@ FONT_NAMES = {
     "TimesNewRomanPSMT": "Times New Roman", "TimesNewRomanPS-BoldMT": "Times New Roman",
     "TimesNewRomanPS-ItalicMT": "Times New Roman", "CourierNewPSMT": "Courier New",
     "Helvetica": "Arial", "Helvetica-Bold": "Arial", "SymbolMT": "Symbol",
+    # 中文字型:PDF 記的是 PostScript 名稱,Word 認得的是另一個名字,對不上就會換成別的字型(字變寬、多出頁數)
+    "DFKaiShu-SB-Estd-BF": "DFKai-SB", "DFKai-SB": "DFKai-SB", "BiauKai": "DFKai-SB",
+    "MicrosoftJhengHei": "Microsoft JhengHei", "MicrosoftJhengHeiRegular": "Microsoft JhengHei",
+    "MicrosoftJhengHeiBold": "Microsoft JhengHei", "MicrosoftJhengHeiLight": "Microsoft JhengHei Light",
+    "MicrosoftJhengHeiUI": "Microsoft JhengHei UI", "PMingLiU": "PMingLiU", "MingLiU": "MingLiU",
+    "PMingLiU-ExtB": "PMingLiU-ExtB", "SimSun": "SimSun", "MicrosoftYaHei": "Microsoft YaHei",
+    "NotoSansTC-Regular": "Noto Sans TC", "NotoSerifTC-Regular": "Noto Serif TC",
 }
 _FLAG_SERIF = 1 << 1
 _FLAG_ITALIC = 1 << 6
@@ -128,7 +135,7 @@ class Line:
 @dataclass
 class Block:
     """一個段落或一張圖片。"""
-    kind: str                       # text 或 image
+    kind: str                       # text、image,或 grid(照框線重建的表格)
     top: float
     left: float = 0.0
     right: float = 0.0
@@ -136,6 +143,7 @@ class Block:
     image: bytes = b""
     width: float = 0.0
     height: float = 0.0
+    grid: dict = field(default_factory=dict)     # 照框線重建的表格(kind 是 grid)
 
 
 # ---------------------------------------------------------------- 讀取 PDF
@@ -160,8 +168,13 @@ def _read_chars(text_page, height) -> list:
         raw.FPDFText_GetFillColor(text_page, index, *[ctypes.byref(v) for v in (red, green, blue, alpha)])
         origin_x, origin_y = ctypes.c_double(), ctypes.c_double()
         raw.FPDFText_GetCharOrigin(text_page, index, ctypes.byref(origin_x), ctypes.byref(origin_y))
-        chars.append(Char(chr(code), left.value, height - top.value, right.value, height - bottom.value,
-                          height - origin_y.value, pdfium.char_size(text_page, index), font,
+        size = pdfium.char_size(text_page, index)
+        # 字框左右用字的起點與字級限制:標楷體這類字型的字框比字大很多(14 點的字框寬 60 點),
+        # 直接用會以為文字寫到很右邊,右邊界就設得太窄,文字超出紙張
+        box_left = max(left.value, origin_x.value - size * 0.1)
+        box_right = min(right.value, origin_x.value + size * 1.05) if right.value > origin_x.value else right.value
+        chars.append(Char(chr(code), box_left, height - top.value, max(box_right, box_left), height - bottom.value,
+                          height - origin_y.value, size, font,
                           bool(flags.value & _FLAG_BOLD) or "Bold" in name,
                           bool(flags.value & _FLAG_ITALIC) or "Italic" in name or "Oblique" in name,
                           (red.value, green.value, blue.value), generated))
@@ -175,8 +188,9 @@ def _drop_extra_spaces(chars) -> list:
         if char.generated:
             before = chars[index - 1] if index else None
             after = chars[index + 1] if index + 1 < len(chars) else None
-            if (before and is_cjk(before.text)) or (after and is_cjk(after.text)):
-                continue
+            wide = before and after and after.left - before.right >= max(before.size, after.size) * 0.6
+            if not wide and ((before and is_cjk(before.text)) or (after and is_cjk(after.text))):
+                continue            # 中文字之間 PDFium 自己補的空白不需要;空很大一段(編號後面)才留著
             # 字和字之間只是排版上的微小間隙時也不算空白,不然 PTR 會變成 P TR
             if before and after and after.left - before.right < max(before.size, after.size, 1.0) * 0.22:
                 continue
@@ -214,11 +228,17 @@ def _group_lines(chars, split_gap=2.5) -> list:
 
 
 def _group_paragraphs(lines) -> list:
-    """把行合併成段落:行距沒有明顯變大、左邊對齊差不多、字級接近、左右有重疊,就算同一段。"""
+    """把行合併成段落:行距沒有明顯變大、左邊對齊差不多、字級接近、左右有重疊,就算同一段。
+    編號開頭的行另起一段;上一行沒寫滿(以句號結尾,或明顯比下一行短)就是段尾。"""
     blocks = []
+    columns = dict(zip(map(id, lines), textrules.column_rights([(l.left, l.right, l.size) for l in lines])))
     for line in lines:
         if blocks and blocks[-1].kind == "text":
             previous = blocks[-1].lines[-1]
+            if textrules.starts_list(line.text.strip()) or textrules.ends_paragraph(
+                    previous.text, previous.right, line.right, columns[id(previous)], previous.size):
+                blocks.append(Block("text", line.top, line.left, line.right, [line]))
+                continue
             gap = line.top - previous.bottom
             height = max(previous.size, line.size)
             same_size = abs(previous.size - line.size) <= max(1.0, height * 0.25)
@@ -264,8 +284,25 @@ def _read_images(document, page, page_height) -> list:
     return results
 
 
+def _path_shape(obj):
+    """線條物件的形狀:straight 表示全是水平、垂直的直線(框線、方框),否則有斜線或曲線(圖表、示意圖)。"""
+    straight, previous = True, None
+    for index in range(raw.FPDFPath_CountSegments(obj)):
+        segment = raw.FPDFPath_GetPathSegment(obj, index)
+        if raw.FPDFPathSegment_GetType(segment) == raw.FPDF_SEGMENT_BEZIERTO:
+            return False
+        x, y = ctypes.c_float(), ctypes.c_float()
+        raw.FPDFPathSegment_GetPoint(segment, ctypes.byref(x), ctypes.byref(y))
+        point = (x.value, y.value)
+        if previous is not None and raw.FPDFPathSegment_GetType(segment) == raw.FPDF_SEGMENT_LINETO \
+                and abs(point[0] - previous[0]) > 0.05 and abs(point[1] - previous[1]) > 0.05:
+            straight = False
+        previous = point
+    return straight
+
+
 def _vector_boxes(page, page_width, page_height) -> list:
-    """線條類物件的範圍(PDF 座標:左、下、右、上);背景色塊與整頁大的方框不算。"""
+    """線條類物件:[(左, 下, 右, 上, 是否全是水平垂直的直線)](PDF 座標);整頁大的底色或外框不算。"""
     boxes = []
     page_area = page_width * page_height
     for index in range(raw.FPDFPage_CountObjects(page.raw)):
@@ -277,39 +314,135 @@ def _vector_boxes(page, page_width, page_height) -> list:
         box = (left.value, bottom.value, right.value, top.value)
         if (box[2] - box[0]) * (box[3] - box[1]) > page_area * 0.8:
             continue                # 整頁的底色或外框,不是圖表
-        boxes.append(box)
+        boxes.append(box + (_path_shape(obj),))
     return boxes
 
 
 def _cluster_boxes(boxes, gap) -> list:
-    """把靠在一起的線條併成一塊;回傳 [(範圍, 幾個線條物件)]。"""
-    clusters = []                   # [[left, bottom, right, top, count]]
+    """把靠在一起的線條併成一塊;回傳 [(範圍, 裡面的線條)]。"""
+    clusters = []                   # [[left, bottom, right, top, members]]
+
+    def touches(a, b):
+        return b[0] <= a[2] + gap and b[2] >= a[0] - gap and b[1] <= a[3] + gap and b[3] >= a[1] - gap
+
     for box in sorted(boxes, key=lambda b: (-b[3], b[0])):
         for cluster in clusters:
-            if (box[0] <= cluster[2] + gap and box[2] >= cluster[0] - gap
-                    and box[1] <= cluster[3] + gap and box[3] >= cluster[1] - gap):
-                cluster[0] = min(cluster[0], box[0])
-                cluster[1] = min(cluster[1], box[1])
-                cluster[2] = max(cluster[2], box[2])
-                cluster[3] = max(cluster[3], box[3])
-                cluster[4] += 1
+            if touches(cluster, box):
+                cluster[0], cluster[1] = min(cluster[0], box[0]), min(cluster[1], box[1])
+                cluster[2], cluster[3] = max(cluster[2], box[2]), max(cluster[3], box[3])
+                cluster[4].append(box)
                 break
         else:
-            clusters.append([*box, 1])
+            clusters.append([box[0], box[1], box[2], box[3], [box]])
     merged = True
     while merged:                   # 前面併過之後範圍變大,可能又和別塊接上了
         merged = False
         for i in range(len(clusters)):
             for j in range(len(clusters) - 1, i, -1):
                 a, b = clusters[i], clusters[j]
-                if (b[0] <= a[2] + gap and b[2] >= a[0] - gap
-                        and b[1] <= a[3] + gap and b[3] >= a[1] - gap):
+                if touches(a, b):
                     a[0], a[1] = min(a[0], b[0]), min(a[1], b[1])
                     a[2], a[3] = max(a[2], b[2]), max(a[3], b[3])
                     a[4] += b[4]
                     clusters.pop(j)
                     merged = True
     return [((c[0], c[1], c[2], c[3]), c[4]) for c in clusters]
+
+
+def _is_table(area, members, inside):
+    """這群線條是表格的框線(要重建成 Word 表格),不是圖表。
+
+    表格的框線全是水平、垂直的細線(Word 常用細長的填色方塊畫),至少有兩條橫的、兩條直的,格子裡有字;
+    圖表幾乎一定有曲線、斜線或資料點。長條圖雖然也都是直線,但長條是粗的色塊,也不會有好幾條直的框線。
+    """
+    if not inside or any(not straight for *_, straight in members):
+        return False
+    left, bottom, right, top = area
+    rows, columns = set(), {}
+    for x0, y0, x1, y1, _ in members:
+        width, height = x1 - x0, y1 - y0
+        if height <= 2.5 and width >= 8:
+            rows.add(round((y0 + y1) / 2))
+        elif width <= 2.5 and height >= 8:
+            key = round((x0 + x1) / 2)
+            columns[key] = columns.get(key, 0.0) + height
+        elif width > 2.5 and height > 2.5 and width * height > (right - left) * (top - bottom) * 0.02:
+            return False            # 大的色塊(長條圖的長條)
+    tall = [x for x, length in columns.items() if length >= (top - bottom) * 0.5]
+    return len(rows) >= 2 and len(tall) >= 2
+
+
+def _merge_positions(values, tolerance=1.5):
+    result = []
+    for value in sorted(values):
+        if result and value - result[-1][-1] <= tolerance:
+            result[-1].append(value)
+        else:
+            result.append([value])
+    return [sum(group) / len(group) for group in result]
+
+
+def _lattice(area, members, inside, page_height):
+    """照框線把表格切成格子,每個字放進它所在的格子;框線斷開的地方是合併儲存格。
+    座標換成左上為原點。回傳 grid 區塊;切不出至少 1×1 的格子時回傳 None。"""
+    left, bottom, right, top = area
+    rows, columns = [], []          # 橫線 (y, x0, x1)、直線 (x, y0, y1),都是左上為原點
+    for x0, y0, x1, y1, _ in members:
+        if y1 - y0 <= 2.5 and x1 - x0 >= 8:
+            rows.append((page_height - (y0 + y1) / 2, x0, x1))
+        elif x1 - x0 <= 2.5 and y1 - y0 >= 8:
+            columns.append(((x0 + x1) / 2, page_height - y1, page_height - y0))
+    xs = _merge_positions([x for x, _, _ in columns])
+    ys = _merge_positions([y for y, _, _ in rows])
+    if len(xs) < 2 or len(ys) < 2:
+        return None
+    count_rows, count_cols = len(ys) - 1, len(xs) - 1
+
+    def has_vertical(x, y):
+        return any(abs(cx - x) < 1.5 and y0 - 1 <= y <= y1 + 1 for cx, y0, y1 in columns)
+
+    def has_horizontal(y, x):
+        return any(abs(cy - y) < 1.5 and x0 - 1 <= x <= x1 + 1 for cy, x0, x1 in rows)
+
+    # 合併儲存格:相鄰兩格中間沒有框線就是同一格
+    owner = {(r, c): (r, c) for r in range(count_rows) for c in range(count_cols)}
+
+    def find(cell):
+        while owner[cell] != cell:
+            owner[cell] = owner[owner[cell]]
+            cell = owner[cell]
+        return cell
+
+    for r in range(count_rows):
+        middle_y = (ys[r] + ys[r + 1]) / 2
+        for c in range(1, count_cols):
+            if not has_vertical(xs[c], middle_y):
+                owner[find((r, c))] = find((r, c - 1))
+    for c in range(count_cols):
+        middle_x = (xs[c] + xs[c + 1]) / 2
+        for r in range(1, count_rows):
+            if not has_horizontal(ys[r], middle_x):
+                owner[find((r, c))] = find((r - 1, c))
+    groups = {}
+    for cell in owner:
+        groups.setdefault(find(cell), []).append(cell)
+    cells = []
+    for members_of in groups.values():
+        r0, r1 = min(r for r, _ in members_of), max(r for r, _ in members_of)
+        c0, c1 = min(c for _, c in members_of), max(c for _, c in members_of)
+        if len(members_of) != (r1 - r0 + 1) * (c1 - c0 + 1):
+            return None             # 合併出來不是長方形,這種框線看不懂,交給其他方式處理
+        cells.append({"row": r0, "col": c0, "rows": r1 - r0 + 1, "cols": c1 - c0 + 1, "chars": [],
+                      "box": (xs[c0], ys[r0], xs[c1 + 1], ys[r1 + 1])})
+    for char in inside:
+        cx, cy = (char.left + char.right) / 2, (char.top + char.bottom) / 2
+        for cell in cells:
+            x0, y0, x1, y1 = cell["box"]
+            if x0 <= cx <= x1 and y0 <= cy <= y1:
+                cell["chars"].append(char)
+                break
+    grid = {"xs": xs, "ys": ys, "cells": cells}
+    return Block("grid", ys[0], xs[0], xs[-1], width=xs[-1] - xs[0], height=ys[-1] - ys[0], grid=grid)
 
 
 def _vector_pictures(page, chars, page_width, page_height) -> tuple:
@@ -320,9 +453,9 @@ def _vector_pictures(page, chars, page_width, page_height) -> tuple:
     回傳 (圖片區塊, 留下來的字)。
     """
     clusters = _cluster_boxes(_vector_boxes(page, page_width, page_height), VECTOR_GAP)
-    picked = []
-    for (left, bottom, right, top), count in clusters:
-        if count < VECTOR_MIN_PATHS or right - left < VECTOR_MIN_SIZE or top - bottom < VECTOR_MIN_SIZE:
+    picked, tables = [], []
+    for (left, bottom, right, top), members in clusters:
+        if len(members) < VECTOR_MIN_PATHS or right - left < VECTOR_MIN_SIZE or top - bottom < VECTOR_MIN_SIZE:
             continue
         if (right - left) * (top - bottom) > page_width * page_height * 0.85:
             continue                # 幾乎整頁大,多半是外框或底紋,不是圖表
@@ -331,11 +464,18 @@ def _vector_pictures(page, chars, page_width, page_height) -> tuple:
                   and bottom - 2 <= page_height - (c.top + c.bottom) / 2 <= top + 2]
         if len(inside) > len(chars) * 0.8:
             continue                # 整頁的字都在裡面,那是版面框線而不是圖表
+        if _is_table((left, bottom, right, top), members, inside):
+            grid = _lattice((left, bottom, right, top), members, inside, page_height)
+            if grid is not None:        # 照框線重建成可以編輯的 Word 表格
+                tables.append((grid, set(id(c) for c in inside)))
+            continue
         picked.append(((left, bottom, right, top), set(id(c) for c in inside)))
-    if not picked:
+    if not picked and not tables:
         return [], chars
 
-    blocks, removed = [], set()
+    blocks, removed = [grid for grid, _ in tables], set()
+    for _, inside in tables:
+        removed |= inside
     for (left, bottom, right, top), inside in picked:
         crop = (max(0.0, left - 2), max(0.0, bottom - 2),
                 max(0.0, page_width - right - 2), max(0.0, page_height - top - 2))
@@ -370,7 +510,7 @@ def _read_rulings(page, page_height) -> list:
 
 def _block_span(block):
     """一個區塊在頁面上的上下範圍。"""
-    if block.kind == "image":
+    if block.kind in ("image", "grid"):
         return block.top, block.top + block.height
     return block.lines[0].top, block.lines[-1].bottom
 
@@ -540,8 +680,50 @@ def _clear_cell_padding(table):
     table._tbl.tblPr.append(margins)
 
 
+def _write_grid(container, block, layout, state):
+    """照框線重建的表格:欄寬、列高、合併儲存格都照原檔,每格的文字依原本的樣式寫進去。"""
+    from docx.enum.table import WD_ROW_HEIGHT_RULE
+
+    grid = block.grid
+    xs, ys = grid["xs"], grid["ys"]
+    if state["baseline"] is not None:
+        # 表格沒辦法設定「與上一段的距離」,用一個固定高度的空段落墊出原本的間隔
+        gap = block.top - state["baseline"] - 4
+        if gap > 1:
+            spacer = container.add_paragraph().paragraph_format
+            spacer.space_before = spacer.space_after = Pt(0)
+            spacer.line_spacing = Pt(round(min(gap, 60.0), 1))
+    table = container.add_table(rows=len(ys) - 1, cols=len(xs) - 1)
+    table.style = "Table Grid"
+    table.autofit = False
+    for index in range(len(xs) - 1):
+        for cell in table.columns[index].cells:
+            cell.width = Emu(round((xs[index + 1] - xs[index]) * EMU_PER_POINT))
+    for index, row in enumerate(table.rows):
+        row.height = Emu(round((ys[index + 1] - ys[index]) * EMU_PER_POINT))
+        row.height_rule = WD_ROW_HEIGHT_RULE.AT_LEAST
+    for item in grid["cells"]:
+        cell = table.cell(item["row"], item["col"])
+        if item["rows"] > 1 or item["cols"] > 1:
+            cell = cell.merge(table.cell(item["row"] + item["rows"] - 1, item["col"] + item["cols"] - 1))
+        x0, _, x1, _ = item["box"]
+        paragraphs = _group_paragraphs(_group_lines(item["chars"])) if item["chars"] else []
+        inner = dict(layout, left=x0 + 5.4, right=x1 - 5.4, slack=0.0)   # Word 儲存格左右各留約 5.4 點
+        for paragraph in paragraphs:
+            _write_block(cell, paragraph, inner, {"baseline": None})
+        if len(cell.paragraphs) > 1 and not cell.paragraphs[0].runs:
+            element = cell.paragraphs[0]._element
+            element.getparent().remove(element)
+        for paragraph in cell.paragraphs:
+            paragraph.paragraph_format.space_before = Pt(0)
+    state["baseline"] = block.top + block.height
+
+
 def _write_block(container, block, layout, state):
     """把一個段落或圖片寫進文件,或寫進表格的儲存格。"""
+    if block.kind == "grid":
+        _write_grid(container, block, layout, state)
+        return
     if block.kind == "image":
         paragraph = container.add_paragraph()
         paragraph.alignment = _alignment(block, layout["left"], layout["right"])
@@ -560,6 +742,14 @@ def _write_block(container, block, layout, state):
     spacing = paragraph.paragraph_format
     spacing.space_after = Pt(0)
     spacing.line_spacing = Pt(round(pitch, 1))                  # 行距照原檔
+    # 縮排照原檔:整段往右縮、第一行縮排,或第一行凸出(項目編號後面的字對齊)
+    rest = min(line.left for line in block.lines[1:]) if len(block.lines) > 1 else block.lines[0].left
+    indent = rest - layout["left"]
+    if indent > 1.5:
+        spacing.left_indent = Pt(round(indent, 1))
+    first = block.lines[0].left - rest
+    if len(block.lines) > 1 and abs(first) > 1.5 and paragraph.alignment is None:
+        spacing.first_line_indent = Pt(round(first, 1))
     if layout["slack"]:
         # 換用的字型通常比原檔稍寬,留一點右側餘裕,才不會為了差幾個字就多折一行
         spacing.right_indent = Pt(-layout["slack"])
@@ -651,8 +841,13 @@ def _write_flow(word, width, section, blocks, rulings):
     previous_was_table = False
     for group in _group_tables(_group_rows(blocks)):
         if len(group) == 1 and len(group[0]["blocks"]) == 1:
-            _write_block(word, group[0]["blocks"][0], layout, state)
-            previous_was_table = False
+            block = group[0]["blocks"][0]
+            if block.kind == "grid" and previous_was_table:
+                spacer = word.add_paragraph().paragraph_format
+                spacer.space_before = spacer.space_after = Pt(0)
+                spacer.line_spacing = Pt(1)
+            _write_block(word, block, layout, state)
+            previous_was_table = block.kind == "grid"
         else:
             if previous_was_table:
                 # 兩個表格直接相鄰時 Word 會把它們併成一個,中間放一個極小的空段落隔開
@@ -694,6 +889,16 @@ def _write_exact(word, width, section, blocks):
             spacing.space_before = spacing.space_after = Pt(0)
             _frame(paragraph, block.left, block.top, block.width)
             paragraph.add_run().add_picture(io.BytesIO(block.image), width=Emu(round(block.width * EMU_PER_POINT)))
+            continue
+        if block.kind == "grid":
+            # 表格固定在頁面上原本的位置(Word 的「浮動表格」),不會被前後的內容推走
+            _write_grid(word, block, {"left": block.left, "right": block.right, "pitch": page_pitch, "slack": 0.0},
+                        {"baseline": None})
+            position = OxmlElement("w:tblpPr")
+            for key, value in (("w:horzAnchor", "page"), ("w:vertAnchor", "page"),
+                               ("w:tblpX", _twips(block.left)), ("w:tblpY", _twips(block.top))):
+                position.set(qn(key), value)
+            word.tables[-1]._tbl.tblPr.insert(0, position)
             continue
         pitch = _line_pitch(block, page_pitch)
         for line in block.lines:
@@ -784,7 +989,9 @@ def _ocr_chars(words, scale) -> list:
         for word in sorted(line_words, key=lambda w: w.left):
             baseline = bottom * scale
             # 只在一般字距時補空白;空得很開的是表格的不同格,補了空白就分不開了
-            if previous is not None and (word.left - previous.right) * scale < size * OCR_SPLIT_GAP:
+            # 中文詞之間不補空白(辨識時會把中文拆成好幾個詞);英文單字之間才補
+            cjk_pair = previous is not None and is_cjk(previous.text[-1]) and is_cjk(word.text[0])
+            if previous is not None and not cjk_pair and (word.left - previous.right) * scale < size * OCR_SPLIT_GAP:
                 chars.append(Char(" ", previous.right * scale, word.top * scale, word.left * scale,
                                   word.bottom * scale, baseline, size, font, False, False, (0, 0, 0), True))
             step = (word.right - word.left) / len(word.text)
