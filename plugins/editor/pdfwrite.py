@@ -4,13 +4,18 @@
 文字框的字型只嵌入用到的字(子集),可變字型固定成一般字重。
 """
 
+import hashlib
+import io
 import math
 import time
 import uuid
+import zlib
+
+from dataclasses import replace
 
 import pikepdf
 
-from . import annots, fonts, geometry
+from . import annots, fonts, geometry, redact
 
 KAPPA = 0.5523
 ARROW_ANGLE = math.radians(28)
@@ -36,6 +41,8 @@ class FontEmbedder:
     def __init__(self, pdf):
         self.pdf = pdf
         self.entries = {}
+        self.images = {}            # 同一張圖(例如同一個簽名蓋在很多頁)只存一份
+        self.kept_text = 0          # 改字時字型沒把握、只被蓋住沒刪掉的文字段數
 
     def _entry(self, face):
         entry = self.entries.get(face.id)
@@ -163,6 +170,56 @@ def _to_unicode(gids):
     return "\n".join(lines).encode("ascii")
 
 
+# ------------------------------------------------------------ 圖片
+
+def image_xobject(pdf, data, cache):
+    """把 PNG 內容變成 PDF 的圖片物件;有透明的部分另外存成遮罩。沒有透明的照片用 JPEG,檔案小很多。"""
+    key = hashlib.sha1(data).hexdigest()
+    if key in cache:
+        return cache[key]
+    from PIL import Image
+
+    image = Image.open(io.BytesIO(data))
+    image.load()
+    alpha = None
+    if image.mode in ("RGBA", "LA", "PA") or (image.mode == "P" and "transparency" in image.info):
+        rgba = image.convert("RGBA")
+        alpha = rgba.getchannel("A")
+        if alpha.getextrema()[0] >= 255:
+            alpha = None
+        image = rgba.convert("RGB")
+    else:
+        image = image.convert("RGB")
+    width, height = image.size
+    if alpha is None and _photo_like(image):
+        buffer = io.BytesIO()
+        image.save(buffer, "JPEG", quality=90)
+        stream = pikepdf.Stream(pdf, buffer.getvalue())
+        stream.Filter = pikepdf.Name.DCTDecode
+    else:
+        stream = pikepdf.Stream(pdf, zlib.compress(image.tobytes(), 9))
+        stream.Filter = pikepdf.Name.FlateDecode
+    stream.Type, stream.Subtype = pikepdf.Name.XObject, pikepdf.Name.Image
+    stream.Width, stream.Height = width, height
+    stream.ColorSpace, stream.BitsPerComponent = pikepdf.Name.DeviceRGB, 8
+    if alpha is not None:
+        mask = pikepdf.Stream(pdf, zlib.compress(alpha.tobytes(), 9))
+        mask.Filter = pikepdf.Name.FlateDecode
+        mask.Type, mask.Subtype = pikepdf.Name.XObject, pikepdf.Name.Image
+        mask.Width, mask.Height = width, height
+        mask.ColorSpace, mask.BitsPerComponent = pikepdf.Name.DeviceGray, 8
+        stream.SMask = pdf.make_indirect(mask)
+    cache[key] = pdf.make_indirect(stream)
+    return cache[key]
+
+
+def _photo_like(image):
+    """顏色很多的是照片(適合 JPEG);顏色少的截圖、圖示用無損壓縮才不會糊。"""
+    small = image.copy()
+    small.thumbnail((200, 200))
+    return len(small.getcolors(200 * 200) or ()) > 4000
+
+
 # ------------------------------------------------------------ 註解外觀
 
 class _Canvas:
@@ -208,6 +265,23 @@ def textbox_height(annot, result):
     return result.height + annots.TEXT_PAD * 2 + annot.width * 2
 
 
+def cover_areas(annot):
+    """改字要塗上底色的範圍:原字的範圍,加上新文字實際佔的範圍(新字比較長時,底下原本的東西也要蓋住)。
+    只塗到新字的寬度為止,不塗整個文字框,旁邊的字才不會被多蓋掉一塊。"""
+    areas = list(annot.rects)
+    if not annot.text.strip():
+        return areas
+    _, result = text_layout(replace(annot, width=0.0))
+    if result is None:
+        return areas
+    left, top = annot.box[0] + annots.TEXT_PAD, annot.box[1] + annots.TEXT_PAD
+    for row, line in enumerate(result.lines):
+        if line.width > 0:
+            areas.append((left, top + row * result.line_height, left + line.width,
+                          top + (row + 1) * result.line_height))
+    return areas
+
+
 def _appearance(pdf, annot, embedder):
     """回傳 (外觀內容, 資源, 外觀在頁面上的範圍, 額外的註解欄位)。"""
     x0, y0, x1, y1 = annots.bounds(annot)
@@ -237,7 +311,12 @@ def _appearance(pdf, annot, embedder):
                 thickness = max(0.6, height * 0.075)
                 y = ly0 + thickness / 2 if kind == "underline" else ly0 + height * 0.45
                 canvas.add(red, green, blue, "RG", thickness, "w", lx0, y, "m", lx1, y, "l S")
-    elif kind == "textbox":
+    elif kind in annots.IMAGES:
+        bx0, by1 = local((annot.box[0], annot.box[1]))
+        bx1, by0 = local((annot.box[2], annot.box[3]))
+        resources.XObject = pikepdf.Dictionary(Im0=image_xobject(pdf, annot.image, embedder.images))
+        canvas.add("q", bx1 - bx0, 0, 0, by1 - by0, bx0, by0, "cm /Im0 Do Q")
+    elif kind in annots.TEXTS:
         face, result = text_layout(annot)
         if annot.background:
             bx0, by1 = local((annot.box[0], annot.box[1]))
@@ -312,7 +391,8 @@ def _appearance(pdf, annot, embedder):
 
 
 _PDF_SUBTYPES = {"highlight": "Highlight", "underline": "Underline", "strike": "StrikeOut", "textbox": "FreeText",
-                 "note": "Text", "line": "Line", "arrow": "Line", "rect": "Square", "ellipse": "Circle", "ink": "Ink"}
+                 "note": "Text", "line": "Line", "arrow": "Line", "rect": "Square", "ellipse": "Circle", "ink": "Ink",
+                 "image": "Stamp", "signature": "Stamp"}
 
 
 def build_annot(pdf, page, ref, annot, embedder):
@@ -356,6 +436,11 @@ def build_annot(pdf, page, ref, annot, embedder):
                   pikepdf.Name("/OpenArrow") if kind == "arrow" else pikepdf.Name("/None")]
     elif kind == "ink":
         obj.InkList = [[round(v, 3) for p in stroke for v in user(p)] for stroke in annot.points]
+    elif kind in annots.IMAGES:
+        obj.NaizKind = pikepdf.String(kind)     # 讀回來時才知道是自己放的圖片或簽名,可以繼續移動、改大小
+        obj.Name = pikepdf.Name("/NaizImage")
+        if "/C" in obj:
+            del obj["/C"]
     if kind in ("line", "arrow", "rect", "ellipse", "ink", "textbox"):
         obj.BS = pikepdf.Dictionary(Type=pikepdf.Name.Border, W=round(annot.width, 3), S=pikepdf.Name.S)
     if kind in ("rect", "ellipse") and annot.background:
@@ -372,8 +457,43 @@ def build_annot(pdf, page, ref, annot, embedder):
     return pdf.make_indirect(obj)
 
 
+def _replace_text(pdf, page, ref, items, embedder):
+    """改字:先真正刪掉被蓋住的原字,再把底色和新的文字直接畫進頁面(不是註解,別的閱讀器看起來就是原本的字)。"""
+    to_user = geometry.ref_to_user(ref)
+    areas = [geometry.transform_box(to_user, rect) for annot in items for rect in annot.rects]
+    _, skipped = redact.redact_page(pdf, page, areas)
+    embedder.kept_text += skipped
+    commands = []
+    for annot in items:
+        cover = [geometry.transform_box(to_user, rect) for rect in cover_areas(annot)]
+        if annot.background:
+            fill = " ".join(f"{_num(x0)} {_num(y0)} {_num(x1 - x0)} {_num(y1 - y0)} re"
+                            for x0, y0, x1, y1 in cover)
+            commands.append(f"q {' '.join(_num(v) for v in _rgb(annot.background))} rg {fill} f Q")
+        if not annot.text.strip():
+            continue
+        text = annots.Annot("textbox", color=annot.color, width=0.0, box=annot.box, text=annot.text,
+                            font=annot.font, font_size=annot.font_size, opacity=annot.opacity)
+        content, resources, box, _ = _appearance(pdf, text, embedder)
+        form = pikepdf.Stream(pdf, content)
+        form.Type, form.Subtype = pikepdf.Name.XObject, pikepdf.Name.Form
+        form.BBox = [0, 0, round(box[2] - box[0], 3), round(box[3] - box[1], 3)]
+        form.Resources = resources
+        matrix = geometry.compose(geometry.local_to_page(box), to_user)
+        name = page.add_resource(pdf.make_indirect(form), pikepdf.Name.XObject, prefix="NaizT")
+        commands.append(f"q {' '.join(_num(v) for v in matrix)} cm {name} Do Q")
+    if commands:
+        # 原本的內容包在 q ... Q 裡,後面畫的東西才不會受它留下的座標變換影響
+        page.contents_add(pikepdf.Stream(pdf, b"q\n"), prepend=True)
+        page.contents_add(pikepdf.Stream(pdf, ("Q\n" + "\n".join(commands) + "\n").encode("latin-1")), prepend=False)
+
+
 def write_page(pdf, page, ref, embedder):
-    """把頁面上的註解整理好:沒改過的原註解照原樣保留,改過或刪掉的拿掉,新的註解依目前資料產生。"""
+    """把頁面上的註解整理好:沒改過的原註解照原樣保留,改過或刪掉的拿掉,新的註解依目前資料產生。
+    改字不是註解,直接改寫頁面內容。"""
+    replaced = [annot for annot in ref.annots if annot.kind == "replace"]
+    if replaced:
+        _replace_text(pdf, page, ref, replaced, embedder)
     existing = page.obj.get("/Annots")
     existing = list(existing) if existing is not None else []
     known = {annot.origin for annot in ref.originals}
@@ -399,7 +519,7 @@ def write_page(pdf, page, ref, embedder):
             parent.Popup = popup
             result.append(popup)
     for annot in ref.annots:
-        if annot.kind == "other" or (annot.origin >= 0 and annot.origin in kept_origins):
+        if annot.kind in ("other", "replace") or (annot.origin >= 0 and annot.origin in kept_origins):
             continue
         result.append(build_annot(pdf, page, ref, annot, embedder))
     if result:

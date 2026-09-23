@@ -394,17 +394,23 @@ class EditorPage(Page):
             return
         pages = list(self.pages)
         flatten, sources = self.flatten, dict(self.data)
+        report = {}
 
         def done(path):
             self.history.mark_saved()
             if self.open_file(path, keep_view=True):
-                merged = "，註解已合併到頁面" if flatten else ""
-                self.notify(f"已儲存成「{path.name}」{merged}，接下來編輯這份新檔", theme.ACCENT)
+                if report.get("kept_text"):
+                    self.notify(f"已儲存成「{path.name}」；有 {report['kept_text']} 段原字的字型比較特殊，"
+                                f"只被底色蓋住、沒有真正刪掉", theme.WARN)
+                else:
+                    merged = "，註解已合併到頁面" if flatten else ""
+                    self.notify(f"已儲存成「{path.name}」{merged}，接下來編輯這份新檔", theme.ACCENT)
             if then is not None:
                 then()
 
         self._run("儲存中...",
-                  lambda: ops.build(pages, out, self.passwords, flatten=flatten, sources=sources), done)
+                  lambda: ops.build(pages, out, self.passwords, flatten=flatten, sources=sources, report=report),
+                  done)
 
     def save_as(self):
         if self.path is None or self.busy:
@@ -787,17 +793,21 @@ class EditorPage(Page):
     # ------------------------------------------------------------ 事件
 
     def modal_open(self):
-        return self.dialog.is_open or self.annot.picker.is_open
+        return self.dialog.is_open or self.annot.picker.is_open or self.annot.signatures.is_open
 
     def draw_modal(self, mouse_pos):
         if self.annot.picker.is_open:
             self.annot.picker.draw(mouse_pos)
+        elif self.annot.signatures.is_open:
+            self.annot.signatures.draw(mouse_pos)
         else:
             self.dialog.draw(mouse_pos)
 
     def handle_modal_event(self, event, mouse_pos):
         if self.annot.picker.is_open:
             self.annot.picker.handle_event(event, mouse_pos)
+        elif self.annot.signatures.is_open:
+            self.annot.signatures.handle_event(event, mouse_pos)
         else:
             self.dialog.handle_event(event, mouse_pos)
 

@@ -111,9 +111,10 @@ def _image_pdf(path):
     return pikepdf.open(io.BytesIO(buffer.getvalue()))
 
 
-def build(pages, out_path, passwords=None, progress=None, cancel=None, flatten=False, sources=None):
+def build(pages, out_path, passwords=None, progress=None, cancel=None, flatten=False, sources=None, report=None):
     """依頁面清單產生新的 PDF;先寫暫存檔,完成才換成正式檔名。存檔後不會保留原檔的密碼。
-    flatten 為 True 時把註解合併到頁面內容;sources 是已經讀進記憶體的來源檔(路徑 → 內容)。"""
+    flatten 為 True 時把註解合併到頁面內容;sources 是已經讀進記憶體的來源檔(路徑 → 內容)。
+    report 是 dict 的話會填入 kept_text:改字時沒辦法真正刪掉、只被蓋住的文字段數。"""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     passwords = passwords or {}
@@ -146,6 +147,8 @@ def build(pages, out_path, passwords=None, progress=None, cancel=None, flatten=F
                 if progress:
                     progress(number, len(pages))
             embedder.finish()
+            if report is not None:
+                report["kept_text"] = embedder.kept_text
             if flatten:
                 for page in dst.pages:
                     pdfwrite.flatten_page(dst, page)

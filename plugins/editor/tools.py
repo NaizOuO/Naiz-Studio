@@ -5,20 +5,23 @@
 
 import math
 from dataclasses import replace
+from pathlib import Path
 
 import pygame
 
-from core import pdfium, theme, widgets
+from core import pdfium, theme, widgets, winfile
 from core.widgets import Dropdown, draw_text, rounded_panel
 
-from . import annot_view, annots, fonts, geometry, model, pdfwrite
+from . import annot_view, annots, fonts, geometry, model, pdfwrite, signature
 from .font_picker import FontPicker
+from .signature import IMAGE_FILTER, SignaturePanel
 from .palette import ColorPalette
 from .textarea import TextEditor, simple_layout
 
 BAR_H = 86
 TOOLS = [("select", "選取"), ("highlight", "螢光筆"), ("underline", "底線"), ("strike", "刪除線"), ("textbox", "文字框"),
-         ("note", "便利貼"), ("line", "直線"), ("arrow", "箭頭"), ("rect", "方框"), ("ellipse", "圓形"), ("ink", "手繪")]
+         ("replace", "改字"), ("note", "便利貼"), ("line", "直線"), ("arrow", "箭頭"), ("rect", "方框"),
+         ("ellipse", "圓形"), ("ink", "手繪"), ("image", "圖片"), ("signature", "簽名")]
 WIDTH_OPTIONS = [(f"{v:g}", f"{v:g} pt") for v in (1, 2, 3, 5, 8)]
 SHAPE_WIDTH_OPTIONS = [("0", "無線條")] + WIDTH_OPTIONS
 BORDER_OPTIONS = [("0", "無外框")] + [(f"{v:g}", f"外框 {v:g} pt") for v in (1, 2, 3)]
@@ -30,6 +33,15 @@ DEFAULTS = {
     "line": dict(width=2.0, opacity=1.0), "arrow": dict(width=2.0, opacity=1.0),
     "rect": dict(width=2.0, opacity=1.0, background=()), "ellipse": dict(width=2.0, opacity=1.0, background=()),
     "ink": dict(width=2.0, opacity=1.0),
+    "replace": dict(font="", font_size=12.0, opacity=1.0, background=(255, 255, 255)),
+    "image": dict(opacity=1.0), "signature": dict(opacity=1.0),
+}
+IMAGE_DPI = 150             # 放進來的圖片預設以這個解析度換算大小
+SIGNATURE_W = 150.0         # 簽名預設寬度(點)
+TOOL_HINTS = {
+    "replace": "在要修改的文字上拖曳選取，放開後直接輸入新的文字；清空文字就是刪除。儲存時原字會真正刪掉",
+    "image": "在頁面上點一下放置圖片，或拖曳出想要的大小",
+    "signature": "在頁面上點一下放置簽名，或拖曳出想要的大小",
 }
 DOUBLE_CLICK_MS = 400
 TEXTBOX_W = 200.0
@@ -47,6 +59,8 @@ COLOR_SLOTS = {
     "textbox": [("color", "文字", False), ("background", "背景", True)],
     "rect": [("color", "線條", False), ("background", "填滿", True)],
     "ellipse": [("color", "線條", False), ("background", "填滿", True)],
+    "replace": [("color", "文字", False), ("background", "底色", False)],
+    "image": [], "signature": [],
 }
 
 
@@ -73,6 +87,8 @@ class AnnotController:
         self._last_press = (-10000, None)
         self._ime_rect = None
         self._note_popup = None
+        self.pending = None         # 選好、還沒放到頁面上的圖片或簽名:dict(kind, image, pixels)
+        self.signatures = SignaturePanel(page, self.accent)
 
     # ------------------------------------------------------------ 資料
 
@@ -112,12 +128,18 @@ class AnnotController:
         return self.find(self.selected)
 
     def fit(self, annot):
-        """文字框的高度跟著內容走。"""
-        if annot.kind != "textbox":
+        """文字框、改字的高度跟著內容走;改字打得比框長時把框加寬,不自動換行(換行會疊到下一行的字)。"""
+        if annot.kind not in annots.TEXTS:
             return annot
-        _, result = pdfwrite.text_layout(annot)
+        face, result = pdfwrite.text_layout(annot)
         if result is None:
             return annot
+        if annot.kind == "replace":
+            natural = fonts.layout(annot.text, face, annot.font_size, None, fonts.CATALOG.fallback()).width
+            need = natural + annots.TEXT_PAD * 2 + 1
+            if annot.box[2] - annot.box[0] < need:
+                annot = replace(annot, box=(annot.box[0], annot.box[1], annot.box[0] + need, annot.box[3]))
+                face, result = pdfwrite.text_layout(annot)
         x0, y0, x1, _ = annot.box
         return replace(annot, box=(x0, y0, x1, y0 + pdfwrite.textbox_height(annot, result)))
 
@@ -193,7 +215,7 @@ class AnnotController:
         current = (values or {}).get("font") or self.settings["textbox"]["font"]
 
         def pick(face_id):
-            if self.target()[0] == "textbox":
+            if self.target()[0] in annots.TEXTS:
                 self.apply_setting(font=face_id)
             else:
                 self.settings["textbox"]["font"] = face_id
@@ -203,9 +225,36 @@ class AnnotController:
     def set_tool(self, key):
         self.finish_editing()
         self.cancel_action()
+        if key == "image":
+            self.choose_image()
+            return
+        if key == "signature":
+            self.signatures.open(self.use_signature)
+            return
         self.tool = key
+        self.pending = None
         if key != "select":
             self.selected = None
+
+    def choose_image(self):
+        """選一張圖片,接著在頁面上點一下或拖曳放置。"""
+        chosen = winfile.ask_open("插入圖片", IMAGE_FILTER)
+        if chosen is None:
+            return
+        try:
+            data, pixels = signature.load_image(chosen)
+        except Exception:
+            self.page.notify(f"「{Path(chosen).name}」讀不到圖片，可能不是支援的格式或已損壞", theme.DANGER)
+            return
+        self._hold("image", data, pixels)
+
+    def use_signature(self, data, pixels):
+        self._hold("signature", data, pixels)
+
+    def _hold(self, kind, data, pixels):
+        self.tool = kind
+        self.selected = None
+        self.pending = dict(kind=kind, image=data, pixels=pixels)
 
     def cancel_action(self):
         action, self.action = self.action, None
@@ -238,6 +287,9 @@ class AnnotController:
         text = editing["editor"].text
         annot = self.fit(replace(editing["annot"], text=text))
         pair = (editing["page_uid"], annot.uid)
+        if annot.kind == "replace" and editing["new"] and text == editing["original"].text:
+            self.selected = None        # 選了字卻沒有改:當作沒做
+            return
         if annot.kind == "textbox" and not text.strip():
             if not editing["new"] and self.find(pair) is not None:
                 self.selected = pair
@@ -253,14 +305,14 @@ class AnnotController:
         editor = self.editing["editor"]
         text = editor.shown() if shown else editor.text
         annot = replace(self.editing["annot"], text=text)
-        if annot.kind == "textbox":
+        if annot.kind in annots.TEXTS:
             return pdfwrite.text_layout(annot)[1]
         return simple_layout(text, theme.font(14), NOTE_POPUP_W - 24)
 
     def _edit_index(self, pos, inside_only):
         editing = self.editing
         annot = editing["annot"]
-        if annot.kind == "textbox":
+        if annot.kind in annots.TEXTS:
             index = self.index_of(editing["page_uid"])
             mapper = self.mapper(index) if index is not None else None
             layout = self._edit_layout()
@@ -387,7 +439,7 @@ class AnnotController:
         if key in (pygame.K_DELETE, pygame.K_BACKSPACE):
             self.delete_selected()
             return True
-        if key in (pygame.K_RETURN, pygame.K_KP_ENTER) and annot.kind in ("textbox", "note"):
+        if key in (pygame.K_RETURN, pygame.K_KP_ENTER) and annot.kind in ("textbox", "note", "replace"):
             self.start_editing(index, annot)
             return True
         arrows = {pygame.K_LEFT: (-1, 0), pygame.K_RIGHT: (1, 0), pygame.K_UP: (0, -1), pygame.K_DOWN: (0, 1)}
@@ -432,7 +484,7 @@ class AnnotController:
             double = self._last_press[1] == pair and now - self._last_press[0] < DOUBLE_CLICK_MS
             self._last_press = (now, pair)
             self.selected = pair
-            if double and annot.kind in ("textbox", "note"):
+            if double and annot.kind in ("textbox", "note", "replace"):
                 self.start_editing(index, annot)
             elif annots.editable(annot):
                 self.action = dict(type="move", index=index, annot=annot, start=point, preview=annot, moved=False)
@@ -441,8 +493,10 @@ class AnnotController:
             return True
         point = self.mapper(index).to_page(pos)
         self.selected = None
-        if self.tool in annots.MARKUP:
+        if self.tool in annots.MARKUP or self.tool == "replace":
             self._press_markup(index, point)
+        elif self.tool in annots.IMAGES and self.pending is None:
+            self.set_tool(self.tool)
         elif self.tool == "note":
             width, height = self.pages[index].size
             size = annots.NOTE_SIZE
@@ -468,19 +522,26 @@ class AnnotController:
                 # 沒有文字的地方(例如掃描的頁面)改成拖曳出一塊範圍
                 self.action = dict(type="create", kind="highlight", index=index, start=point, current=point,
                                    stroke=[point])
+            elif self.tool == "replace":
+                self.page.notify("這裡沒有可以修改的文字；掃描的頁面可以用「文字框」加上背景色蓋住再打字", theme.WARN)
             else:
                 self.page.notify("這裡沒有可以選取的文字；底線、刪除線要在文字上拖曳", theme.WARN)
             return
-        self.action = dict(type="markup", index=index, lookup=lookup, start=start, rects=(), moved=False)
+        self.action = dict(type="markup", index=index, lookup=lookup, start=start, end=start, rects=(), moved=False,
+                           point=point)
 
-    def _update_markup(self, point):
-        action = self.action
+    def _update_markup(self, point, action=None):
+        action = action or self.action
         ref = self.pages[action["index"]]
         end = action["lookup"].index_at(*geometry.apply(geometry.ref_to_user(ref), point))
         if end is None:
             return
+        action["end"] = end
         to_page = geometry.ref_from_user(ref)
-        action["rects"] = tuple(geometry.transform_box(to_page, rect) for rect in action["lookup"].rects(action["start"], end))
+        # 改字用自己算的範圍(PDFium 的字框在某些字型會大很多,會把旁邊的字一起蓋掉)
+        found = action["lookup"].line_boxes(action["start"], end) if self.tool == "replace" \
+            else action["lookup"].rects(action["start"], end)
+        action["rects"] = tuple(geometry.transform_box(to_page, rect) for rect in found)
 
     @staticmethod
     def _snap(start, point):
@@ -506,6 +567,7 @@ class AnnotController:
             action["preview"] = self.fit(annots.resized(action["annot"], action["handle"], point))
         elif kind == "markup":
             action["moved"] = True
+            action["point"] = point
             self._update_markup(point)
         else:
             if action["kind"] in ("line", "arrow") and pygame.key.get_mods() & pygame.KMOD_SHIFT:
@@ -529,6 +591,14 @@ class AnnotController:
                 message = f"已移動{label}" if kind == "move" else f"已調整{label}大小"
                 self.replace_annot(index, action["annot"], action["preview"], message)
         elif kind == "markup":
+            if self.tool == "replace":
+                if not action["moved"]:
+                    self._update_markup(action["point"], action)
+                made = self._make_replace(index, action) if action["rects"] else None
+                action["lookup"].close()
+                if made is not None:
+                    self.start_editing(index, made, new=True)
+                return
             action["lookup"].close()
             if action["moved"] and action["rects"]:
                 self.add(index, annots.create(self.tool, rects=action["rects"], **self.style(self.tool)))
@@ -540,6 +610,49 @@ class AnnotController:
                 self.start_editing(index, annot, new=True)
             else:
                 self.add(index, annot)
+                if annot.kind in annots.IMAGES:
+                    self.tool, self.pending = "select", None      # 放好後回到選取,可以直接移動、改大小
+
+    def _make_replace(self, index, action):
+        """選好的原字 → 改字:字級、顏色、字型盡量和原字一樣,底色取原字周圍的顏色,新文字的底線對齊原字。"""
+        lookup, ref = action["lookup"], self.pages[index]
+        first, last = sorted((action["start"], action["end"]))
+        text = lookup.text_of(first, last)
+        size, color, font_name, serif, bold, baseline = lookup.char_style(first)
+        size = round(size * 2) / 2 or 12.0
+        face = fonts.match_pdf_font(font_name, serif, bold, cjk=any(ord(ch) > 0x2E80 for ch in text))
+        if face is None:
+            self.page.notify("找不到可以用的字型，請先選擇或下載字型", theme.WARN)
+            return None
+        rects = action["rects"]
+        x0 = min(r[0] for r in rects)
+        x1 = max(r[2] for r in rects)
+        # 原字的底線換成頁面座標(只取第一行的 y)
+        first_line = geometry.apply(geometry.ref_from_user(ref), (0.0, baseline))[1] \
+            if ref.base_rotation % 180 == 0 else min(r[1] for r in rects) + size * 0.88
+        top = first_line - annots.TEXT_PAD - size * fonts.BASELINE
+        box = (x0 - annots.TEXT_PAD, top, max(x1, x0 + size) + annots.TEXT_PAD + 1, top + 10)
+        style = dict(self.style("replace"), font=face.id, font_size=size, color=tuple(color))
+        style["background"] = self._paper_color(index, rects) or style["background"]
+        return self.fit(annots.create("replace", rects=rects, box=box, text=text, **style))
+
+    def _paper_color(self, index, rects):
+        """原字周圍最常見的顏色(大多是紙的白色,有底色的表格就是那個底色)。"""
+        ref = self.pages[index]
+        doc = self.page.docs.get(ref.source) if ref.kind == "pdf" else None
+        if doc is None:
+            return None
+        x0 = max(0.0, min(r[0] for r in rects) - 2)
+        y0 = max(0.0, min(r[1] for r in rects) - 2)
+        x1 = min(ref.size[0], max(r[2] for r in rects) + 2)
+        y1 = min(ref.size[1], max(r[3] for r in rects) + 2)
+        try:
+            image = pdfium.render(doc, ref.index, 2.0, crop=(x0, ref.size[1] - y1, ref.size[0] - x1, y0),
+                                  hidden=annots.hidden_origins(ref))
+        except Exception:
+            return None
+        colors = image.getcolors(image.width * image.height)
+        return max(colors)[1] if colors else None
 
     def _created(self, action, final=False):
         """拖曳出來的新註解;final 為 False 時只是畫面預覽。"""
@@ -561,6 +674,9 @@ class AnnotController:
             return make(kind, box=box, **style) if big_enough else None
         if kind == "ink":
             return make("ink", points=(tuple(action["stroke"]),), **style)
+        if kind in annots.IMAGES and self.pending is not None:
+            return make(kind, box=self._image_box(action, big_enough), image=self.pending["image"],
+                        pixels=self.pending["pixels"], **style)
         if kind == "textbox" and final:
             font = self.textbox_font()
             if font is None:
@@ -578,6 +694,27 @@ class AnnotController:
             return self.fit(annots.create("textbox", box=(left, max(0.0, top), right, top + 10), **style))
         return None
 
+    def _image_box(self, action, dragged):
+        """圖片放置的範圍:有拖曳就照拖的寬度(維持比例),只點一下就用預設大小、以點的位置為中心。"""
+        page_w, page_h = self.pages[action["index"]].size
+        width_px, height_px = self.pending["pixels"]
+        ratio = height_px / width_px if width_px else 1.0
+        (x0, y0), (x1, y1) = action["start"], action["current"]
+        if dragged:
+            width = max(8.0, abs(x1 - x0))
+            left = x0 if x1 >= x0 else x0 - width
+            top = y0 if y1 >= y0 else y0 - width * ratio
+            return left, top, left + width, top + width * ratio
+        if self.pending["kind"] == "signature":
+            width = SIGNATURE_W
+        else:
+            width = min(width_px * 72 / IMAGE_DPI, page_w * 0.5)
+        width = min(width, page_w * 0.9, page_h * 0.9 / ratio if ratio else page_w)
+        height = width * ratio
+        left = max(0.0, min(page_w - width, x0 - width / 2))
+        top = max(0.0, min(page_h - height, y0 - height / 2))
+        return left, top, left + width, top + height
+
     # ------------------------------------------------------------ 每一幀
 
     def update(self):
@@ -594,8 +731,10 @@ class AnnotController:
             pygame.key.stop_text_input()
         self.selected = None
         self.tool = "select"
+        self.pending = None
         self.cache.clear()
         self.picker.close()
+        self.signatures.close()
         self.palette.close()
 
     def deactivate(self):
@@ -614,8 +753,12 @@ class AnnotController:
         pygame.draw.line(screen, theme.PANEL_EDGE, (rect.x, rect.bottom - 1), (rect.right, rect.bottom - 1))
         x, y = rect.x + 12, rect.y + 8
         self.tool_rects = []
-        for key, label in TOOLS:
-            box = pygame.Rect(x, y, theme.font(13).size(label)[0] + 22, 30)
+        # 視窗窄時縮小按鈕左右的空白,14 個工具在最小的 960 寬也放得下
+        widths = [theme.font(13).size(label)[0] for _, label in TOOLS]
+        room = rect.width - 24 - 4 * (len(TOOLS) - 1) - sum(widths)
+        pad = max(10, min(22, room // len(TOOLS)))
+        for (key, label), text_w in zip(TOOLS, widths):
+            box = pygame.Rect(x, y, text_w + pad, 30)
             active = key == self.tool
             if active:
                 rounded_panel(screen, box, tuple(int(c * 0.3) for c in self.accent), radius=7, border=self.accent)
@@ -670,7 +813,7 @@ class AnnotController:
         for key, label, allow_none in COLOR_SLOTS.get(kind, [("color", "顏色", False)]):
             x = self._draw_color_button(x, cy, label, key, values[key], allow_none, mouse_pos).right + 6
         x += 6
-        if kind == "textbox":
+        if kind in annots.TEXTS:
             face = fonts.CATALOG.resolve(values["font"])
             self.font_rect = pygame.Rect(x, cy - 15, 150, 30)
             hover = self.font_rect.collidepoint(mouse_pos)
@@ -696,10 +839,16 @@ class AnnotController:
             self._menus.append((self.width_menu, "width"))
             x += menu_w + 12
         if kind != "note":
-            x = self._label("透明度", x, cy).right + 6
-            self._sync(self.opacity_menu, OPACITY_OPTIONS, values["opacity"], lambda v: f"{round((1 - v) * 100)}%")
-            self.opacity_menu.draw(screen, pygame.Rect(x, cy - 15, 76, 30), mouse_pos)
-            self._menus.append((self.opacity_menu, "opacity"))
+            if kind != "replace":
+                x = self._label("透明度", x, cy).right + 6
+                self._sync(self.opacity_menu, OPACITY_OPTIONS, values["opacity"],
+                           lambda v: f"{round((1 - v) * 100)}%")
+                self.opacity_menu.draw(screen, pygame.Rect(x, cy - 15, 76, 30), mouse_pos)
+                self._menus.append((self.opacity_menu, "opacity"))
+                x += 88
+        hint = TOOL_HINTS.get(kind) if kind == self.tool and self.selected is None else None
+        if hint and row.right - x > 120:
+            draw_text(screen, widgets.clip_text(hint, 12, row.right - x), (x, cy - 8), 12, theme.TEXT_FAINT)
 
     def draw_menus(self, mouse_pos):
         for menu, _ in self._menus:
@@ -752,7 +901,7 @@ class AnnotController:
         if action is not None and action["index"] == index:
             if action["type"] == "markup":
                 annot_view.draw_markup_preview(screen, mapper, self.tool, action["rects"],
-                                               self.settings[self.tool]["color"])
+                                               self.accent if self.tool == "replace" else self.settings[self.tool]["color"])
             elif action["type"] == "create":
                 if action["kind"] == "textbox":
                     (x0, y0), (x1, y1) = action["start"], action["current"]
@@ -764,7 +913,7 @@ class AnnotController:
                         annot_view.draw_annot(screen, mapper, preview, self.cache)
         found = self.selected_annot()
         if self.editing is not None and self.editing["page_uid"] == ref.uid:
-            if self.editing["annot"].kind == "textbox":
+            if self.editing["annot"].kind in annots.TEXTS:
                 self._draw_text_editing(mapper)
         elif found is not None and found[0] == index:
             shown = next((a for a in items if a.uid == found[1].uid), found[1])

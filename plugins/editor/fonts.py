@@ -419,6 +419,60 @@ class Catalog:
 
 CATALOG = Catalog()
 
+# PDF 裡的字型名稱(PostScript 名稱)→ 電腦上的字型檔;改字時用來找一個和原字最像的字型
+_PDF_FONT_FILES = {
+    "microsoftjhenghei": ("msjh.ttc", 0), "microsoftjhengheiregular": ("msjh.ttc", 0),
+    "microsoftjhengheibold": ("msjhbd.ttc", 0), "microsoftjhengheiui": ("msjh.ttc", 1),
+    "mingliu": ("mingliu.ttc", 0), "pmingliu": ("mingliu.ttc", 1), "細明體": ("mingliu.ttc", 0),
+    "新細明體": ("mingliu.ttc", 1), "dfkaishusbestdbf": ("kaiu.ttf", 0), "dfkaisb": ("kaiu.ttf", 0),
+    "biaukai": ("kaiu.ttf", 0), "標楷體": ("kaiu.ttf", 0), "kaiu": ("kaiu.ttf", 0),
+    "simsun": ("simsun.ttc", 0), "nsimsun": ("simsun.ttc", 1), "arial": ("arial.ttf", 0),
+    "arialmt": ("arial.ttf", 0), "arialbold": ("arialbd.ttf", 0), "arialboldmt": ("arialbd.ttf", 0),
+    "helvetica": ("arial.ttf", 0), "helveticabold": ("arialbd.ttf", 0),
+    "timesnewroman": ("times.ttf", 0), "timesnewromanpsmt": ("times.ttf", 0), "times": ("times.ttf", 0),
+    "timesroman": ("times.ttf", 0), "timesnewromanbold": ("timesbd.ttf", 0),
+    "timesnewromanpsboldmt": ("timesbd.ttf", 0), "calibri": ("calibri.ttf", 0), "calibribold": ("calibrib.ttf", 0),
+    "cambria": ("cambria.ttc", 0), "couriernew": ("cour.ttf", 0), "couriernewpsmt": ("cour.ttf", 0),
+    "courier": ("cour.ttf", 0), "verdana": ("verdana.ttf", 0), "tahoma": ("tahoma.ttf", 0),
+    "segoeui": ("segoeui.ttf", 0), "georgia": ("georgia.ttf", 0),
+}
+
+
+def _plain(name):
+    return "".join(ch for ch in name.lower() if ch.isalnum() or ord(ch) > 127)
+
+
+def match_pdf_font(name, serif=False, bold=False, cjk=True):
+    """找和 PDF 裡的字型最像、而且可以嵌入的字型;找不到時依有沒有襯線挑中文字型。回傳 FontFace 或 None。"""
+    base = name.split("+", 1)[1] if len(name) > 7 and name[6] == "+" else name
+    plain = _plain(base.replace(",", "-"))
+    candidates = [plain]
+    for suffix in ("regular", "normal", "roman", "book", "medium", "light", "italic", "oblique"):
+        if plain.endswith(suffix) and len(plain) > len(suffix):
+            candidates.append(plain[: -len(suffix)])
+    for key in candidates:
+        found = _PDF_FONT_FILES.get(key)
+        if found is not None:
+            face = CATALOG.system_file(*found)
+            if face is not None and face.usable:
+                return face
+    with CATALOG._lock:
+        system = list(CATALOG.system)
+    for face in [pack for pack in CATALOG.packs() if pack.installed] + system + CATALOG.custom():
+        if face.usable and _plain(face.name) in candidates:
+            return face
+    if cjk:
+        for filename, index in ((("mingliu.ttc", 1), ("kaiu.ttf", 0)) if serif else
+                                (("msjhbd.ttc", 0) if bold else ("msjh.ttc", 0),)):
+            face = CATALOG.system_file(filename, index)
+            if face is not None and face.usable:
+                return face
+    else:
+        face = CATALOG.system_file("times.ttf" if serif else "arial.ttf")
+        if face is not None and face.usable:
+            return face
+    return CATALOG.default()
+
 
 # ------------------------------------------------------------ 排版
 

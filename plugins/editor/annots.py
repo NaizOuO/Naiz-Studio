@@ -11,6 +11,8 @@ from . import geometry
 
 MARKUP = ("highlight", "underline", "strike")
 SHAPES = ("line", "arrow", "rect", "ellipse", "ink")
+IMAGES = ("image", "signature")     # 插入的圖片、簽名:存成圖章註解,外觀就是那張圖
+TEXTS = ("textbox", "replace")      # 可以打字、排版的種類;改字是「蓋住原字 + 文字框」
 NOTE_SIZE = 20.0
 TEXT_PAD = 4.0
 LINE_HEIGHT = 1.3           # 行高是字型大小的幾倍
@@ -21,6 +23,7 @@ DEFAULT_COLORS = {     # 和顏色選單裡的標準色一致
     "highlight": (255, 255, 0), "underline": (0, 112, 192), "strike": (255, 0, 0), "textbox": (0, 0, 0),
     "note": (255, 192, 0), "line": (255, 0, 0), "arrow": (255, 0, 0), "rect": (255, 0, 0),
     "ellipse": (255, 0, 0), "ink": (0, 112, 192), "other": (150, 150, 150),
+    "image": (0, 0, 0), "signature": (0, 0, 0), "replace": (0, 0, 0),
 }
 _SUBTYPES = {"Highlight": "highlight", "Underline": "underline", "StrikeOut": "strike", "FreeText": "textbox",
              "Text": "note", "Line": "line", "Square": "rect", "Circle": "ellipse", "Ink": "ink"}
@@ -35,13 +38,15 @@ class Annot:
     color: tuple = (255, 214, 0)
     opacity: float = 1.0
     width: float = 2.0              # 線條粗細;文字框是外框粗細(0 表示沒有外框)
-    rects: tuple = ()               # 文字標記:每一行的範圍 (x0, y0, x1, y1)
+    rects: tuple = ()               # 文字標記:每一行的範圍 (x0, y0, x1, y1);改字:要蓋掉(刪掉)的原字範圍
     box: tuple = (0.0, 0.0, 0.0, 0.0)   # 文字框、便利貼、方框、圓形、其他:範圍
     points: tuple = ()              # 直線與箭頭:(起點, 終點);手繪:(筆畫, ...),每一筆是點的 tuple
     text: str = ""
     font: str = ""                  # 字型代號(fonts.FontFace.id)
     font_size: float = 12.0
-    background: tuple = ()          # 文字框的背景、方框與圓形的填滿顏色;空的表示沒有底色
+    background: tuple = ()          # 文字框的背景、方框與圓形的填滿顏色;空的表示沒有底色。改字是蓋住原字的顏色
+    image: bytes = b""              # 圖片、簽名:PNG 檔的內容
+    pixels: tuple = ()              # 圖片的像素寬高;改大小時維持這個比例
     origin: int = -1                # 原檔這一頁 /Annots 的第幾個;-1 是在編輯器裡新增的
     subtype: str = ""               # 原檔的註解類型名稱
 
@@ -56,7 +61,7 @@ def arrow_size(width):
 
 
 def raw_box(annot):
-    """不含線條粗細的範圍。"""
+    """不含線條粗細的範圍;改字是文字框的範圍(不含蓋住的原字)。"""
     if annot.kind in MARKUP:
         return geometry.bbox([p for x0, y0, x1, y1 in annot.rects for p in ((x0, y0), (x1, y1))])
     if annot.kind in ("line", "arrow"):
@@ -67,8 +72,10 @@ def raw_box(annot):
 
 
 def bounds(annot):
-    """畫出來會佔到的範圍(含線條粗細、箭頭)。"""
+    """畫出來會佔到的範圍(含線條粗細、箭頭);改字包含蓋住原字的範圍。"""
     x0, y0, x1, y1 = raw_box(annot)
+    if annot.kind == "replace" and annot.rects:
+        return geometry.bbox([(x0, y0), (x1, y1)] + [p for a, b, c, d in annot.rects for p in ((a, b), (c, d))])
     if annot.kind == "arrow":
         pad = arrow_size(annot.width) + annot.width
     elif annot.kind in ("line", "ink", "rect", "ellipse") or (annot.kind == "textbox" and annot.width):
@@ -84,6 +91,8 @@ def _inside(box, point, tolerance=0.0):
 
 
 def hit(annot, point, tolerance=3.0):
+    if annot.kind == "replace":
+        return _inside(annot.box, point, tolerance) or any(_inside(rect, point, tolerance) for rect in annot.rects)
     if annot.kind in MARKUP:
         return any(_inside(rect, point, tolerance) for rect in annot.rects)
     reach = tolerance + annot.width / 2
@@ -104,7 +113,7 @@ def moved(annot, dx, dy):
         return p[0] + dx, p[1] + dy
 
     changes = {}
-    if annot.rects:
+    if annot.rects and annot.kind != "replace":     # 改字移動的是新文字,蓋住原字的範圍留在原地
         changes["rects"] = tuple((x0 + dx, y0 + dy, x1 + dx, y1 + dy) for x0, y0, x1, y1 in annot.rects)
     if annot.kind in ("line", "arrow"):
         changes["points"] = tuple(shift(p) for p in annot.points)
@@ -121,8 +130,10 @@ def handles(annot):
         return [("p1", annot.points[0]), ("p2", annot.points[1])]
     x0, y0, x1, y1 = raw_box(annot)
     cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-    if annot.kind == "textbox":
+    if annot.kind in TEXTS:
         return [("w", (x0, cy)), ("e", (x1, cy))]
+    if annot.kind in IMAGES:
+        return [("nw", (x0, y0)), ("ne", (x1, y0)), ("se", (x1, y1)), ("sw", (x0, y1))]
     if annot.kind in ("rect", "ellipse", "ink"):
         return [("nw", (x0, y0)), ("n", (cx, y0)), ("ne", (x1, y0)), ("e", (x1, cy)),
                 ("se", (x1, y1)), ("s", (cx, y1)), ("sw", (x0, y1)), ("w", (x0, cy))]
@@ -135,7 +146,9 @@ def resized(annot, handle, point):
         first, second = annot.points
         return replace(annot, points=((px, py), second) if handle == "p1" else (first, (px, py)))
     x0, y0, x1, y1 = raw_box(annot)
-    if annot.kind == "textbox":
+    if annot.kind in IMAGES:
+        return replace(annot, box=_keep_ratio(annot, handle, point))
+    if annot.kind in TEXTS:
         if handle == "w":
             x0 = min(px, x1 - MIN_TEXT_W)
         else:
@@ -161,20 +174,33 @@ def resized(annot, handle, point):
     return replace(annot, points=strokes)
 
 
+def _keep_ratio(annot, handle, point):
+    """圖片改大小:拖的是角,對面的角固定,寬高維持原本的比例。"""
+    x0, y0, x1, y1 = annot.box
+    ratio = (y1 - y0) / (x1 - x0) if x1 > x0 else 1.0
+    fixed_x = x1 if "w" in handle else x0
+    fixed_y = y1 if "n" in handle else y0
+    width = max(MIN_SHAPE * 2, abs(point[0] - fixed_x), abs(point[1] - fixed_y) / ratio if ratio else 0.0)
+    height = width * ratio
+    left = fixed_x - width if "w" in handle else fixed_x
+    top = fixed_y - height if "n" in handle else fixed_y
+    return left, top, left + width, top + height
+
+
 def editable(annot):
     return annot.kind != "other"
 
 
 def styled(annot, **settings):
     """套用顏色、粗細等設定;不適用這種註解的設定會被略過。"""
-    allowed = {"color"}
-    if annot.kind in MARKUP or annot.kind in SHAPES or annot.kind == "textbox":
+    allowed = set() if annot.kind in IMAGES else {"color"}
+    if annot.kind in MARKUP or annot.kind in SHAPES or annot.kind in IMAGES or annot.kind == "textbox":
         allowed.add("opacity")
     if annot.kind in SHAPES or annot.kind == "textbox":
         allowed.add("width")
-    if annot.kind in ("rect", "ellipse", "textbox"):
+    if annot.kind in ("rect", "ellipse", "textbox", "replace"):
         allowed.add("background")
-    if annot.kind == "textbox":
+    if annot.kind in TEXTS:
         allowed |= {"font", "font_size"}
     changes = {key: value for key, value in settings.items() if key in allowed}
     return replace(annot, **changes) if changes else annot
@@ -242,6 +268,12 @@ def parse(obj, index, to_page):
     rect = [float(v) for v in obj.Rect] if "/Rect" in obj and len(obj.Rect) == 4 else [0, 0, 0, 0]
     box = geometry.transform_box(to_page, rect)
     kind = _SUBTYPES.get(subtype, "other")
+    if subtype == "Stamp" and str(obj.get("/NaizKind", "")) in IMAGES:
+        found = _stamp_image(obj)
+        if found is not None:
+            data, pixels = found
+            return Annot(str(obj.NaizKind), uid=next(_ids), box=box, image=data, pixels=pixels, origin=index,
+                         subtype=subtype, opacity=_number(obj.get("/CA", 1.0), 1.0), color=DEFAULT_COLORS["image"])
     color = _color(obj.get("/C"), DEFAULT_COLORS.get(kind, (150, 150, 150)))
     common = dict(uid=next(_ids), color=color, opacity=_number(obj.get("/CA", 1.0), 1.0), origin=index,
                   subtype=subtype, text=str(obj.get("/Contents", "")))
@@ -300,6 +332,28 @@ def parse(obj, index, to_page):
     return Annot("other", box=box, **common)
 
 
+def _stamp_image(obj):
+    """自己存的圖片、簽名:從外觀裡取回原本的圖(含透明);讀不到回傳 None。"""
+    try:
+        import io
+
+        import pikepdf
+        from PIL import Image
+
+        form = obj.AP.N
+        xobject = next(iter(form.Resources.XObject.values()))
+        image = pikepdf.PdfImage(xobject).as_pil_image().convert("RGB")
+        if "/SMask" in xobject:
+            alpha = pikepdf.PdfImage(xobject.SMask).as_pil_image().convert("L")
+            image = image.convert("RGBA")
+            image.putalpha(alpha.resize(image.size))
+        buffer = io.BytesIO()
+        image.save(buffer, "PNG")
+        return buffer.getvalue(), image.size
+    except Exception:
+        return None
+
+
 def read_page(page_obj, size, base_rotation, origin):
     """一頁 PDF 裡可以在編輯器顯示的註解。"""
     items = page_obj.get("/Annots")
@@ -320,4 +374,5 @@ def read_page(page_obj, size, base_rotation, origin):
 
 
 LABELS = {"highlight": "螢光筆", "underline": "底線", "strike": "刪除線", "textbox": "文字框", "note": "便利貼",
-          "line": "直線", "arrow": "箭頭", "rect": "方框", "ellipse": "圓形", "ink": "手繪", "other": "其他註解"}
+          "line": "直線", "arrow": "箭頭", "rect": "方框", "ellipse": "圓形", "ink": "手繪", "other": "其他註解",
+          "image": "圖片", "signature": "簽名", "replace": "改字"}

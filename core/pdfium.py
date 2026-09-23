@@ -146,6 +146,73 @@ class TextLookup:
             count = self.text.count_rects(first, last - first + 1)
             return [self.text.get_rect(i) for i in range(count)]
 
+    def line_boxes(self, first, last):
+        """第 first 到 last 個字(含)實際佔的範圍,同一行合併:[(左, 下, 右, 上)]。
+
+        不用 PDFium 的字框:有些字型的字框比字本身大很多(14 點的字框寬 60 點),拿來蓋字會連旁邊的字一起蓋掉。
+        改用每個字的起點與字級:左右是起點到下一個字的起點,上下是底線往下 0.22、往上 0.88 個字級。
+        """
+        import ctypes
+
+        import pypdfium2.raw as raw
+
+        first, last = sorted((first, last))
+        chars = []
+        with LOCK:
+            handle = self.text.raw
+            for index in range(first, min(last + 1, self.count)):
+                code = raw.FPDFText_GetUnicode(handle, index)
+                if code in (0, 10, 13):
+                    continue
+                x, y = ctypes.c_double(), ctypes.c_double()
+                raw.FPDFText_GetCharOrigin(handle, index, ctypes.byref(x), ctypes.byref(y))
+                size = abs(raw.FPDFText_GetFontSize(handle, index)) or 10.0
+                left, bottom, right, top = self.text.get_charbox(index)
+                chars.append((x.value, y.value, size, right, code == 32))
+        lines = []
+        for position, (x, y, size, box_right, space) in enumerate(chars):
+            following = chars[position + 1] if position + 1 < len(chars) else None
+            same_line = following is not None and abs(following[1] - y) < size * 0.3 and following[0] > x
+            right = following[0] if same_line else min(max(box_right, x + size * 0.3), x + size * 1.05)
+            if space and not same_line:
+                continue            # 行尾的空白不算
+            box = [x, y - size * 0.22, max(right, x + 0.5), y + size * 0.88]
+            if lines and abs(lines[-1][1] - box[1]) < size * 0.3 and box[0] >= lines[-1][0] - 1:
+                line = lines[-1]
+                line[0], line[1] = min(line[0], box[0]), min(line[1], box[1])
+                line[2], line[3] = max(line[2], box[2]), max(line[3], box[3])
+            else:
+                lines.append(box)
+        return [tuple(line) for line in lines]
+
+    def text_of(self, first, last):
+        """第 first 到 last 個字(含)的文字;PDFium 自己補的換行換成空白。"""
+        first, last = sorted((first, last))
+        with LOCK:
+            text = self.text.get_text_range(first, last - first + 1)
+        return " ".join(part.strip() for part in text.replace("\r\n", "\n").split("\n") if part.strip())
+
+    def char_style(self, index):
+        """一個字的樣式:(字級, 顏色 (R, G, B), 字型名稱, 是不是有襯線, 是不是粗體, 底線的 y)。"""
+        import ctypes
+
+        import pypdfium2.raw as raw
+
+        with LOCK:
+            handle = self.text.raw
+            size = abs(raw.FPDFText_GetFontSize(handle, index))
+            red, green, blue, alpha = (ctypes.c_uint() for _ in range(4))
+            raw.FPDFText_GetFillColor(handle, index, *[ctypes.byref(v) for v in (red, green, blue, alpha)])
+            buffer = ctypes.create_string_buffer(256)
+            flags = ctypes.c_int()
+            raw.FPDFText_GetFontInfo(handle, index, buffer, 256, ctypes.byref(flags))
+            weight = raw.FPDFText_GetFontWeight(handle, index)
+            x, y = ctypes.c_double(), ctypes.c_double()
+            raw.FPDFText_GetCharOrigin(handle, index, ctypes.byref(x), ctypes.byref(y))
+        name = buffer.value.decode("utf-8", "replace")
+        bold = weight >= 600 or "Bold" in name or bool(flags.value & (1 << 18))
+        return size, (red.value, green.value, blue.value), name, bool(flags.value & 2), bold, y.value
+
     def close(self):
         with LOCK:
             self.text.close()

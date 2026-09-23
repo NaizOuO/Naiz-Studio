@@ -4,6 +4,7 @@
 文字框用和儲存時相同的排版,畫面上看到的換行位置就是存檔後的樣子。
 """
 
+import io
 import math
 from collections import OrderedDict
 
@@ -105,10 +106,52 @@ def _textbox_surface(mapper, annot, cache):
     return surface
 
 
+def _image_surface(mapper, annot, cache):
+    """圖片、簽名:先把 PNG 解成圖(同一張圖只解一次),再依畫面大小縮放;放很大時只取看得到的解析度。"""
+    source = cache.get(("image", annot.image))
+    if source is None:
+        image = Image.open(io.BytesIO(annot.image)).convert("RGBA")
+        source = pygame.image.frombytes(image.tobytes(), image.size, "RGBA")
+        cache.put(("image", annot.image), source)
+    area = mapper.box(annot.box)
+    size = (max(1, area.width), max(1, area.height)) if mapper.rotation % 180 == 0 else         (max(1, area.height), max(1, area.width))
+    if size[0] * size[1] > 40_000_000:
+        return None
+    key = ("scaled", annot.image, size, mapper.rotation)
+    surface = cache.get(key)
+    if surface is None:
+        surface = pygame.transform.smoothscale(source, size)
+        if mapper.rotation:
+            surface = pygame.transform.rotate(surface, -mapper.rotation)
+        cache.put(key, surface)
+    return surface
+
+
 def draw_annot(screen, mapper, annot, cache):
     kind = annot.kind
     scale = mapper.scale
     color = tuple(annot.color)
+    if kind in annots.IMAGES:
+        surface = _image_surface(mapper, annot, cache)
+        if surface is not None:
+            if annot.opacity < 0.999:
+                surface = surface.copy()
+                surface.set_alpha(round(255 * annot.opacity))
+            screen.blit(surface, mapper.box(annot.box).topleft)
+        return
+    if kind == "replace":
+        if annot.background:
+            for rect in pdfwrite.cover_areas(annot):
+                area = mapper.box(rect).clip(screen.get_clip())
+                if area.width > 0 and area.height > 0:
+                    screen.fill(tuple(annot.background), area)
+        if annot.text:
+            text = annots.Annot("textbox", color=annot.color, width=0.0, box=annot.box, text=annot.text,
+                                font=annot.font, font_size=annot.font_size)
+            surface = _textbox_surface(mapper, text, cache)
+            if surface is not None:
+                screen.blit(surface, mapper.box(annot.box).topleft)
+        return
     if kind == "highlight":
         tint = _tint(color, annot.opacity)
         for rect in annot.rects:

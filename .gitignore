@@ -22,6 +22,9 @@ bin/
 models/
 fonts/
 
+# 使用者存的簽名屬於個人資料
+signatures/
+
 # 測試或處理中的 PDF 屬於個人檔案
 *.pdf
 
