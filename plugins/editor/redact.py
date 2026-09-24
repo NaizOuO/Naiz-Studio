@@ -475,7 +475,7 @@ class Redactor:
         return new_name
 
 
-def _own_resources(pdf, page):
+def own_resources(pdf, page):
     """這一頁自己的資源字典(可能是從上層繼承或和別頁共用);要修改前先複製一份,避免改到其他頁。"""
     node, resources = page.obj, None
     while node is not None and resources is None:
@@ -494,7 +494,7 @@ def redact_page(pdf, page, areas, images=False, fill=(0, 0, 0)):
     回傳 (刪掉的字數, 沒把握而保留的段數)。"""
     if not areas:
         return 0, 0
-    resources = _own_resources(pdf, page)
+    resources = own_resources(pdf, page)
     redactor = Redactor(pdf, areas, images=images, fill=fill)
     operations = pikepdf.parse_content_stream(page)
     rewritten, changed = redactor.rewrite(operations, resources)

@@ -115,7 +115,8 @@ def _image_surface(mapper, annot, cache):
         source = pygame.image.frombytes(image.tobytes(), image.size, "RGBA")
         cache.put(("image", annot.image), source)
     area = mapper.box(annot.box)
-    size = (max(1, area.width), max(1, area.height)) if mapper.rotation % 180 == 0 else         (max(1, area.height), max(1, area.width))
+    size = (max(1, area.width), max(1, area.height)) if mapper.rotation % 180 == 0 else \
+        (max(1, area.height), max(1, area.width))
     if size[0] * size[1] > 40_000_000:
         return None
     key = ("scaled", annot.image, size, mapper.rotation)
@@ -132,7 +133,9 @@ def draw_annot(screen, mapper, annot, cache):
     kind = annot.kind
     scale = mapper.scale
     color = tuple(annot.color)
-    if kind in annots.IMAGES:
+    if kind == annots.PAGE_IMAGE and not annot.image:
+        return                      # 原檔的圖片由 PDFium 畫;只有拖曳中才帶著圖在這裡畫
+    if kind in annots.IMAGES or kind == annots.PAGE_IMAGE:
         surface = _image_surface(mapper, annot, cache)
         if surface is not None:
             if annot.opacity < 0.999:

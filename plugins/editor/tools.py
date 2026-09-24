@@ -9,18 +9,26 @@ from pathlib import Path
 
 import pygame
 
-from core import pdfium, theme, widgets, winfile
+from core import imageclip, pdfium, theme, widgets, winfile
+from core.contextmenu import ContextMenu
 from core.widgets import Dropdown, draw_text, rounded_panel
 
-from . import annot_view, annots, fonts, geometry, model, paragraphs, pdffonts, pdfwrite, signature
+from . import annot_view, annots, fonts, geometry, icons, model, paragraphs, pdffonts, pdfwrite, signature
 from .font_picker import FontPicker
 from .signature import IMAGE_FILTER, SignaturePanel
 from .palette import ColorPalette
 from .textarea import TextEditor, simple_layout
 
 BAR_H = 86
+ICON_BOX = 34               # 工具按鈕平常只有圖示,這是圖示按鈕的寬度
+ICON_SIZE = 20
+TOOL_H = 30
+GROW_SPEED = 14             # 滑過、選取時文字拉開的速度(越大越快)
+HOVER_MS = 120              # 滑鼠停在工具上這麼久才拉開文字,掃過去時不會每個都動
+SNAP_PX = 6                 # 按住 Ctrl 移動時,離其他物件的邊或中線這麼近(畫面像素)就對齊
+PASTE_OFFSET = 12.0         # 用鍵盤貼上、滑鼠又不在頁面上時,貼在原本位置往右下偏移這麼多(點)
 TOOLS = [("select", "選取"), ("highlight", "螢光筆"), ("underline", "底線"), ("strike", "刪除線"), ("textbox", "文字框"),
-         ("replace", "改字"), ("redact", "塗黑"), ("note", "便利貼"), ("line", "直線"), ("arrow", "箭頭"), ("rect", "方框"),
+         ("redact", "塗黑"), ("note", "便利貼"), ("line", "直線"), ("arrow", "箭頭"), ("rect", "方框"),
          ("ellipse", "圓形"), ("ink", "手繪"), ("image", "圖片"), ("signature", "簽名")]
 WIDTH_OPTIONS = [(f"{v:g}", f"{v:g} pt") for v in (1, 2, 3, 5, 8)]
 SHAPE_WIDTH_OPTIONS = [("0", "無線條")] + WIDTH_OPTIONS
@@ -42,12 +50,13 @@ TOOL_HINTS = {
     "replace": "點一下文字修改整段，拖曳選取只改其中幾個字；清空文字就是刪除。儲存時原字會真正刪掉",
     "redact": "在文字上拖曳選取要塗黑的字，或在其他地方拉出範圍(照片、簽名也行)；儲存時底下的字和圖會真正刪掉",
     "image": "在頁面上點一下放置圖片，或拖曳出想要的大小",
+    annots.PAGE_IMAGE: "拖曳可以移動，拉四個角改大小，按 Delete 刪除；儲存時圖片的畫質不變",
     "signature": "在頁面上點一下放置簽名，或拖曳出想要的大小",
 }
 DOUBLE_CLICK_MS = 400
 TEXTBOX_W = 200.0
 NOTE_POPUP_W = 260
-HINT = "選擇上方的工具後在頁面上拖曳；點選註解可以移動、改大小、改顏色，按 Delete 刪除，按兩下文字框或便利貼可以修改文字"
+HINT = "點文字直接修改，拖曳選字可以複製；點註解、圖片可以移動，按住 Ctrl 拖曳會對齊；右鍵可以複製、貼上"
 
 
 def _values(annot):
@@ -61,7 +70,7 @@ COLOR_SLOTS = {
     "rect": [("color", "線條", False), ("background", "填滿", True)],
     "ellipse": [("color", "線條", False), ("background", "填滿", True)],
     "replace": [("color", "文字", False), ("background", "底色", False)],
-    "image": [], "signature": [],
+    "image": [], "signature": [], annots.PAGE_IMAGE: [],
 }
 
 
@@ -80,6 +89,13 @@ class AnnotController:
         self._palette_key = ""
         self.bar_rect = pygame.Rect(0, 0, 0, 0)
         self.tool_rects, self.color_buttons = [], []
+        self._tool_shown = {}       # 每個工具按鈕畫出來的範圍(含拉開的文字)
+        self._grow = {}             # 工具 → (選取時拉開的程度, 畫出來拉開的程度),0～1
+        self._hover_tool = None
+        self._hover_at = (None, 0)  # 滑鼠停在哪個工具上、從什麼時候開始
+        self._bar_tick = 0
+        self.menu = ContextMenu(self.accent)
+        self._clip = None           # 複製的註解:dict(annot, page_uid, sequence)
         self.font_rect = pygame.Rect(0, 0, 0, 0)
         self.width_menu = Dropdown(WIDTH_OPTIONS, accent=self.accent, size=13)
         self.opacity_menu = Dropdown(OPACITY_OPTIONS, accent=self.accent, size=13)
@@ -373,8 +389,19 @@ class AnnotController:
 
     def handle_event(self, event, pos):
         """回傳 True 代表事件被註解工具用掉了。"""
+        if self.menu.handle_event(event, pos):
+            return True
+        if self.palette.is_open and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            # 點另一個顏色按鈕:直接換成那個按鈕的顏色選單
+            if any(key != self._palette_key and rect.collidepoint(pos) for key, rect, _, _ in self.color_buttons):
+                self.palette.close()
         if self.palette.handle_event(event, pos):
             return True
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+            area = self.page.view_rect
+            if area.collidepoint(pos) and pos[0] < area.right - 12 and pos[1] < area.bottom - 8:
+                self._context(pos)
+                return True
         if self.editing is not None and self._handle_editing(event, pos):
             return True
         if self._handle_menus(event, pos):
@@ -409,22 +436,38 @@ class AnnotController:
                     return True
         return False
 
-    def _click_bar(self, pos):
+    def _tool_at(self, pos):
+        """pos 上的工具:先看圖示本身;滑鼠在拉開的文字上、底下又沒有別的圖示時,算是那個拉開的工具。"""
         for key, rect in self.tool_rects:
             if rect.collidepoint(pos):
-                self.set_tool(key)
-                return
+                return key
+        shown = self._tool_shown.get(self._hover_tool)
+        if shown is not None and shown.collidepoint(pos):
+            return self._hover_tool
+        return None
+
+    def _click_bar(self, pos):
+        key = self._tool_at(pos)
+        if key is not None:
+            self.set_tool(key)
+            return
         for key, rect, value, allow_none in self.color_buttons:
             if rect.collidepoint(pos):
                 self._palette_key = key
                 self.palette.open(rect, value, lambda color, key=key: self.apply_setting(**{key: color}),
-                                  allow_none=allow_none)
+                                  allow_none=allow_none, restore_text=self.editing is not None)
                 return
         if self.font_rect.collidepoint(pos):
             self.open_picker()
 
     def _handle_key(self, event):
         key = event.key
+        ctrl = event.mod & pygame.KMOD_CTRL
+        if ctrl and key == pygame.K_v:
+            return self.paste()
+        if ctrl and key in (pygame.K_c, pygame.K_x) and self.selected_annot() is not None and self.action is None:
+            self.copy_selected(cut=key == pygame.K_x)
+            return True
         if key == pygame.K_ESCAPE:
             if self.action is not None:
                 self.cancel_action()
@@ -457,12 +500,29 @@ class AnnotController:
             return True
         return False
 
-    def _annot_at(self, index, point):
+    def _annot_at(self, index, point, images=True):
+        """點到的註解;images 為 False 時不含原檔的圖片。"""
         tolerance = 5 / self.scale()
         for annot in reversed(self.pages[index].annots):
+            if not images and annot.kind == annots.PAGE_IMAGE:
+                continue
             if annots.hit(annot, point, tolerance):
                 return annot
         return None
+
+    def _on_text(self, index, point):
+        """點的地方是不是原檔的文字(剛好在字上,或在某一段文字的範圍裡)。"""
+        ref = self.pages[index]
+        doc = self.page.docs.get(ref.source) if ref.kind == "pdf" else None
+        if doc is None:
+            return False
+        if self.paragraph_at(index, point) is not None:
+            return True
+        lookup = pdfium.TextLookup(doc, ref.index)
+        try:
+            return lookup.on_text(*geometry.apply(geometry.ref_to_user(ref), point))
+        finally:
+            lookup.close()
 
     def _press(self, pos):
         now = pygame.time.get_ticks()
@@ -473,13 +533,25 @@ class AnnotController:
                 mapper = self.mapper(found[0])
                 handle = annot_view.handle_at(mapper, found[1], pos) if mapper is not None else None
                 if handle is not None:
-                    self.action = dict(type="resize", index=found[0], annot=found[1], handle=handle, preview=found[1])
+                    self.action = dict(type="resize", index=found[0], annot=found[1], handle=handle, preview=found[1],
+                                       picture=self._page_picture(found[0], found[1]))
                     return True
             if index is None:
                 self.selected = None
                 return False
             point = self.mapper(index).to_page(pos)
-            annot = self._annot_at(index, point)
+            # 先看註解,再看文字(點一下改整段、拖曳選字),最後才是原檔的圖片
+            annot = self._annot_at(index, point, images=False)
+            if annot is not None and annot.kind == "replace":
+                self.start_editing(index, annot)            # 改過還沒存的段落:接著改
+                return True
+            if annot is None and self._on_text(index, point):
+                self.selected = None
+                self._press_markup(index, point, "replace")
+                self.action["pos"] = pos
+                return True
+            if annot is None:
+                annot = self._annot_at(index, point)
             if annot is None:
                 self.selected = None
                 return False
@@ -490,7 +562,8 @@ class AnnotController:
             if double and annot.kind in ("textbox", "note", "replace"):
                 self.start_editing(index, annot)
             elif annots.editable(annot):
-                self.action = dict(type="move", index=index, annot=annot, start=point, preview=annot, moved=False)
+                self.action = dict(type="move", index=index, annot=annot, start=point, preview=annot, moved=False,
+                                   picture=self._page_picture(index, annot))
             return True
         if index is None:
             return True
@@ -518,7 +591,9 @@ class AnnotController:
             self.action = dict(type="create", kind=self.tool, index=index, start=point, current=point, stroke=[point])
         return True
 
-    def _press_markup(self, index, point):
+    def _press_markup(self, index, point, tool=None):
+        """在文字上按下:之後拖曳選字。tool 是這次的用途(選取工具點在文字上時是 replace,也就是改字)。"""
+        tool = tool or self.tool
         ref = self.pages[index]
         lookup, start = None, None
         doc = self.page.docs.get(ref.source) if ref.kind == "pdf" else None
@@ -528,17 +603,17 @@ class AnnotController:
         if start is None:
             if lookup is not None:
                 lookup.close()
-            if self.tool in ("highlight", "redact"):
+            if tool in ("highlight", "redact"):
                 # 沒有文字的地方(例如掃描的頁面、照片)改成拖曳出一塊範圍
-                self.action = dict(type="create", kind=self.tool, index=index, start=point, current=point,
+                self.action = dict(type="create", kind=tool, index=index, start=point, current=point,
                                    stroke=[point])
-            elif self.tool == "replace":
+            elif tool == "replace":
                 self.page.notify("這裡沒有可以修改的文字；掃描的頁面可以用「文字框」加上背景色蓋住再打字", theme.WARN)
             else:
                 self.page.notify("這裡沒有可以選取的文字；底線、刪除線要在文字上拖曳", theme.WARN)
             return
         self.action = dict(type="markup", index=index, lookup=lookup, start=start, end=start, rects=(), moved=False,
-                           point=point)
+                           point=point, tool=tool)
 
     def _update_markup(self, point, action=None):
         action = action or self.action
@@ -549,9 +624,49 @@ class AnnotController:
         action["end"] = end
         to_page = geometry.ref_from_user(ref)
         # 改字用自己算的範圍(PDFium 的字框在某些字型會大很多,會把旁邊的字一起蓋掉)
-        found = action["lookup"].line_boxes(action["start"], end) if self.tool in ("replace", "redact") \
+        found = action["lookup"].line_boxes(action["start"], end) if action["tool"] in ("replace", "redact") \
             else action["lookup"].rects(action["start"], end)
         action["rects"] = tuple(geometry.transform_box(to_page, rect) for rect in found)
+
+    def _snap_targets(self, index, moving):
+        """可以對齊的物件範圍:其他註解、原檔的圖片、每一段文字,以及頁面本身。"""
+        ref = self.pages[index]
+        boxes = [annots.bounds(a) for a in ref.annots if a.uid != moving.uid and a.kind != "other"]
+        to_page = geometry.ref_from_user(ref)
+        if not ref.base_rotation % 360:
+            boxes += [geometry.transform_box(to_page, p.bounds()) for p in self.paragraphs_of(index)]
+        width, height = ref.size
+        return boxes, (0.0, 0.0, width, height)
+
+    def _align(self, index, annot, dx, dy):
+        """按住 Ctrl 移動:只往水平或垂直其中一個方向走,並吸附到附近物件的邊或中線。回傳 (dx, dy, 對齊線)。"""
+        if abs(dx) >= abs(dy):
+            dy = 0.0
+        else:
+            dx = 0.0
+        boxes, page_box = self._snap_targets(index, annot)
+        x0, y0, x1, y1 = annots.bounds(annot)
+        x0, x1, y0, y1 = x0 + dx, x1 + dx, y0 + dy, y1 + dy
+        limit = SNAP_PX / self.scale()
+        guides = []
+        axis = 0 if dy == 0.0 else 1
+        mine = (x0, (x0 + x1) / 2, x1) if axis == 0 else (y0, (y0 + y1) / 2, y1)
+        best = None
+        for box in boxes + [page_box]:
+            theirs = (box[0], (box[0] + box[2]) / 2, box[2]) if axis == 0 else (box[1], (box[1] + box[3]) / 2, box[3])
+            for a in mine:
+                for b in theirs:
+                    if abs(b - a) <= limit and (best is None or abs(b - a) < abs(best[0])):
+                        best = (b - a, b, box)
+        if best is not None:
+            shift, line, box = best
+            if axis == 0:
+                dx += shift
+                guides.append(((line, min(y0, box[1])), (line, max(y1, box[3]))))
+            else:
+                dy += shift
+                guides.append(((min(x0, box[0]), line), (max(x1, box[2]), line)))
+        return dx, dy, guides
 
     @staticmethod
     def _snap(start, point):
@@ -571,7 +686,10 @@ class AnnotController:
             dx, dy = point[0] - action["start"][0], point[1] - action["start"][1]
             if math.hypot(dx, dy) * self.scale() >= 3:
                 action["moved"] = True
+            action["guides"] = []
             if action["moved"]:
+                if pygame.key.get_mods() & pygame.KMOD_CTRL:
+                    dx, dy, action["guides"] = self._align(action["index"], action["annot"], dx, dy)
                 action["preview"] = annots.moved(action["annot"], dx, dy)
         elif kind == "resize":
             action["preview"] = self.fit(annots.resized(action["annot"], action["handle"], point))
@@ -601,8 +719,9 @@ class AnnotController:
                 message = f"已移動{label}" if kind == "move" else f"已調整{label}大小"
                 self.replace_annot(index, action["annot"], action["preview"], message)
         elif kind == "markup":
-            if self.tool == "replace":
+            if action["tool"] == "replace":
                 made = self._make_paragraph(index, action) if not action["moved"] else None
+                whole = made is not None
                 if made is None and not action["moved"]:
                     self._update_markup(action["point"], action)
                 if made is None:
@@ -610,6 +729,14 @@ class AnnotController:
                 action["lookup"].close()
                 if made is not None:
                     self.start_editing(index, made, new=True)
+                    editor = self.editing["editor"] if self.editing is not None else None
+                    if editor is not None and whole and "pos" in action:
+                        caret = self._edit_index(action["pos"], inside_only=False)
+                        if caret is not None:
+                            editor.click(caret)         # 點一下整段:游標放在點的位置
+                            editor.release()
+                    elif editor is not None:
+                        editor.select_all()             # 拖曳選的字:整個選起來,可以直接複製或打字取代
                 return
             action["lookup"].close()
             if action["moved"] and action["rects"]:
@@ -624,6 +751,157 @@ class AnnotController:
                 self.add(index, annot)
                 if annot.kind in annots.IMAGES:
                     self.tool, self.pending = "select", None      # 放好後回到選取,可以直接移動、改大小
+
+    def _context(self, pos):
+        """右鍵選單:複製、剪下、貼上、刪除;正在打字時是文字的複製、剪下、貼上。"""
+        if self.editing is not None:
+            editor = self.editing["editor"]
+
+            def key(code):
+                return lambda: editor.handle(pygame.event.Event(pygame.KEYDOWN, key=code, mod=pygame.KMOD_CTRL,
+                                                                unicode=""), self._edit_layout())
+
+            start, end = editor.selection
+            self.menu.open(pos, [("複製", "Ctrl+C", start != end, key(pygame.K_c)),
+                                 ("剪下", "Ctrl+X", start != end, key(pygame.K_x)),
+                                 ("貼上", "Ctrl+V", True, key(pygame.K_v))])
+            return
+        index = self.page_at(pos)
+        found = None
+        if index is not None:
+            annot = self._annot_at(index, self.mapper(index).to_page(pos))
+            if annot is not None and annots.editable(annot):
+                self.selected = (self.pages[index].uid, annot.uid)
+                found = annot
+            elif annot is None:
+                self.selected = None
+        can_copy = found is not None and found.kind not in ("replace", "other")
+        self.menu.open(pos, [("複製", "Ctrl+C", can_copy, self.copy_selected),
+                             ("剪下", "Ctrl+X", can_copy, lambda: self.copy_selected(cut=True)),
+                             ("貼上", "Ctrl+V", True, lambda: self.paste(pos)),
+                             ("刪除", "Delete", found is not None, self.delete_selected)])
+
+    def copy_selected(self, cut=False):
+        """複製選取的註解;圖片(含原檔的圖片)同時放進 Windows 剪貼簿,可以貼到其他程式。"""
+        found = self.selected_annot()
+        if found is None:
+            return
+        index, annot = found
+        if annot.kind in ("replace", "other"):
+            return
+        ref = self.pages[index]
+        if annot.kind == annots.PAGE_IMAGE:
+            data = self._original_picture(ref, annot)
+            if not data:
+                self.page.notify("這張圖片讀不出來，沒辦法複製", theme.WARN)
+                return
+            from PIL import Image
+            import io
+
+            with Image.open(io.BytesIO(data)) as picture:
+                pixels = picture.size
+            annot = annots.Annot("image", box=annot.box, image=data, pixels=pixels,
+                                 color=annots.DEFAULT_COLORS["image"])
+        if annot.image:
+            imageclip.copy_image(annot.image)
+        elif annot.text:
+            widgets.copy_to_clipboard(annot.text)
+        self._clip = dict(annot=annot, page_uid=ref.uid, sequence=imageclip.sequence())
+        if cut:
+            self.delete_selected()
+        else:
+            self.page.notify(f"已複製{annots.LABELS[annot.kind]}", theme.ACCENT)
+
+    def _original_picture(self, ref, annot):
+        """原檔圖片的原始像素(PNG);讀不到原始資料時(例如圖片在頁面上轉過)改用畫出來的圖。"""
+        source = self._source_pdf(ref)
+        if source is not None:
+            try:
+                data = pdfwrite.page_image(source.pages[ref.index], annot.number)
+            except Exception:
+                data = None
+            if data:
+                return data
+        doc = self.page.docs.get(ref.source) if ref.kind == "pdf" else None
+        try:
+            return pdfium.image_png(doc, ref.index, annot.number, max_side=None) if doc is not None else b""
+        except Exception:
+            return b""
+
+    def _paste_place(self, pos):
+        """貼上的位置:(頁面索引, 頁面座標);滑鼠在頁面上就貼在滑鼠那裡。"""
+        pos = pos or pygame.mouse.get_pos()
+        index = self.page_at(pos) if self.page.view_rect.collidepoint(pos) else None
+        if index is not None:
+            return index, self.mapper(index).to_page(pos)
+        return None, None
+
+    def paste(self, pos=None):
+        """貼上:剪貼簿還是自己複製的註解就貼那個,否則看剪貼簿裡是圖片還是文字。"""
+        if not self.pages:
+            return False
+        index, point = self._paste_place(pos)
+        clip = self._clip
+        if clip is not None and clip["sequence"] == imageclip.sequence():
+            annot = clip["annot"]
+            source = self.index_of(clip["page_uid"])
+            if index is None:
+                index = source if source is not None else self.page.current_index()
+                dx = dy = PASTE_OFFSET
+            else:
+                x0, y0, x1, y1 = annots.bounds(annot)
+                dx, dy = point[0] - (x0 + x1) / 2, point[1] - (y0 + y1) / 2
+            copy = annots.moved(replace(annot, uid=next(annots._ids), origin=-1, subtype=""), dx, dy)
+            self.add(index, copy)
+            self._clip = dict(clip, annot=copy)             # 連續貼上時一個接一個往下排
+            self.tool = "select"
+            return True
+        if index is None:
+            index = self.page.current_index()
+            width, height = self.pages[index].size
+            point = (width / 2, height / 2)
+        data = imageclip.paste_image()
+        if data:
+            from PIL import Image
+            import io
+
+            with Image.open(io.BytesIO(data)) as picture:
+                pixels = picture.size
+            width, height = pixels[0] * 72 / IMAGE_DPI, pixels[1] * 72 / IMAGE_DPI
+            page_w, page_h = self.pages[index].size
+            fit = min(1.0, page_w * 0.8 / width, page_h * 0.8 / height)
+            width, height = width * fit, height * fit
+            left = max(0.0, min(page_w - width, point[0] - width / 2))
+            top = max(0.0, min(page_h - height, point[1] - height / 2))
+            self.add(index, annots.create("image", box=(left, top, left + width, top + height), image=data,
+                                          pixels=pixels, **self.style("image")))
+            self.tool = "select"
+            return True
+        text = widgets._clipboard_text().strip()
+        if text:
+            font = self.textbox_font()
+            if font is None:
+                return True
+            page_w = self.pages[index].size[0]
+            left = max(4.0, min(page_w - TEXTBOX_W - 4, point[0]))
+            style = dict(self.style("textbox"), font=font)
+            box = (left, point[1], left + TEXTBOX_W, point[1] + 20)
+            self.add(index, self.fit(annots.create("textbox", box=box, text=text, **style)))
+            self.tool = "select"
+            return True
+        self.page.notify("剪貼簿裡沒有可以貼上的圖片或文字", theme.WARN)
+        return True
+
+    def _page_picture(self, index, annot):
+        """原檔圖片的內容(PNG);拖曳時頁面先不畫它,由編輯器畫在滑鼠的位置。"""
+        ref = self.pages[index]
+        doc = self.page.docs.get(ref.source) if ref.kind == "pdf" else None
+        if annot.kind != annots.PAGE_IMAGE or doc is None:
+            return b""
+        try:
+            return pdfium.image_png(doc, ref.index, annot.number)
+        except Exception:
+            return b""
 
     def _make_replace(self, index, action):
         """選好的原字 → 改字:字級、顏色、字型盡量和原字一樣,底色取原字周圍的顏色,新文字的底線對齊原字。"""
@@ -780,7 +1058,7 @@ class AnnotController:
         if kind in ("rect", "ellipse"):
             return make(kind, box=box, **style) if big_enough else None
         if kind == "ink":
-            return make("ink", points=(tuple(action["stroke"]),), **style)
+            return make("ink", points=(geometry.smooth_stroke(action["stroke"], 1.5 / scale),), **style)
         if kind in annots.IMAGES and self.pending is not None:
             return make(kind, box=self._image_box(action, big_enough), image=self.pending["image"],
                         pixels=self.pending["pixels"], **style)
@@ -863,23 +1141,53 @@ class AnnotController:
         self.bar_rect = rect
         rounded_panel(screen, rect, theme.PANEL, radius=0, alpha=240)
         pygame.draw.line(screen, theme.PANEL_EDGE, (rect.x, rect.bottom - 1), (rect.right, rect.bottom - 1))
+        self._draw_tools(rect, mouse_pos)
+        self._draw_settings(pygame.Rect(rect.x + 12, rect.y + 46, rect.width - 24, 32), mouse_pos)
+
+    def _draw_tools(self, rect, mouse_pos):
+        """工具按鈕平常只有圖示;滑過時文字往右拉開、後面的按鈕跟著往右推,選取的工具文字一直顯示。"""
+        screen = self.page.screen
+        now = pygame.time.get_ticks()
+        step = min(1.0, max(0.0, (now - self._bar_tick) / 1000) * GROW_SPEED)
+        self._bar_tick = now
+        busy = self.palette.is_open or self.menu.is_open or any(menu.is_open for menu, _ in self._menus)
+        under = self._tool_at(mouse_pos) if rect.collidepoint(mouse_pos) and not busy else None
+        if under != self._hover_at[0]:
+            self._hover_at = (under, now)
+        # 停一下才拉開;已經拉開的工具在滑鼠還在它上面時保持拉開
+        if under is None or under == self._hover_tool or now - self._hover_at[1] >= HOVER_MS:
+            self._hover_tool = under
         x, y = rect.x + 12, rect.y + 8
-        self.tool_rects = []
-        # 視窗窄時縮小按鈕左右的空白,14 個工具在最小的 960 寬也放得下
-        widths = [theme.font(13).size(label)[0] for _, label in TOOLS]
-        room = rect.width - 24 - 4 * (len(TOOLS) - 1) - sum(widths)
-        pad = max(10, min(22, room // len(TOOLS)))
-        for (key, label), text_w in zip(TOOLS, widths):
-            box = pygame.Rect(x, y, text_w + pad, 30)
+        items, self.tool_rects, self._tool_shown = [], [], {}
+        for key, label in TOOLS:
+            extra = theme.font(13).size(label)[0] + 12
+            chosen, shown = self._grow.get(key, (0.0, 0.0))
+            chosen += ((1.0 if key == self.tool else 0.0) - chosen) * step
+            shown += ((1.0 if key in (self.tool, self._hover_tool) else 0.0) - shown) * step
+            chosen, shown = (round(v, 3) if abs(v - round(v)) > 0.01 else float(round(v)) for v in (chosen, shown))
+            self._grow[key] = (chosen, shown)
+            full = pygame.Rect(x, y, ICON_BOX + round(extra * max(chosen, shown)), TOOL_H)
+            items.append((key, label, full))
+            self.tool_rects.append((key, full))
+            self._tool_shown[key] = full
+            x = full.right + 4
+        for key, label, full in items:
             active = key == self.tool
             if active:
-                rounded_panel(screen, box, tuple(int(c * 0.3) for c in self.accent), radius=7, border=self.accent)
-            elif box.collidepoint(mouse_pos):
-                rounded_panel(screen, box, theme.PANEL_LIGHT, radius=7)
-            draw_text(screen, label, box.center, 13, self.accent if active else theme.TEXT, center=True)
-            self.tool_rects.append((key, box))
-            x = box.right + 4
-        self._draw_settings(pygame.Rect(rect.x + 12, rect.y + 46, rect.width - 24, 32), mouse_pos)
+                rounded_panel(screen, full, tuple(int(c * 0.3) for c in self.accent), radius=7, border=self.accent)
+            elif key == self._hover_tool:
+                rounded_panel(screen, full, theme.PANEL_LIGHT, radius=7, border=theme.TEXT_FAINT)
+            else:
+                rounded_panel(screen, full, theme.BG_DEEP, radius=7, alpha=160, border=theme.PANEL_EDGE)
+            color = self.accent if active else theme.TEXT
+            picture = icons.icon(key, ICON_SIZE, color)
+            if picture is not None:
+                screen.blit(picture, (full.x + (ICON_BOX - ICON_SIZE) // 2, full.centery - ICON_SIZE // 2))
+            if full.width > ICON_BOX + 4:
+                clip = screen.get_clip()
+                screen.set_clip(full.inflate(-4, 0).clip(clip))
+                self._label(label, full.x + ICON_BOX - 4, full.centery, color)
+                screen.set_clip(clip)
 
     def _label(self, text, x, cy, color=theme.TEXT_DIM):
         return draw_text(self.page.screen, text, (x, cy - theme.font(13).get_height() // 2), 13, color)
@@ -951,14 +1259,15 @@ class AnnotController:
             self._menus.append((self.width_menu, "width"))
             x += menu_w + 12
         if kind != "note":
-            if kind not in ("replace", "redact"):          # 塗黑一定要完全不透明
+            if kind not in ("replace", "redact", annots.PAGE_IMAGE):          # 塗黑一定要完全不透明
                 x = self._label("透明度", x, cy).right + 6
                 self._sync(self.opacity_menu, OPACITY_OPTIONS, values["opacity"],
                            lambda v: f"{round((1 - v) * 100)}%")
                 self.opacity_menu.draw(screen, pygame.Rect(x, cy - 15, 76, 30), mouse_pos)
                 self._menus.append((self.opacity_menu, "opacity"))
                 x += 88
-        hint = TOOL_HINTS.get(kind) if kind == self.tool and self.selected is None else None
+        chosen = kind == self.tool and self.selected is None
+        hint = TOOL_HINTS.get(kind) if chosen or kind == annots.PAGE_IMAGE else None
         if hint and row.right - x > 120:
             draw_text(screen, widgets.clip_text(hint, 12, row.right - x), (x, cy - 8), 12, theme.TEXT_FAINT)
 
@@ -966,6 +1275,7 @@ class AnnotController:
         for menu, _ in self._menus:
             menu.draw_menu(self.page.screen, mouse_pos)
         self.palette.draw(self.page.screen, mouse_pos)
+        self.menu.draw(self.page.screen, mouse_pos)
 
     # ------------------------------------------------------------ 繪製:頁面上的註解
 
@@ -978,6 +1288,8 @@ class AnnotController:
         if action is not None and action["type"] in ("move", "resize") and action["index"] < len(self.pages) \
                 and self.pages[action["index"]].uid == ref.uid and action["preview"] != action["annot"]:
             candidates.append(action["annot"])
+            if action["annot"].kind == annots.PAGE_IMAGE and action["picture"]:
+                return (("image", action["annot"].number),)
         if self.editing is not None and self.editing["page_uid"] == ref.uid:
             candidates.append(self.editing["original"])
         originals = set(ref.originals)
@@ -985,12 +1297,16 @@ class AnnotController:
 
     def _items(self, index, ref):
         originals = set(ref.originals)
-        items = [a for a in ref.annots if not (a.origin >= 0 and a in originals)]
+        # 原檔的圖片由 PDFium 畫(移動過的也是),只有拖曳中才由這裡畫
+        items = [a for a in ref.annots if not (a.origin >= 0 and a in originals) and a.kind != annots.PAGE_IMAGE]
         swap = {}
         action = self.action
         if action is not None and action["type"] in ("move", "resize") and action["index"] == index \
                 and action["preview"] != action["annot"]:
-            swap[action["annot"].uid] = action["preview"]
+            preview = action["preview"]
+            if preview.kind == annots.PAGE_IMAGE:
+                preview = replace(preview, image=action["picture"])
+            swap[action["annot"].uid] = preview
         if self.editing is not None and self.editing["page_uid"] == ref.uid:
             live = self.fit(replace(self.editing["annot"], text=self.editing["editor"].shown()))
             swap[live.uid] = live
@@ -1012,9 +1328,13 @@ class AnnotController:
         action = self.action
         if action is not None and action["index"] == index:
             if action["type"] == "markup":
-                annot_view.draw_markup_preview(screen, mapper, self.tool, action["rects"],
-                                               self.accent if self.tool in ("replace", "redact")
-                                               else self.settings[self.tool]["color"])
+                tool = action["tool"]
+                annot_view.draw_markup_preview(screen, mapper, tool, action["rects"],
+                                               self.accent if tool in ("replace", "redact")
+                                               else self.settings[tool]["color"])
+            elif action["type"] == "move":
+                for a, b in action.get("guides", ()):
+                    self._dashed(screen, mapper.point(a), mapper.point(b))
             elif action["type"] == "create":
                 if action["kind"] == "textbox":
                     (x0, y0), (x1, y1) = action["start"], action["current"]
@@ -1024,7 +1344,7 @@ class AnnotController:
                     preview = self._created(action)
                     if preview is not None:
                         annot_view.draw_annot(screen, mapper, preview, self.cache)
-        if self.tool == "replace" and action is None and self.editing is None:
+        if self.tool == "select" and action is None and self.editing is None and not self.menu.is_open:
             self._draw_paragraph_hover(index, mapper)
         found = self.selected_annot()
         if self.editing is not None and self.editing["page_uid"] == ref.uid:
@@ -1035,12 +1355,26 @@ class AnnotController:
             annot_view.draw_selection(screen, mapper, shown, self.accent,
                                       handles=annots.editable(shown) and action is None)
 
+    def _dashed(self, screen, a, b):
+        """對齊線:虛線。"""
+        length = math.hypot(b[0] - a[0], b[1] - a[1])
+        if length < 1:
+            return
+        ux, uy = (b[0] - a[0]) / length, (b[1] - a[1]) / length
+        for start in range(0, int(length), 8):
+            end = min(length, start + 5)
+            pygame.draw.line(screen, self.accent, (a[0] + ux * start, a[1] + uy * start),
+                             (a[0] + ux * end, a[1] + uy * end), 1)
+
     def _draw_paragraph_hover(self, index, mapper):
-        """改字工具:滑鼠移到文字上時框出會被修改的那一段。"""
+        """選取工具:滑鼠移到文字上時框出點下去會修改的那一段(滑鼠在註解上時不框)。"""
         mouse = pygame.mouse.get_pos()
         if not mapper.rect.collidepoint(mouse) or not self.page.view_rect.collidepoint(mouse):
             return
         point = mapper.to_page(mouse)
+        other = self._annot_at(index, point, images=False)
+        if other is not None and other.kind != "replace":
+            return
         done = next((a for a in reversed(self.pages[index].annots)
                      if a.kind == "replace" and annots.hit(a, point, 3 / mapper.scale)), None)
         if done is not None:

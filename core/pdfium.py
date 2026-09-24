@@ -87,14 +87,94 @@ def _apply_hidden(doc, page, index, hidden):
             raw.FPDFPage_CloseAnnot(handle)
 
 
-def render(doc, index, scale, rotation=0, crop=(0, 0, 0, 0), hidden=()):
+def _image_objects(page):
+    """頁面最上層的圖片物件(不含表單裡面的),依內容的先後順序;第幾個就是編輯器記的圖片編號。"""
+    import pypdfium2.raw as raw
+
+    found = []
+    for number in range(raw.FPDFPage_CountObjects(page.raw)):
+        obj = raw.FPDFPage_GetObject(page.raw, number)
+        if raw.FPDFPageObj_GetType(obj) == raw.FPDF_PAGEOBJ_IMAGE:
+            found.append(obj)
+    return found
+
+
+def _bounds(obj):
+    import ctypes
+
+    import pypdfium2.raw as raw
+
+    values = [ctypes.c_float() for _ in range(4)]
+    raw.FPDFPageObj_GetBounds(obj, *[ctypes.byref(v) for v in values])
+    return tuple(v.value for v in values)
+
+
+def page_images(doc, index):
+    """第 index 頁上的圖片:[(編號, (左, 下, 右, 上))],使用者座標。"""
+    with LOCK:
+        page = doc[index]
+        try:
+            return [(number, _bounds(obj)) for number, obj in enumerate(_image_objects(page))]
+        finally:
+            page.close()
+
+
+def image_png(doc, index, number, max_side=1600):
+    """第 index 頁第 number 張圖片畫成 PNG(含透明);長邊最多 max_side 像素,拖曳預覽用小一點,複製時給 None 取原解析度。"""
+    import io
+
+    with LOCK:
+        page = doc[index]
+        try:
+            objects = _image_objects(page)
+            if number >= len(objects):
+                return b""
+            import pypdfium2 as pdfium_lib
+
+            image = pdfium_lib.PdfImage(objects[number], page=page, pdf=doc)
+            bitmap = image.get_bitmap(render=True, scale_to_original=True)
+            picture = bitmap.to_pil().convert("RGBA").copy()
+            bitmap.close()
+        finally:
+            page.close()
+    if max_side and max(picture.size) > max_side:
+        picture.thumbnail((max_side, max_side))
+    buffer = io.BytesIO()
+    picture.save(buffer, "PNG")
+    return buffer.getvalue()
+
+
+def _apply_images(page, edits):
+    """編輯器移動、縮放、刪除過的圖片:只改這次載入的頁面(關掉頁面就還原),原檔不動。
+    edits:[(編號, 新的範圍 (左, 下, 右, 上) 或 None 表示刪除)]。"""
+    import pypdfium2.raw as raw
+
+    objects = _image_objects(page)
+    for number, box in edits:
+        if number >= len(objects):
+            continue
+        obj = objects[number]
+        if box is None:
+            if raw.FPDFPage_RemoveObject(page.raw, obj):
+                raw.FPDFPageObj_Destroy(obj)
+            continue
+        left, bottom, right, top = _bounds(obj)
+        if right - left <= 0 or top - bottom <= 0:
+            continue
+        sx, sy = (box[2] - box[0]) / (right - left), (box[3] - box[1]) / (top - bottom)
+        raw.FPDFPageObj_Transform(obj, sx, 0, 0, sy, box[0] - left * sx, box[1] - bottom * sy)
+
+
+def render(doc, index, scale, rotation=0, crop=(0, 0, 0, 0), hidden=(), images=()):
     """把第 index 頁(從 0 起算)畫成 RGB 圖片;scale 為 1 時 1 點 = 1 像素。
     rotation 是在頁面原本方向上再轉的角度;crop 是旋轉後從左、下、右、上各切掉多少點(只畫看得到的範圍時用);
-    hidden 是這次不要畫的註解編號(被編輯器改過或刪掉的原註解)。"""
+    hidden 是這次不要畫的註解編號(被編輯器改過或刪掉的原註解);images 是移動、刪除過的圖片(見 _apply_images)。"""
     with LOCK:
         page = doc[index]
         try:
             _apply_hidden(doc, page, index, hidden)
+            if images:
+                _apply_images(page, images)
             bitmap = page.render(scale=scale, rotation=rotation, crop=crop)
             # to_pil 和點陣圖共用記憶體,複製一份再釋放,之後在鎖外面使用才安全
             image = bitmap.to_pil().convert("RGB").copy()
@@ -154,6 +234,14 @@ class TextLookup:
             if distance < best_distance:
                 best, best_distance = i, distance
         return best
+
+    def on_text(self, x, y, tolerance=1.5):
+        """(x, y) 是不是剛好在字上(不找附近的字);選取工具用來分辨點的是文字還是空白處。"""
+        if not self.count:
+            return False
+        with LOCK:
+            found = self.text.get_index(x, y, tolerance, tolerance)
+        return found is not None and found >= 0
 
     def rects(self, first, last):
         """第 first 到 last 個字(含)占的範圍,同一行合併成一個 (左, 下, 右, 上)。"""

@@ -4,6 +4,7 @@
 文字框的字型只嵌入用到的字(子集),可變字型固定成一般字重。
 """
 
+import decimal
 import hashlib
 import io
 import math
@@ -43,6 +44,7 @@ class FontEmbedder:
         self.entries = {}
         self.images = {}            # 同一張圖(例如同一個簽名蓋在很多頁)只存一份
         self.kept_text = 0          # 改字時字型沒把握、只被蓋住沒刪掉的文字段數
+        self.kept_images = 0        # 原檔圖片的內容太特殊,沒能照編輯器移動、刪除的張數
 
     def _entry(self, face):
         entry = self.entries.get(face.id)
@@ -507,9 +509,115 @@ def _redact(pdf, page, ref, items, embedder):
     page.contents_add(pikepdf.Stream(pdf, ("Q\n" + "\n".join(commands) + "\n").encode("latin-1")), prepend=False)
 
 
+def _walk_images(page):
+    """依序走過頁面最上層的內容:[(指令, 當時的座標矩陣, 圖片編號或 None, 圖片物件或 None)]。
+    圖片編號和 core.pdfium 一樣是最上層的第幾張圖片(含內嵌圖片);內嵌圖片沒有圖片物件。"""
+    node, resources = page.obj, None
+    while node is not None and resources is None:
+        resources = node.get("/Resources")
+        node = node.get("/Parent")
+    xobjects = resources.get("/XObject") if resources is not None else None
+    ctm, stack, number, result = geometry.IDENTITY, [], 0, []
+    for item in pikepdf.parse_content_stream(page):
+        operator = str(item.operator)
+        operands = item.operands
+        if operator == "q":
+            stack.append(ctm)
+        elif operator == "Q":
+            ctm = stack.pop() if stack else geometry.IDENTITY
+        elif operator == "cm" and len(operands) == 6:
+            ctm = geometry.compose(tuple(float(v) for v in operands), ctm)
+        target = None
+        is_image = operator == "INLINE IMAGE"
+        if operator == "Do" and operands and xobjects is not None:
+            target = xobjects.get(operands[0])
+            is_image = target is not None and str(target.get("/Subtype", "")) == "/Image"
+        if is_image:
+            result.append((item, ctm, number, target))
+            number += 1
+        else:
+            result.append((item, ctm, None, None))
+    return result
+
+
+def page_image(page, number):
+    """原檔第 number 張圖片的原始像素(PNG,含透明);圖片在頁面上轉過或翻過、讀不到時回傳 None。"""
+    for item, ctm, found, target in _walk_images(page):
+        if found != number:
+            continue
+        a, b, c, d, _, _ = ctm
+        if abs(b) > 1e-6 or abs(c) > 1e-6 or a <= 0 or d <= 0:
+            return None
+        try:
+            if target is None:
+                picture = item.operands[0].as_pil_image()
+            else:
+                picture = pikepdf.PdfImage(target).as_pil_image()
+                if "/SMask" in target:
+                    alpha = pikepdf.PdfImage(target.SMask).as_pil_image().convert("L")
+                    picture = picture.convert("RGBA")
+                    picture.putalpha(alpha.resize(picture.size))
+            if picture.mode not in ("RGB", "RGBA", "L", "LA"):
+                picture = picture.convert("RGB")
+            buffer = io.BytesIO()
+            picture.save(buffer, "PNG")
+            return buffer.getvalue()
+        except Exception:
+            return None
+    return None
+
+
+def _edit_images(pdf, page, ref, edits):
+    """移動、縮放、刪除原檔的圖片:直接改頁面內容,圖片本身的資料不動(畫質不變)。
+    編號和 core.pdfium 一樣是頁面最上層的第幾張圖片(含內嵌圖片);找到的位置和編輯器記的對不上時不動它。
+    回傳沒改到的張數。"""
+    to_user = geometry.ref_to_user(ref)
+    before = {annot.number: geometry.transform_box(to_user, annot.box)
+              for annot in ref.originals if annot.kind == annots.PAGE_IMAGE}
+    wanted = {number: (before.get(number), geometry.transform_box(to_user, box) if box is not None else None)
+              for number, box in edits}
+    done, result, removed = set(), [], set()
+    for item, ctm, number, target in _walk_images(page):
+        if number is not None:
+            old, new = wanted.get(number, (None, None))
+            box = geometry.transform_box(ctm, (0.0, 0.0, 1.0, 1.0))
+            if old is not None and max(abs(a - b) for a, b in zip(box, old)) <= 1.0:
+                done.add(number)
+                if new is None:
+                    if target is not None:
+                        removed.add(str(item.operands[0]))
+                    continue            # 刪除
+                sx = (new[2] - new[0]) / (box[2] - box[0]) if box[2] > box[0] else 1.0
+                sy = (new[3] - new[1]) / (box[3] - box[1]) if box[3] > box[1] else 1.0
+                shift = (sx, 0.0, 0.0, sy, new[0] - box[0] * sx, new[1] - box[1] * sy)
+                # 在目前的座標系裡多套一層:最後的位置 = 原本的位置再移動、縮放到新的範圍
+                matrix = geometry.compose(geometry.compose(ctm, shift), geometry.invert(ctm))
+                result.append(([], pikepdf.Operator("q")))
+                result.append(([decimal.Decimal(f"{v:.6f}") for v in matrix], pikepdf.Operator("cm")))
+                result.append(item)
+                result.append(([], pikepdf.Operator("Q")))
+                continue
+        result.append(item)
+    if done:
+        page.obj.Contents = pdf.make_stream(pikepdf.unparse_content_stream(result))
+        # 刪掉的圖片沒有再用到的話從資源拿掉,存檔後檔案裡就不會留著那張圖
+        used = {str(item.operands[0]) for item in result
+                if not isinstance(item, tuple) and str(item.operator) == "Do" and item.operands}
+        unused = [name for name in removed if name not in used]
+        if unused:
+            xobjects = redact.own_resources(pdf, page).XObject
+            for name in unused:
+                if name in xobjects:
+                    del xobjects[name]
+    return len(wanted) - len(done)
+
+
 def write_page(pdf, page, ref, embedder):
     """把頁面上的註解整理好:沒改過的原註解照原樣保留,改過或刪掉的拿掉,新的註解依目前資料產生。
-    改字不是註解,直接改寫頁面內容。"""
+    改字不是註解,直接改寫頁面內容;移動、刪除過的原檔圖片也是。"""
+    edits = annots.image_edits(ref)
+    if edits:
+        embedder.kept_images += _edit_images(pdf, page, ref, edits)
     replaced = [annot for annot in ref.annots if annot.kind == "replace"]
     if replaced:
         _replace_text(pdf, page, ref, replaced, embedder)
@@ -541,7 +649,8 @@ def write_page(pdf, page, ref, embedder):
             parent.Popup = popup
             result.append(popup)
     for annot in ref.annots:
-        if annot.kind in ("other", "replace", "redact") or (annot.origin >= 0 and annot.origin in kept_origins):
+        if annot.kind in ("other", "replace", "redact", annots.PAGE_IMAGE) \
+                or (annot.origin >= 0 and annot.origin in kept_origins):
             continue
         result.append(build_annot(pdf, page, ref, annot, embedder))
     if result:

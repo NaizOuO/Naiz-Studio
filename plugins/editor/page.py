@@ -1,5 +1,6 @@
 """PDF 編輯器(v1.11.0 檢視與頁面管理):左邊頁面縮圖,中間所有頁面連續捲動;可以排序、旋轉、刪除、插入、擷取頁面。"""
 
+import os
 import threading
 from pathlib import Path
 
@@ -88,6 +89,7 @@ class EditorPage(Page):
         self.btn_insert = Button("插入檔案", filled=False, size=13)
         self.btn_extract = Button("擷取選取的頁面", filled=False, size=13)
         self.btn_save_as = Button("選擇位置儲存", filled=False, size=13)
+        self.btn_output = Button("輸出資料夾", filled=False, size=13)
         self.btn_empty_open = Button("選擇 PDF 檔案", accent=accent, size=15)
         self.annot = AnnotController(self)
 
@@ -402,6 +404,9 @@ class EditorPage(Page):
                 if report.get("kept_text"):
                     self.notify(f"已儲存成「{path.name}」；有 {report['kept_text']} 段原字的字型比較特殊，"
                                 f"只被底色蓋住、沒有真正刪掉", theme.WARN)
+                elif report.get("kept_images"):
+                    self.notify(f"已儲存成「{path.name}」；有 {report['kept_images']} 張圖片的內容比較特殊，"
+                                f"維持在原本的位置", theme.WARN)
                 else:
                     merged = "，註解已合併到頁面" if flatten else ""
                     self.notify(f"已儲存成「{path.name}」{merged}，接下來編輯這份新檔", theme.ACCENT)
@@ -738,6 +743,10 @@ class EditorPage(Page):
         rounded_panel(screen, rect, theme.PANEL, radius=0, alpha=245)
         pygame.draw.line(screen, theme.PANEL_EDGE, (rect.x, rect.y), (rect.right, rect.y))
         x = rect.x + 16
+        right = rect.right - 16
+        # 和其他工具一樣,右下角可以直接打開輸出資料夾
+        self.btn_output.draw(screen, pygame.Rect(right - 104, rect.y + 7, 104, 32), mouse_pos)
+        right -= 112
         if self.path is None:
             draw_text(screen, "還沒有開啟檔案", (x, rect.y + 14), 13, theme.TEXT_FAINT)
             return
@@ -747,7 +756,6 @@ class EditorPage(Page):
             info += " · 有尚未儲存的變更"
         draw_text(screen, info, (name.right + 12, rect.y + 14), 13,
                   theme.WARN if self.history.dirty else theme.TEXT_DIM)
-        right = rect.right - 16
         self.btn_save_as.enabled = not self.busy and winfile.available()
         self.btn_save_as.draw(screen, pygame.Rect(right - 118, rect.y + 7, 118, 32), mouse_pos)
         hint = draw_text(screen, "「儲存」預設存到 output\\editor\\", (right - 130, rect.y + 23), 12,
@@ -959,7 +967,14 @@ class EditorPage(Page):
         if not self.selected and self.pages:
             self.selected = {self.pages[min(self.current_index(), len(self.pages) - 1)].uid}
 
+    def open_output(self):
+        output_dir().mkdir(parents=True, exist_ok=True)
+        os.startfile(output_dir())
+
     def _click(self, pos):
+        if self.btn_output.clicked(pos, True):
+            self.open_output()
+            return
         if self.path is None:
             if self.btn_empty_open.clicked(pos, True):
                 self.ask_open_file()

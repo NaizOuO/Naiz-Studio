@@ -11,7 +11,7 @@ from PIL import Image
 
 from core import pdfium
 
-from . import annots, ops
+from . import annots, geometry, ops
 
 CACHE_BYTES = 200 * 1024 * 1024
 MAX_PIXELS = 8_000_000      # 整頁畫出來超過這麼多像素(約 30MB)時,改成只畫看得到的範圍;A4 放大到 300% 左右開始
@@ -39,11 +39,15 @@ class PageRenderer:
 
     @staticmethod
     def key(ref, scale, crop=None, extra=()):
-        # 被改過或刪掉的原註解不給 PDFium 畫(extra 是正在拖曳、編輯的);藏起來的註解不同時要重畫
+        # 被改過或刪掉的原註解不給 PDFium 畫(extra 是正在拖曳、編輯的);藏起來的註解不同時要重畫。
+        # extra 裡的 ("image", 編號) 是正在拖曳的原檔圖片,先不畫,改由編輯器畫在滑鼠的位置
         hidden = annots.hidden_origins(ref)
-        if extra:
-            hidden = tuple(sorted(set(hidden) | set(extra)))
-        return identity(ref) + (round(scale, 4), crop, hidden)
+        numbers = [item for item in extra if isinstance(item, int)]
+        if numbers:
+            hidden = tuple(sorted(set(hidden) | set(numbers)))
+        edits = dict(annots.image_edits(ref))
+        edits.update((item[1], None) for item in extra if isinstance(item, tuple))
+        return identity(ref) + (round(scale, 4), crop, hidden, tuple(sorted(edits.items())))
 
     def clear(self):
         """換檔案時清掉所有圖;還在畫的舊圖畫完也不會放進來。"""
@@ -107,10 +111,13 @@ class PageRenderer:
         self._images.move_to_end(path)
         return image
 
-    def _draw(self, ref, scale, crop, hidden=()):
+    def _draw(self, ref, scale, crop, hidden=(), edits=()):
         if ref.kind == "pdf":
+            to_user = geometry.ref_to_user(ref)
+            images = [(number, geometry.transform_box(to_user, box) if box is not None else None)
+                      for number, box in edits]
             return pdfium.render(self.docs[ref.source], ref.index, scale, rotation=ref.rotation,
-                                 crop=crop or (0, 0, 0, 0), hidden=hidden)
+                                 crop=crop or (0, 0, 0, 0), hidden=hidden, images=images)
         shown_w, shown_h = ref.shown_size
         left, bottom, right, top = crop or (0, 0, 0, 0)
         size = (max(1, round((shown_w - left - right) * scale)), max(1, round((shown_h - top - bottom) * scale)))
@@ -135,7 +142,7 @@ class PageRenderer:
                 self._busy = key
                 generation = self._generation
             try:
-                image = self._draw(ref, scale, crop, key[-1])
+                image = self._draw(ref, scale, crop, key[-2], key[-1])
                 result = (image.width, image.height, image.convert("RGB").tobytes())
                 with self._cond:
                     if generation == self._generation:

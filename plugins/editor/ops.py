@@ -77,9 +77,13 @@ def page_refs(doc, path, password=None, data=None):
     """PDF 每一頁的頁面資料(含原本的註解)。"""
     infos = [pdfium.page_info(doc, index) for index in range(pdfium.page_count(doc))]
     found = read_annotations(path, password, infos, data)
-    return [model.new_ref("pdf", source=str(path), index=index, size=size, base_rotation=rotation, origin=origin,
-                          annots=found[index], originals=found[index])
-            for index, (size, rotation, origin) in enumerate(infos)]
+    refs = []
+    for index, (size, rotation, origin) in enumerate(infos):
+        # 原檔的圖片放在最前面:點選時註解優先,圖片在最底下
+        items = annots.page_images(pdfium.page_images(doc, index), size, rotation, origin) + found[index]
+        refs.append(model.new_ref("pdf", source=str(path), index=index, size=size, base_rotation=rotation,
+                                  origin=origin, annots=items, originals=items))
+    return refs
 
 
 def load_image(path):
@@ -114,7 +118,8 @@ def _image_pdf(path):
 def build(pages, out_path, passwords=None, progress=None, cancel=None, flatten=False, sources=None, report=None):
     """依頁面清單產生新的 PDF;先寫暫存檔,完成才換成正式檔名。存檔後不會保留原檔的密碼。
     flatten 為 True 時把註解合併到頁面內容;sources 是已經讀進記憶體的來源檔(路徑 → 內容)。
-    report 是 dict 的話會填入 kept_text:改字時沒辦法真正刪掉、只被蓋住的文字段數。"""
+    report 是 dict 的話會填入 kept_text:改字時沒辦法真正刪掉、只被蓋住的文字段數;
+    kept_images:原檔圖片的內容太特殊、沒能移動或刪除的張數。"""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     passwords = passwords or {}
@@ -149,6 +154,7 @@ def build(pages, out_path, passwords=None, progress=None, cancel=None, flatten=F
             embedder.finish()
             if report is not None:
                 report["kept_text"] = embedder.kept_text
+                report["kept_images"] = embedder.kept_images
             if flatten:
                 for page in dst.pages:
                     pdfwrite.flatten_page(dst, page)

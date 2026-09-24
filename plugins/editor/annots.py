@@ -12,6 +12,9 @@ from . import geometry
 MARKUP = ("highlight", "underline", "strike")
 SHAPES = ("line", "arrow", "rect", "ellipse", "ink")
 IMAGES = ("image", "signature")     # 插入的圖片、簽名:存成圖章註解,外觀就是那張圖
+PAGE_IMAGE = "pageimage"            # 原檔頁面上本來就有的圖片:可以移動、縮放、刪除,儲存時直接改頁面內容
+MIN_PAGE_IMAGE = 8.0                # 比這個小(點)的圖通常是線條或裝飾,不讓它被選到
+SCAN_COVER = 0.85                   # 蓋住整頁這麼多的圖是掃描檔的底圖,不讓它被選到
 TEXTS = ("textbox", "replace")      # 可以打字、排版的種類;改字是「蓋住原字 + 文字框」
 NOTE_SIZE = 20.0
 TEXT_PAD = 4.0
@@ -24,6 +27,7 @@ DEFAULT_COLORS = {     # 和顏色選單裡的標準色一致
     "note": (255, 192, 0), "line": (255, 0, 0), "arrow": (255, 0, 0), "rect": (255, 0, 0),
     "ellipse": (255, 0, 0), "ink": (0, 112, 192), "other": (150, 150, 150),
     "image": (0, 0, 0), "signature": (0, 0, 0), "replace": (0, 0, 0), "redact": (0, 0, 0),
+    PAGE_IMAGE: (0, 0, 0),
 }
 _SUBTYPES = {"Highlight": "highlight", "Underline": "underline", "StrikeOut": "strike", "FreeText": "textbox",
              "Text": "note", "Line": "line", "Square": "rect", "Circle": "ellipse", "Ink": "ink"}
@@ -55,6 +59,7 @@ class Annot:
     wrap: bool = False              # 改字:True 是整段編輯(自動換行),False 是只改幾個字(框跟著字變寬)
     pixels: tuple = ()              # 圖片的像素寬高;改大小時維持這個比例
     origin: int = -1                # 原檔這一頁 /Annots 的第幾個;-1 是在編輯器裡新增的
+    number: int = -1                # 原檔圖片:頁面上的第幾張圖片(core.pdfium 的圖片編號)
     subtype: str = ""               # 原檔的註解類型名稱
 
 
@@ -139,7 +144,7 @@ def handles(annot):
     cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
     if annot.kind in TEXTS:
         return [("w", (x0, cy)), ("e", (x1, cy))]
-    if annot.kind in IMAGES:
+    if annot.kind in IMAGES or annot.kind == PAGE_IMAGE:
         return [("nw", (x0, y0)), ("ne", (x1, y0)), ("se", (x1, y1)), ("sw", (x0, y1))]
     if annot.kind in ("rect", "ellipse", "ink"):
         return [("nw", (x0, y0)), ("n", (cx, y0)), ("ne", (x1, y0)), ("e", (x1, cy)),
@@ -153,7 +158,7 @@ def resized(annot, handle, point):
         first, second = annot.points
         return replace(annot, points=((px, py), second) if handle == "p1" else (first, (px, py)))
     x0, y0, x1, y1 = raw_box(annot)
-    if annot.kind in IMAGES:
+    if annot.kind in IMAGES or annot.kind == PAGE_IMAGE:
         return replace(annot, box=_keep_ratio(annot, handle, point))
     if annot.kind in TEXTS:
         if handle == "w":
@@ -200,6 +205,8 @@ def editable(annot):
 
 def styled(annot, **settings):
     """套用顏色、粗細等設定;不適用這種註解的設定會被略過。"""
+    if annot.kind == PAGE_IMAGE:
+        return annot
     allowed = set() if annot.kind in IMAGES else {"color"}
     if annot.kind in MARKUP or annot.kind in SHAPES or annot.kind in IMAGES or annot.kind == "textbox":
         allowed.add("opacity")
@@ -227,6 +234,35 @@ def hidden_origins(ref):
         return ()
     kept = untouched_origins(ref)
     return tuple(sorted(annot.origin for annot in ref.originals if annot.origin not in kept))
+
+
+def image_edits(ref):
+    """移動、縮放或刪除過的原檔圖片:((編號, 新範圍或 None), ...),範圍是頁面座標;畫頁面和儲存時用。"""
+    current = {annot.uid: annot for annot in ref.annots if annot.kind == PAGE_IMAGE}
+    edits = []
+    for annot in ref.originals:
+        if annot.kind != PAGE_IMAGE:
+            continue
+        now = current.get(annot.uid)
+        if now is None:
+            edits.append((annot.number, None))
+        elif now.box != annot.box:
+            edits.append((annot.number, tuple(round(v, 3) for v in now.box)))
+    return tuple(edits)
+
+
+def page_images(found, size, base_rotation, origin):
+    """core.pdfium.page_images 找到的圖片 → 原檔圖片 Annot;太小的和掃描檔的底圖不列入。"""
+    to_page = geometry.user_to_page(size, base_rotation, origin)
+    page_area = size[0] * size[1]
+    result = []
+    for number, bounds in found:
+        box = geometry.transform_box(to_page, bounds)
+        width, height = box[2] - box[0], box[3] - box[1]
+        if width < MIN_PAGE_IMAGE or height < MIN_PAGE_IMAGE or width * height >= page_area * SCAN_COVER:
+            continue
+        result.append(Annot(PAGE_IMAGE, uid=next(_ids), box=box, number=number, color=DEFAULT_COLORS[PAGE_IMAGE]))
+    return tuple(result)
 
 
 def _color(value, fallback):
@@ -382,4 +418,4 @@ def read_page(page_obj, size, base_rotation, origin):
 
 LABELS = {"highlight": "螢光筆", "underline": "底線", "strike": "刪除線", "textbox": "文字框", "note": "便利貼",
           "line": "直線", "arrow": "箭頭", "rect": "方框", "ellipse": "圓形", "ink": "手繪", "other": "其他註解",
-          "image": "圖片", "signature": "簽名", "replace": "改字", "redact": "塗黑"}
+          "image": "圖片", "signature": "簽名", "replace": "改字", "redact": "塗黑", PAGE_IMAGE: "圖片"}

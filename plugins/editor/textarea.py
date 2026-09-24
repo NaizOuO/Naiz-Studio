@@ -150,6 +150,9 @@ class TextEditor:
                 line = layout.lines[layout.line_of(self.cursor)]
                 self._move(line.start if key == pygame.K_HOME else line.end, shift)
 
+    def select_all(self):
+        self.anchor, self.cursor = 0, len(self.text)
+
     def click(self, index, shift=False):
         now = pygame.time.get_ticks()
         if now - self._last_click[0] < DOUBLE_CLICK_MS and abs(index - self._last_click[1]) <= 1:

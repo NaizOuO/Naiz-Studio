@@ -120,3 +120,22 @@ def distance_to_segment(point, a, b):
     t = 0.0 if length == 0 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length))
     cx, cy = ax + t * dx, ay + t * dy
     return ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
+
+
+def smooth_stroke(points, step):
+    """手繪筆畫修圓:滑鼠取樣的點之間用 Catmull-Rom 曲線補點(曲線會經過原本的每個點),
+    step 是補點的間隔(點);移動太快、取樣太疏時才不會變成多邊形。"""
+    if len(points) < 3:
+        return tuple(points)
+    padded = [points[0]] + list(points) + [points[-1]]
+    result = [points[0]]
+    for i in range(1, len(padded) - 2):
+        p0, p1, p2, p3 = padded[i - 1], padded[i], padded[i + 1], padded[i + 2]
+        length = ((p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2) ** 0.5
+        count = max(1, min(32, int(length / step)))
+        for k in range(1, count + 1):
+            t = k / count
+            t2, t3 = t * t, t * t * t
+            result.append(tuple(0.5 * (2 * p1[j] + (p2[j] - p0[j]) * t + (2 * p0[j] - 5 * p1[j] + 4 * p2[j] - p3[j]) * t2
+                                       + (3 * p1[j] - p0[j] - 3 * p2[j] + p3[j]) * t3) for j in (0, 1)))
+    return tuple(result)

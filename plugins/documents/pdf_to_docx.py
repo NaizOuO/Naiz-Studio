@@ -34,6 +34,7 @@ SCAN_DPI = 150              # 沒有文字的頁面(掃描檔)直接放整頁圖
 MIN_MARGIN = 14.0           # 邊界至少留這麼多點,避免文字貼著紙邊
 COLUMN_TOLERANCE = 8.0      # 左邊界差這麼多點以內就當成同一欄
 OCR_SPLIT_GAP = 1.5         # 辨識出來的詞之間空到這麼多個字寬,就當成表格或分欄的不同格
+MAX_IMAGE_PIXELS = 40_000_000  # 圖片照原解析度取出時的上限(像素),太大的掃描圖縮到這個大小
 VECTOR_DPI = 200            # 圖表(用線條畫出來的)整塊截圖時的解析度
 VECTOR_GAP = 8.0            # 線條相距這麼多點以內就當成同一張圖
 VECTOR_MIN_PATHS = 8        # 這麼多條線以上才當成圖表,不然只是表格框線
@@ -253,10 +254,67 @@ def _group_paragraphs(lines) -> list:
     return blocks
 
 
-def _read_images(document, page, page_height) -> list:
-    """頁面上的圖片:位置與內容(畫成 PNG);座標換成左上角為原點。"""
+def _image_pixels(document, page, obj, width, height):
+    """圖片照原檔的解析度取出(不是照頁面上顯示的大小重畫,放進 Word 才不會糊):回傳 (檔案內容, 是不是 JPEG)。
+    原檔是 JPEG、沒有旋轉翻轉的照片,直接沿用原本的資料,不重新壓縮。"""
     from PIL import Image
 
+    matrix = raw.FS_MATRIX()
+    raw.FPDFPageObj_GetMatrix(obj, ctypes.byref(matrix))
+    upright = abs(matrix.b) < 1e-6 and abs(matrix.c) < 1e-6 and matrix.a > 0 and matrix.d > 0
+    px_w, px_h = ctypes.c_uint(), ctypes.c_uint()
+    raw.FPDFImageObj_GetImagePixelSize(obj, ctypes.byref(px_w), ctypes.byref(px_h))
+    if upright and px_w.value and px_h.value:
+        filters = [_image_filter(obj, i) for i in range(raw.FPDFImageObj_GetImageFilterCount(obj))]
+        metadata = raw.FPDF_IMAGEOBJ_METADATA()
+        raw.FPDFImageObj_GetImageMetadata(obj, page.raw, ctypes.byref(metadata))
+        if filters == ["DCTDecode"] and metadata.colorspace in (raw.FPDF_COLORSPACE_DEVICERGB,
+                                                                raw.FPDF_COLORSPACE_DEVICEGRAY):
+            size = raw.FPDFImageObj_GetImageDataRaw(obj, None, 0)
+            data = (ctypes.c_ubyte * size)()
+            raw.FPDFImageObj_GetImageDataRaw(obj, data, size)
+            return bytes(data), True
+    # 暫時把圖片放大到原本的像素大小再畫(會套用透明遮罩和旋轉),畫完改回來
+    scale = 1.0
+    if px_w.value and px_h.value and width > 0 and height > 0:
+        wide, tall = (px_h.value, px_w.value) if (px_w.value < px_h.value) != (width < height)             else (px_w.value, px_h.value)
+        scale = max(1.0, wide / width, tall / height)
+        scale = min(scale, (MAX_IMAGE_PIXELS / (width * height)) ** 0.5)
+    original = raw.FS_MATRIX(matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f)
+    if scale > 1.0:
+        scaled = raw.FS_MATRIX(matrix.a * scale, matrix.b * scale, matrix.c * scale, matrix.d * scale,
+                               matrix.e * scale, matrix.f * scale)
+        raw.FPDFPageObj_SetMatrix(obj, ctypes.byref(scaled))
+    try:
+        bitmap = raw.FPDFImageObj_GetRenderedBitmap(document.raw, page.raw, obj)
+    finally:
+        if scale > 1.0:
+            raw.FPDFPageObj_SetMatrix(obj, ctypes.byref(original))
+    if not bitmap:
+        return None, False
+    try:
+        stride = raw.FPDFBitmap_GetStride(bitmap)
+        size = (raw.FPDFBitmap_GetWidth(bitmap), raw.FPDFBitmap_GetHeight(bitmap))
+        data = ctypes.string_at(raw.FPDFBitmap_GetBuffer(bitmap), stride * size[1])
+        image = Image.frombuffer("RGBA", size, data, "raw", "BGRA", stride, 1).copy()
+    finally:
+        raw.FPDFBitmap_Destroy(bitmap)
+    if image.getextrema()[3][0] == 255:
+        image = image.convert("RGB")        # 沒有透明的地方就不存透明度,檔案小一點
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    return buffer.getvalue(), False
+
+
+def _image_filter(obj, index):
+    size = raw.FPDFImageObj_GetImageFilter(obj, index, None, 0)
+    buffer = ctypes.create_string_buffer(size)
+    raw.FPDFImageObj_GetImageFilter(obj, index, buffer, size)
+    return buffer.value.decode("latin-1")
+
+
+def _read_images(document, page, page_height) -> list:
+    """頁面上的圖片:位置與內容;座標換成左上角為原點。"""
     results = []
     for index in range(raw.FPDFPage_CountObjects(page.raw)):
         obj = raw.FPDFPage_GetObject(page.raw, index)
@@ -267,20 +325,11 @@ def _read_images(document, page, page_height) -> list:
         width, box_height = right.value - left.value, top.value - bottom.value
         if width < 8 or box_height < 8:
             continue                # 太小的圖通常是線條或裝飾,跳過
-        bitmap = raw.FPDFImageObj_GetRenderedBitmap(document.raw, page.raw, obj)
-        if not bitmap:
+        data, _ = _image_pixels(document, page, obj, width, box_height)
+        if data is None:
             continue
-        try:
-            stride = raw.FPDFBitmap_GetStride(bitmap)
-            size = (raw.FPDFBitmap_GetWidth(bitmap), raw.FPDFBitmap_GetHeight(bitmap))
-            data = ctypes.string_at(raw.FPDFBitmap_GetBuffer(bitmap), stride * size[1])
-            image = Image.frombuffer("RGBA", size, data, "raw", "BGRA", stride, 1).convert("RGB")
-        finally:
-            raw.FPDFBitmap_Destroy(bitmap)
-        buffer = io.BytesIO()
-        image.save(buffer, "PNG")
         results.append(Block("image", page_height - top.value, left.value, right.value,
-                             image=buffer.getvalue(), width=width, height=box_height))
+                             image=data, width=width, height=box_height))
     return results
 
 
