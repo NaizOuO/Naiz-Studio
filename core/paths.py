@@ -15,6 +15,8 @@ IMAGES_DIR = APP_DIR / "images"
 OUTPUT_DIR = APP_DIR / "output"
 PLUGINS_DIR = BUNDLE_DIR / "plugins"
 DEV_DIR = APP_DIR / "dev"
+# 擴充模組:別人寫的或另外下載的工具,放進 exe 旁邊的 mods 資料夾就會出現在首頁
+MODS_DIR = APP_DIR / "mods"
 BIN_DIR = APP_DIR / "bin"
 MODELS_DIR = APP_DIR / "models"
 FONTS_DIR = APP_DIR / "fonts"

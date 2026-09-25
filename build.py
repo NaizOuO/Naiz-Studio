@@ -73,6 +73,11 @@ def main():
     import PyInstaller.__main__
 
     version = sys.argv[1] if len(sys.argv) > 1 else ""
+    sys.path.insert(0, str(ROOT))
+    from core.version import VERSION
+
+    if version and version.lstrip("vV") != VERSION:
+        sys.exit(f"core/version.py 寫的是 {VERSION}，和要打包的 {version} 不同，請先更新")
     dist = ROOT / "dist"
     release = dist / NAME
     exe = release / f"{NAME}.exe"
@@ -98,6 +103,7 @@ def main():
         zf.write(exe, Path(NAME) / exe.name)
         for _, relative in release_files():
             zf.write(release / relative, Path(NAME) / relative)
+        zf.writestr(f"{NAME}/mods/", "")      # 空的擴充模組資料夾,下載的模組解壓縮到這裡
     print(f"\n完成:{release}\n壓縮檔:{archive}({archive.stat().st_size / 1024 / 1024:.1f} MB)")
 
 

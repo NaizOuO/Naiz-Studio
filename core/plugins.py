@@ -19,6 +19,10 @@ class Tool:
     accent = theme.ACCENT
     # 需要額外下載的元件(core.deps.Dependency);缺少時開啟前會先詢問使用者
     requires = ()
+    # 擴充模組填寫:需要的主程式版本(例如 "1.14.4")、模組自己的版本與作者,首頁卡片會顯示
+    min_app = ""
+    version = ""
+    author = ""
 
     def create_page(self, app):
         raise NotImplementedError

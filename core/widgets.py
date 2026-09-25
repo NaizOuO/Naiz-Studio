@@ -7,12 +7,30 @@ import pygame
 from . import theme
 
 
+# 每一幀都會重畫整個畫面,同樣的文字、半透明底板不必每次重新產生;超過上限時清空重來
+_CACHE_LIMIT = 3000
+_panels = {}
+_texts = {}
+_layouts = {}
+
+
+def _remember(cache, key, value):
+    if len(cache) >= _CACHE_LIMIT:
+        cache.clear()
+    cache[key] = value
+    return value
+
+
 def rounded_panel(surface, rect, color=theme.PANEL, radius=10, alpha=None, border=None):
     if alpha is None:
         pygame.draw.rect(surface, color, rect, border_radius=radius)
     else:
-        layer = pygame.Surface(rect.size, pygame.SRCALPHA)
-        pygame.draw.rect(layer, (*color, alpha), layer.get_rect(), border_radius=radius)
+        key = (rect.width, rect.height, tuple(color), alpha, radius)
+        layer = _panels.get(key)
+        if layer is None:
+            layer = pygame.Surface(rect.size, pygame.SRCALPHA)
+            pygame.draw.rect(layer, (*color, alpha), layer.get_rect(), border_radius=radius)
+            _remember(_panels, key, layer)
         surface.blit(layer, rect.topleft)
     if border:
         pygame.draw.rect(surface, border, rect, 1, border_radius=radius)
@@ -77,7 +95,10 @@ def screen_text():
 
 
 def draw_text(surface, text, pos, size=16, color=theme.TEXT, bold=False, center=False, right=False):
-    img = theme.font(size, bold).render(text, True, color)
+    key = (text, size, bold, tuple(color))
+    img = _texts.get(key)
+    if img is None:
+        img = _remember(_texts, key, theme.font(size, bold).render(text, True, color))
     rect = img.get_rect()
     if center:
         rect.center = pos
@@ -94,19 +115,37 @@ def draw_text(surface, text, pos, size=16, color=theme.TEXT, bold=False, center=
 
 
 def clip_text(text: str, size: int, max_width: int, bold: bool = False) -> str:
+    key = ("clip", text, size, max_width, bold)
+    clipped = _layouts.get(key)
+    if clipped is None:
+        clipped = _remember(_layouts, key, _clip_text(text, size, max_width, bold))
+    if clipped != text and _text_log is not None:
+        _full_text[clipped] = text
+    return clipped
+
+
+def _clip_text(text, size, max_width, bold):
     f = theme.font(size, bold)
     if f.size(text)[0] <= max_width:
         return text
-    original = text
     while text and f.size(text + "...")[0] > max_width:
         text = text[:-1]
-    if _text_log is not None:
-        _full_text[text + "..."] = original
     return text + "..."
 
 
 def wrap_text(text: str, size: int, max_width: int, bold: bool = False, max_lines=None) -> list:
     """依寬度自動換行;英文單字盡量不從中間切開,超過 max_lines 時最後一行結尾加上「...」。"""
+    key = ("wrap", text, size, max_width, bold, max_lines)
+    cached = _layouts.get(key)
+    if cached is None:
+        cached = _remember(_layouts, key, _wrap_text(text, size, max_width, bold, max_lines))
+    lines, rest = cached
+    if rest is not None and _text_log is not None:
+        _full_text[lines[-1]] = rest        # 開發者模式複製文字時要能找回被截掉的原文
+    return list(lines)
+
+
+def _wrap_text(text, size, max_width, bold, max_lines):
     f = theme.font(size, bold)
     lines, current = [], ""
     for ch in text:
@@ -123,10 +162,11 @@ def wrap_text(text: str, size: int, max_width: int, bold: bool = False, max_line
             current = ch.lstrip()
     if current:
         lines.append(current)
+    rest = None
     if max_lines and len(lines) > max_lines:
         rest = " ".join(lines[max_lines - 1:])
-        lines = lines[:max_lines - 1] + [clip_text(rest, size, max_width, bold)]
-    return lines
+        lines = lines[:max_lines - 1] + [_clip_text(rest, size, max_width, bold)]
+    return lines, rest
 
 
 class Button:

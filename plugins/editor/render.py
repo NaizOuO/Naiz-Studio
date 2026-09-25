@@ -17,6 +17,8 @@ CACHE_BYTES = 200 * 1024 * 1024
 MAX_PIXELS = 8_000_000      # 整頁畫出來超過這麼多像素(約 30MB)時,改成只畫看得到的範圍;A4 放大到 300% 左右開始
 IMAGE_CACHE = 4
 LAST_SHOWN = 24             # 最多記住幾頁最近畫在畫面上的圖(新的樣子還沒畫好時頂著用)
+LAST_SHOWN_BYTES = 64 * 1024 * 1024     # 那些圖合計的上限;放大時一頁就很大,只看張數會吃掉幾百 MB
+READY_BYTES = 64 * 1024 * 1024          # 背景畫好、還沒拿去顯示的圖的上限(捲過頭的頁面不會一直留著)
 
 
 def identity(ref):
@@ -100,8 +102,10 @@ class PageRenderer:
         head = key[:len(key) - 3]
         self._last[head] = surface
         self._last.move_to_end(head)
-        while len(self._last) > LAST_SHOWN:
-            self._last.popitem(last=False)
+        total = sum(s.get_width() * s.get_height() * 4 for s in self._last.values())
+        while len(self._last) > 1 and (len(self._last) > LAST_SHOWN or total > LAST_SHOWN_BYTES):
+            _, old = self._last.popitem(last=False)
+            total -= old.get_width() * old.get_height() * 4
 
     def last_shown(self, ref, scale):
         return self._last.get(identity(ref) + (round(scale, 4),))
@@ -162,6 +166,13 @@ class PageRenderer:
                                 round(image.height - bottom * px)))
         return image.resize(size, Image.Resampling.LANCZOS if size[0] < image.width else Image.Resampling.BILINEAR)
 
+    def _trim_ready(self):
+        """畫好但一直沒被拿去顯示的圖(已經捲過去的頁面)超過上限時,從最舊的丟掉;要用時再重畫。"""
+        total = sum(len(data) for _, _, data in self._ready.values())
+        while len(self._ready) > 1 and total > READY_BYTES:
+            old = next(iter(self._ready))
+            total -= len(self._ready.pop(old)[2])
+
     def _worker(self):
         while True:
             with self._cond:
@@ -176,6 +187,7 @@ class PageRenderer:
                 with self._cond:
                     if generation == self._generation:
                         self._ready[key] = result
+                        self._trim_ready()
             except Exception:
                 with self._cond:
                     if generation == self._generation:

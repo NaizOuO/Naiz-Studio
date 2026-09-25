@@ -32,16 +32,19 @@ import pygame
 if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from core import paths, plugins, tempclean, theme, widgets
+from core import paths, plugins, tempclean, theme, version, widgets
 from core.consent import ConsentDialog
 from core.large_files import LargeFileDialog
+from core.scroll import ScrollView
 from core.settings_panel import SettingsPanel
 from core.widgets import Button, draw_text, rounded_panel
 
 HEADER_H = 66
 CATEGORY_ORDER = ["文件", "影像", "影音"]
+MODS_CATEGORY = "擴充模組"      # mods 資料夾裡的工具都放這一類,排在最後
 DEV_CLICKS = 7
 DEV_WINDOW_SECONDS = 3.0
+IDLE_SECONDS = 1.5      # 這麼久沒有任何操作就降低畫面更新頻率
 
 
 class App:
@@ -97,6 +100,7 @@ class App:
         self.pages = {}
         self.current = None
         self.card_rects = []
+        self.home_view = ScrollView(indicator=True)     # 工具變多、視窗矮時首頁可以捲動
         self.reload_tools()
         tempclean.start()   # 插件載入後才開始,插件登記的暫存資料夾才算得進去
 
@@ -109,6 +113,11 @@ class App:
     def reload_tools(self):
         plugins.reset_extensions()
         tools, errors = plugins.load_tools(paths.PLUGINS_DIR, "naiz_plugins")
+        mods, mod_errors = plugins.load_tools(paths.MODS_DIR, "naiz_mods")
+        for tool in mods:
+            tool.category = MODS_CATEGORY
+        tools += mods
+        errors += mod_errors
         if self.dev_mode:
             dev_tools, dev_errors = plugins.load_tools(paths.DEV_DIR, "naiz_dev")
             tools += dev_tools
@@ -211,12 +220,16 @@ class App:
         draw_text(self.screen, "選擇要使用的功能", (rect.x, rect.y + 36), 13, theme.TEXT_DIM)
 
         categories = [c for c in CATEGORY_ORDER if any(t.category == c for t in self.tools)]
-        categories += sorted({t.category for t in self.tools} - set(categories))
+        categories += sorted({t.category for t in self.tools} - set(categories) - {MODS_CATEGORY})
+        categories.append(MODS_CATEGORY)       # 沒有模組時也顯示,裡面是「加入擴充模組」的說明卡片
 
         card_w, card_h, gap = 280, 116, 16
         columns = max(1, (rect.width + gap) // (card_w + gap))
         self.card_rects = []
-        y = rect.y + 80
+        area = pygame.Rect(rect.x - 8, rect.y + 70, rect.right - rect.x + 16, rect.bottom - rect.y - 70)
+        view = self.home_view
+        self.screen.set_clip(area)
+        y = area.y + 10 - view.scroll
 
         if not self.tools:
             draw_text(self.screen, "沒有可用的工具", (rect.centerx, rect.centery), 16,
@@ -224,29 +237,69 @@ class App:
 
         for category in categories:
             items = [tool for tool in self.tools if tool.category == category]
+            if category == MODS_CATEGORY:
+                items.append(None)
             label = draw_text(self.screen, category, (rect.x, y), 15, theme.TEXT, bold=True)
-            draw_text(self.screen, str(len(items)), (label.right + 10, y + 2), 13, theme.TEXT_FAINT)
+            draw_text(self.screen, str(len([t for t in items if t])), (label.right + 10, y + 2), 13, theme.TEXT_FAINT)
             pygame.draw.line(self.screen, theme.PANEL_EDGE, (rect.x, y + 30), (rect.right, y + 30))
             y += 44
 
             for index, tool in enumerate(items):
                 card = pygame.Rect(rect.x + (index % columns) * (card_w + gap),
                                    y + (index // columns) * (card_h + gap), card_w, card_h)
-                self.card_rects.append((tool, card))
-                hover = card.collidepoint(mouse_pos)
+                self.card_rects.append((tool, card.clip(area)))
+                hover = card.collidepoint(mouse_pos) and area.collidepoint(mouse_pos)
+                if tool is None:
+                    self._draw_mods_card(card, hover)
+                    continue
+                if not version.at_least(tool.min_app):
+                    self._draw_old_app_card(tool, card)
+                    continue
                 rounded_panel(self.screen, card, theme.PANEL_LIGHT if hover else theme.PANEL, radius=12,
                               alpha=232, border=tool.accent if hover else theme.PANEL_EDGE)
                 pygame.draw.rect(self.screen, tool.accent, (card.x + 18, card.y + 20, 4, 24), border_radius=2)
                 draw_text(self.screen, tool.name, (card.x + 32, card.y + 17), 18, theme.TEXT, bold=True)
+                if tool.version:        # 擴充模組:版本與作者
+                    credit = f"v{tool.version.lstrip('vV')}" + (f" · {tool.author}" if tool.author else "")
+                    draw_text(self.screen, widgets.clip_text(credit, 12, 110), (card.right - 16, card.y + 22), 12,
+                              theme.TEXT_FAINT, right=True)
                 # 說明太長時換行,最多 3 行,不再截斷成看不到內容
                 for row, line in enumerate(widgets.wrap_text(tool.description, 13, card_w - 36, max_lines=3)):
                     draw_text(self.screen, line, (card.x + 18, card.y + 54 + row * 19), 13, theme.TEXT_DIM)
 
             y += math.ceil(len(items) / columns) * (card_h + gap) + 20
+        self.screen.set_clip(None)
+        view.layout(area, y + view.scroll - area.y)
+        view.draw(self.screen, mouse_pos)
 
         if self.load_errors:
-            draw_text(self.screen, f"有 {len(self.load_errors)} 個插件載入失敗，詳細內容已寫入 error.log",
+            draw_text(self.screen, f"有 {len(self.load_errors)} 個工具或擴充模組載入失敗，詳細內容已寫入 error.log",
                       (rect.x, rect.bottom - 18), 12, theme.WARN)
+
+    def _draw_mods_card(self, card, hover):
+        """擴充模組分類最後的卡片:說明怎麼加入模組,點一下打開 mods 資料夾。"""
+        rounded_panel(self.screen, card, theme.PANEL_LIGHT if hover else theme.PANEL, radius=12, alpha=150,
+                      border=theme.ACCENT if hover else theme.PANEL_EDGE)
+        draw_text(self.screen, "＋  加入擴充模組", (card.x + 18, card.y + 17), 18,
+                  theme.ACCENT if hover else theme.TEXT_DIM, bold=True)
+        note = "把模組資料夾放進 mods 資料夾，重新開啟程式後就會出現；點這裡打開 mods 資料夾"
+        for row, line in enumerate(widgets.wrap_text(note, 13, card.width - 36, max_lines=3)):
+            draw_text(self.screen, line, (card.x + 18, card.y + 54 + row * 19), 13, theme.TEXT_FAINT)
+
+    def _draw_old_app_card(self, tool, card):
+        """模組需要比較新的主程式:卡片變暗,不能開啟。"""
+        rounded_panel(self.screen, card, theme.PANEL, radius=12, alpha=150, border=theme.PANEL_EDGE)
+        draw_text(self.screen, tool.name, (card.x + 32, card.y + 17), 18, theme.TEXT_FAINT, bold=True)
+        note = f"需要主程式 v{tool.min_app.lstrip('vV')} 以上才能使用，目前是 v{version.VERSION}"
+        for row, line in enumerate(widgets.wrap_text(note, 13, card.width - 36, max_lines=3)):
+            draw_text(self.screen, line, (card.x + 18, card.y + 54 + row * 19), 13, theme.WARN)
+
+    def open_mods_folder(self):
+        try:
+            paths.MODS_DIR.mkdir(parents=True, exist_ok=True)
+            os.startfile(paths.MODS_DIR)
+        except OSError:
+            pass
 
     def draw_frame(self, mouse_pos=(-100, -100)):
         if self.dev_mode:
@@ -368,11 +421,16 @@ class App:
             if self.current is None:
                 for tool, card in self.card_rects:
                     if card.collidepoint(mouse_pos):
-                        self.open_tool(tool)
+                        if tool is None:
+                            self.open_mods_folder()
+                        elif version.at_least(tool.min_app):
+                            self.open_tool(tool)
                         return True
 
         if self.current:
             self.pages[self.current.id].handle_event(event, mouse_pos)
+        else:
+            self.home_view.handle_event(event, mouse_pos)
         return True
 
     def _copy_click(self, event, pos):
@@ -406,17 +464,32 @@ class App:
                 return False
         return True
 
+    def frame_rate(self, idle_seconds):
+        """每秒畫幾次:操作中 60;停下來一陣子後降到 30,視窗不在前景時 15,縮到最小時不畫,減少耗電。
+        按住滑鼠(拖曳到邊緣會自動捲動)或中鍵自動捲動(系統游標會藏起來)時不降。"""
+        if not pygame.display.get_active():
+            return 0
+        if idle_seconds < IDLE_SECONDS or any(pygame.mouse.get_pressed()) or not pygame.mouse.get_visible():
+            return 60
+        return 30 if pygame.key.get_focused() else 15
+
     def run(self):
         running = True
+        last_input = time.monotonic()
         while running:
-            running = self.process_events(pygame.event.get())
+            events = pygame.event.get()
+            if events:
+                last_input = time.monotonic()
+            running = self.process_events(events)
             mouse_pos = pygame.mouse.get_pos()
             self.consent.update()
             if self.current:
                 self.pages[self.current.id].update()
-            self.draw_frame(mouse_pos)
-            pygame.display.flip()
-            self.clock.tick(60)
+            rate = self.frame_rate(time.monotonic() - last_input)
+            if rate:
+                self.draw_frame(mouse_pos)
+                pygame.display.flip()
+            self.clock.tick(rate or 5)
         pygame.quit()
 
 

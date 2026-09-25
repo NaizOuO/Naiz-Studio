@@ -62,6 +62,12 @@
 - 可區分說話者，自動判斷人數或指定人數
 - 修正錯字：自訂「辨識錯的字 → 正確的字」，之後的逐字稿會自動套用
 
+### 擴充模組
+- **加入模組**：把模組資料夾放進 exe 旁邊的 `mods` 資料夾（例如 `mods\circuit`），重新開啟程式後，首頁「擴充模組」分類就會出現；首頁的「加入擴充模組」卡片可以直接打開這個資料夾
+- **移除模組**：把 `mods` 裡的那個資料夾刪掉即可
+- **注意安全**：模組是程式碼，會在本地直接執行，只安裝信得過的模組
+- 模組需要比較新的主程式時，首頁會顯示需要的版本；壞掉的模組不會影響其他工具，錯誤內容會寫進 `error.log`
+
 ## 下載與執行
 
 ### 一般使用
@@ -150,6 +156,43 @@ python naiz_cli.py images-to-pdf --output 報告.pdf 照片1.jpg 照片2.jpg
 - 結果是一行 JSON：`{"ok": true, "output": "…", "pages": 3, "bytes": 812345}`；失敗時 `ok` 為 `false`，
   `error` 是可以直接顯示給使用者看的中文訊息，離開碼為 1
 
+## 自己寫擴充模組
+
+在 `mods` 裡建一個資料夾（名稱用英文，例如 `mods\hello`），裡面放 `__init__.py`：
+
+```python
+from core.plugins import Page, Tool
+from core.widgets import draw_text
+
+
+class HelloPage(Page):
+    def draw(self, rect, mouse_pos):
+        draw_text(self.screen, "你好", rect.center, 24, center=True)
+
+    def handle_event(self, event, mouse_pos):
+        pass
+
+
+class HelloTool(Tool):
+    id = "hello"                # 不能和其他工具重複
+    name = "打招呼"
+    description = "首頁卡片上的說明"
+    accent = (120, 200, 255)    # 主題色
+    version = "0.1.0"           # 模組版本,顯示在首頁卡片
+    author = "你的名字"
+    min_app = "1.14.4"          # 需要的主程式版本
+
+    def create_page(self, app):
+        return HelloPage(app, self)
+
+
+TOOLS = [HelloTool]
+```
+
+- 畫面用 pygame 繪製，可以使用主程式的共用元件（`core.widgets` 的按鈕、輸入框，`core.scroll` 的捲動清單等）
+- 模組只能使用主程式已經帶著的套件（Pillow、pygame、pikepdf、pypdfium2 等）；其他套件在 exe 版裡讀不到
+- 一個資料夾可以有好幾個 .py 檔，彼此用 `from . import xxx` 引用
+
 ## 檔案位置
 
 以下都在 exe（或原始碼版的 `naiz_studio.py`）所在的資料夾：
@@ -166,6 +209,7 @@ python naiz_cli.py images-to-pdf --output 報告.pdf 照片1.jpg 照片2.jpg
 | `fonts\downloads\` | 下載的開源字型包 |
 | `fonts\custom\` | 自己加入的字型（也可以直接把字型檔放進來） |
 | `signatures\` | 存起來的簽名（只存在本地，不會上傳） |
+| `mods\` | 擴充模組，一個模組一個資料夾 |
 | `images\` | 介面圖片；也可以放自己的圖片當作背景 |
 | `config.json` | 設定（背景、修正錯字規則等） |
 | `error.log` | 發生錯誤時的紀錄 |
