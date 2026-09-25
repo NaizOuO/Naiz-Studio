@@ -16,7 +16,7 @@ from dataclasses import replace
 
 import pikepdf
 
-from . import annots, fonts, geometry, redact
+from . import annots, fonts, geometry, links, redact
 
 KAPPA = 0.5523
 ARROW_ANGLE = math.radians(28)
@@ -45,6 +45,7 @@ class FontEmbedder:
         self.images = {}            # 同一張圖(例如同一個簽名蓋在很多頁)只存一份
         self.kept_text = 0          # 改字時字型沒把握、只被蓋住沒刪掉的文字段數
         self.kept_images = 0        # 原檔圖片的內容太特殊,沒能照編輯器移動、刪除的張數
+        self.page_links = []        # 跳頁連結:[(連結物件, 目標頁面 uid)],全部頁面寫完才知道目標在哪
 
     def _entry(self, face):
         entry = self.entries.get(face.id)
@@ -262,7 +263,8 @@ def text_layout(annot):
     if face is None:
         return None, None
     width = max(1.0, annot.box[2] - annot.box[0] - annots.TEXT_PAD * 2 - annot.width * 2)
-    fallback = [fonts.CATALOG.get(annot.fallback) if annot.fallback else None, fonts.CATALOG.fallback()]
+    symbols = [fonts.CATALOG.get(face_id) for face_id in annot.symbols.split(",") if face_id]
+    fallback = [fonts.CATALOG.get(annot.fallback) if annot.fallback else None] + symbols + [fonts.CATALOG.fallback()]
     latin = [fonts.CATALOG.get(annot.latin), fonts.CATALOG.get(annot.latin_fallback) if annot.latin_fallback else None] \
         if annot.latin else None
     return face, fonts.layout(annot.text, face, annot.font_size, width, fallback, annot.align, annot.offsets,
@@ -342,6 +344,10 @@ def _appearance(pdf, annot, embedder):
             left = annot.box[0] + annots.TEXT_PAD + annot.width
             top = annot.box[1] + annots.TEXT_PAD + annot.width
             canvas.add("BT", red, green, blue, "rg")
+            if annot.bold:
+                # 粗體:填滿再加同色的外框描邊(2 Tr),任何字型都能變粗
+                canvas.add(red, green, blue, "RG", _num(annot.font_size * fonts.BOLD_STROKE), "w 2 Tr")
+            slant = fonts.ITALIC_SLANT if annot.italic else 0
             for row, line in enumerate(result.lines):
                 for run_face, text, x in line.runs:
                     if not text.strip():
@@ -352,9 +358,14 @@ def _appearance(pdf, annot, embedder):
                         name = names[run_face.id] = f"F{len(names) + 1}"
                         fonts_used[f"/{name}"] = ref
                     lx, ly = local((left + x, top + result.baseline(row)))
-                    canvas.add(f"/{name}", annot.font_size, "Tf 1 0 0 1", lx, ly, "Tm", f"<{codes.hex()}> Tj")
+                    canvas.add(f"/{name}", annot.font_size, "Tf 1 0", _num(slant), "1", lx, ly, "Tm",
+                               f"<{codes.hex()}> Tj")
             canvas.add("ET")
             extra["NaizFont"] = pikepdf.String(face.id)
+            if annot.bold:
+                extra["NaizBold"] = True
+            if annot.italic:
+                extra["NaizItalic"] = True
         if names:
             resources.Font = fonts_used
         first = f"/{next(iter(names.values()))}" if names else "/Helv"
@@ -400,7 +411,7 @@ def _appearance(pdf, annot, embedder):
 
 _PDF_SUBTYPES = {"highlight": "Highlight", "underline": "Underline", "strike": "StrikeOut", "textbox": "FreeText",
                  "note": "Text", "line": "Line", "arrow": "Line", "rect": "Square", "ellipse": "Circle", "ink": "Ink",
-                 "image": "Stamp", "signature": "Stamp"}
+                 "image": "Stamp", "signature": "Stamp", "stamp": "Stamp"}
 
 
 def build_annot(pdf, page, ref, annot, embedder):
@@ -465,6 +476,31 @@ def build_annot(pdf, page, ref, annot, embedder):
     return pdf.make_indirect(obj)
 
 
+def build_link(pdf, page, ref, annot, embedder):
+    """超連結:沒有外框的 Link 註解;網址用 URI 動作,跳頁先記下目標,全部頁面寫完再接上。"""
+    rect = geometry.transform_box(geometry.ref_to_user(ref), annot.box)
+    obj = pikepdf.Dictionary(Type=pikepdf.Name.Annot, Subtype=pikepdf.Name.Link, Rect=[round(v, 3) for v in rect],
+                             Border=[0, 0, 0], F=4, P=page.obj)
+    obj = pdf.make_indirect(obj)
+    uid = links.page_uid(annot.text)
+    if uid is None:
+        obj.A = pikepdf.Dictionary(Type=pikepdf.Name.Action, S=pikepdf.Name.URI, URI=pikepdf.String(annot.text))
+    else:
+        embedder.page_links.append((obj, uid))
+    return obj
+
+
+def connect_links(pdf, embedder, uids):
+    """跳頁連結接上目標頁面;uids 是新檔每一頁對應的頁面 uid。目標頁被刪掉的連結不做事。"""
+    where = {}
+    for number, uid in enumerate(uids):
+        where.setdefault(uid, number)
+    for obj, uid in embedder.page_links:
+        number = where.get(uid)
+        if number is not None:
+            obj.Dest = pikepdf.Array([pdf.pages[number].obj, pikepdf.Name.Fit])
+
+
 def _replace_text(pdf, page, ref, items, embedder):
     """改字:先真正刪掉被蓋住的原字,再把底色和新的文字直接畫進頁面(不是註解,別的閱讀器看起來就是原本的字)。"""
     to_user = geometry.ref_to_user(ref)
@@ -493,6 +529,35 @@ def _replace_text(pdf, page, ref, items, embedder):
         # 原本的內容包在 q ... Q 裡,後面畫的東西才不會受它留下的座標變換影響
         page.contents_add(pikepdf.Stream(pdf, b"q\n"), prepend=True)
         page.contents_add(pikepdf.Stream(pdf, ("Q\n" + "\n".join(commands) + "\n").encode("latin-1")), prepend=False)
+
+
+def _ocr_text(pdf, page, ref, embedder):
+    """掃描頁的文字層:辨識出來的字用透明的文字(3 Tr)疊在圖片上同樣的位置,
+    寬度用水平縮放(Tz)對齊,這樣搜尋、選字時框起來的範圍和圖片上的字一致。"""
+    face = fonts.CATALOG.fallback()
+    if face is None:
+        return
+    measure = fonts.data(face)
+    to_user = geometry.ref_to_user(ref)
+    name = None
+    commands = []
+    for text, (x0, top, x1, bottom), baseline in ref.ocr:
+        size = max(4.0, baseline - top)
+        natural = sum(measure.advance(ch) for ch in text) * size
+        if natural <= 0 or x1 <= x0:
+            continue
+        font_ref, codes = embedder.encode(face, text)
+        if name is None:
+            name = page.add_resource(font_ref, pikepdf.Name.Font, prefix="NaizO")
+        # 文字座標:往右是頁面的右邊、往上是頁面的上面(頁面座標 y 往下),再換成 PDF 的座標
+        matrix = geometry.compose((1.0, 0.0, 0.0, -1.0, x0, baseline), to_user)
+        scale = (x1 - x0) / natural * 100
+        commands.append(f"BT 3 Tr {name} {_num(size)} Tf {_num(scale)} Tz {' '.join(_num(v) for v in matrix)} Tm "
+                        f"<{codes.hex()}> Tj ET")
+    if commands:
+        page.contents_add(pikepdf.Stream(pdf, b"q\n"), prepend=True)
+        page.contents_add(pikepdf.Stream(pdf, ("Q\nq\n" + "\n".join(commands) + "\nQ\n").encode("latin-1")),
+                          prepend=False)
 
 
 def _redact(pdf, page, ref, items, embedder):
@@ -618,6 +683,8 @@ def write_page(pdf, page, ref, embedder):
     edits = annots.image_edits(ref)
     if edits:
         embedder.kept_images += _edit_images(pdf, page, ref, edits)
+    if ref.ocr:
+        _ocr_text(pdf, page, ref, embedder)
     replaced = [annot for annot in ref.annots if annot.kind == "replace"]
     if replaced:
         _replace_text(pdf, page, ref, replaced, embedder)
@@ -651,6 +718,9 @@ def write_page(pdf, page, ref, embedder):
     for annot in ref.annots:
         if annot.kind in ("other", "replace", "redact", annots.PAGE_IMAGE) \
                 or (annot.origin >= 0 and annot.origin in kept_origins):
+            continue
+        if annot.kind == "link":
+            result.append(build_link(pdf, page, ref, annot, embedder))
             continue
         result.append(build_annot(pdf, page, ref, annot, embedder))
     if result:

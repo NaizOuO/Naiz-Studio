@@ -415,7 +415,9 @@ def _load_rebuilder():
 
 
 def ocr_module():
-    return _load_module("ocr")
+    from core import ocr
+
+    return ocr
 
 
 def has_scanned_pages(path) -> bool:

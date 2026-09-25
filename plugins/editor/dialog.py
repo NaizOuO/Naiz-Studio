@@ -22,13 +22,13 @@ class Dialog:
         self.field = TextInput(accent=accent, size=15)
         self._button_widgets = []
 
-    def open(self, title, lines, buttons, on_choice, field=None, mask=False, error=""):
+    def open(self, title, lines, buttons, on_choice, field=None, mask=False, error="", value=""):
         """buttons:[(代號, 文字, 是否醒目)],由左到右排;on_choice(代號, 輸入的文字)。
         field 是輸入框的提示文字,給 None 時不顯示輸入框;按 Esc 等於按「cancel」。"""
         self.title, self.lines, self.buttons, self.on_choice = title, list(lines), list(buttons), on_choice
         self.error = error
         self.show_field = field is not None
-        self.field.set_text("")
+        self.field.set_text(value)
         self.field.placeholder = field or ""
         self.field.mask = mask
         self._button_widgets = [Button(label, accent=self.accent, filled=filled, size=14)
@@ -36,6 +36,7 @@ class Dialog:
         self.is_open = True
         if self.show_field:
             self.field.focus()
+            self.field.select_all()
 
     def close(self):
         self.field.blur()

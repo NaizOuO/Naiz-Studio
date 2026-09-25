@@ -16,11 +16,12 @@ from . import annots, geometry, ops
 CACHE_BYTES = 200 * 1024 * 1024
 MAX_PIXELS = 8_000_000      # 整頁畫出來超過這麼多像素(約 30MB)時,改成只畫看得到的範圍;A4 放大到 300% 左右開始
 IMAGE_CACHE = 4
+LAST_SHOWN = 24             # 最多記住幾頁最近畫在畫面上的圖(新的樣子還沒畫好時頂著用)
 
 
 def identity(ref):
     """同一頁、同一個方向的圖可以互相替代(例如還沒畫好的大圖先用縮圖放大頂著)。"""
-    return ref.kind, ref.source, ref.index, ref.rotation, ref.size
+    return ref.kind, ref.source, ref.index, ref.rotation, ref.size, ref.origin
 
 
 class PageRenderer:
@@ -35,6 +36,7 @@ class PageRenderer:
         self._bytes = 0
         self._generation = 0
         self._images = OrderedDict()
+        self._last = OrderedDict()  # (頁面, 縮放) → 最近一次畫在畫面上的圖(整頁的,不含只畫局部的)
         threading.Thread(target=self._worker, daemon=True).start()
 
     @staticmethod
@@ -59,6 +61,7 @@ class PageRenderer:
         self._surfaces.clear()
         self._bytes = 0
         self._images.clear()
+        self._last.clear()
 
     def get(self, key):
         surface = self._surfaces.get(key)
@@ -77,6 +80,31 @@ class PageRenderer:
             _, old = self._surfaces.popitem(last=False)
             self._bytes -= old.get_width() * old.get_height() * 4
         return surface
+
+    def render_now(self, key, ref, scale):
+        """馬上在這個執行緒畫好(不等背景);用在按下原檔圖片時,先把沒有那張圖的頁面準備好。"""
+        with self._cond:
+            if key in self._ready:
+                return
+        if key in self._surfaces:
+            return
+        try:
+            image = self._draw(ref, scale, None, key[-2], key[-1])
+        except Exception:
+            return
+        with self._cond:
+            self._ready[key] = (image.width, image.height, image.convert("RGB").tobytes())
+
+    def shown(self, key, surface):
+        """記下這一頁這個縮放最近一次畫的圖;新的樣子還沒畫好時先用它頂著。"""
+        head = key[:len(key) - 3]
+        self._last[head] = surface
+        self._last.move_to_end(head)
+        while len(self._last) > LAST_SHOWN:
+            self._last.popitem(last=False)
+
+    def last_shown(self, ref, scale):
+        return self._last.get(identity(ref) + (round(scale, 4),))
 
     def fallback(self, ref):
         """已經畫好、同一頁同方向的圖裡最大的一張(不含只畫局部的);沒有時回傳 None。"""
@@ -117,7 +145,8 @@ class PageRenderer:
             images = [(number, geometry.transform_box(to_user, box) if box is not None else None)
                       for number, box in edits]
             return pdfium.render(self.docs[ref.source], ref.index, scale, rotation=ref.rotation,
-                                 crop=crop or (0, 0, 0, 0), hidden=hidden, images=images)
+                                 crop=crop or (0, 0, 0, 0), hidden=hidden, images=images,
+                                 box=geometry.user_box(ref))
         shown_w, shown_h = ref.shown_size
         left, bottom, right, top = crop or (0, 0, 0, 0)
         size = (max(1, round((shown_w - left - right) * scale)), max(1, round((shown_h - top - bottom) * scale)))

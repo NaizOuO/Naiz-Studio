@@ -43,6 +43,12 @@ def page_count(doc):
         return len(doc)
 
 
+def page_sizes(doc):
+    """每一頁的寬高(點,已含頁面本身的旋轉);不用載入頁面內容,幾百頁也很快。"""
+    with LOCK:
+        return [tuple(doc.get_page_size(index)) for index in range(len(doc))]
+
+
 def page_size(doc, index):
     """第 index 頁(從 0 起算)的寬高,單位是點(1/72 英吋)。"""
     with LOCK:
@@ -85,6 +91,45 @@ def _apply_hidden(doc, page, index, hidden):
                 raw.FPDFAnnot_SetFlags(handle, wanted)
         finally:
             raw.FPDFPage_CloseAnnot(handle)
+
+
+def outline(doc):
+    """文件的書籤(目錄):[(層級, 標題, 第幾頁)];沒有指到頁面的書籤略過。"""
+    found = []
+    with LOCK:
+        try:
+            for mark in doc.get_toc():
+                dest = mark.get_dest()
+                index = dest.get_index() if dest is not None else None
+                if index is not None and index >= 0:
+                    found.append((mark.level, mark.get_title() or "", index))
+        except Exception:
+            return found
+    return found
+
+
+def is_scan(doc, index):
+    """這一頁是不是掃描的:完全沒有文字物件,但有圖片。"""
+    import pypdfium2.raw as raw
+
+    with LOCK:
+        page = doc[index]
+        try:
+            kinds = {raw.FPDFPageObj_GetType(raw.FPDFPage_GetObject(page.raw, i))
+                     for i in range(raw.FPDFPage_CountObjects(page.raw))}
+            return raw.FPDF_PAGEOBJ_TEXT not in kinds and raw.FPDF_PAGEOBJ_IMAGE in kinds
+        finally:
+            page.close()
+
+
+def media_box(doc, index):
+    """第 index 頁完整的紙張範圍 (左, 下, 右, 上)(MediaBox);頁面有裁切時比 page_info 的範圍大。"""
+    with LOCK:
+        page = doc[index]
+        try:
+            return tuple(float(v) for v in page.get_mediabox())
+        finally:
+            page.close()
 
 
 def _image_objects(page):
@@ -144,6 +189,45 @@ def image_png(doc, index, number, max_side=1600):
     return buffer.getvalue()
 
 
+def image_rgba(doc, index, number, scale=2.0):
+    """第 index 頁第 number 張圖片照頁面上顯示的樣子畫出來(含透明、旋轉),1 點 = scale 像素;
+    拖曳預覽用,直接回傳 (寬高, RGBA 像素),不轉成 PNG,按下去的那一刻才不會卡。沒有這張圖時回傳 None。"""
+    import ctypes
+
+    import pypdfium2.raw as raw
+
+    with LOCK:
+        page = doc[index]
+        try:
+            objects = _image_objects(page)
+            if number >= len(objects):
+                return None
+            obj = objects[number]
+            matrix = raw.FS_MATRIX()
+            raw.FPDFPageObj_GetMatrix(obj, ctypes.byref(matrix))
+            original = raw.FS_MATRIX(matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f)
+            scaled = raw.FS_MATRIX(*(v * scale for v in (matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f)))
+            raw.FPDFPageObj_SetMatrix(obj, ctypes.byref(scaled))
+            try:
+                bitmap = raw.FPDFImageObj_GetRenderedBitmap(doc.raw, page.raw, obj)
+            finally:
+                raw.FPDFPageObj_SetMatrix(obj, ctypes.byref(original))
+            if not bitmap:
+                return None
+            try:
+                stride = raw.FPDFBitmap_GetStride(bitmap)
+                size = (raw.FPDFBitmap_GetWidth(bitmap), raw.FPDFBitmap_GetHeight(bitmap))
+                data = ctypes.string_at(raw.FPDFBitmap_GetBuffer(bitmap), stride * size[1])
+            finally:
+                raw.FPDFBitmap_Destroy(bitmap)
+        finally:
+            page.close()
+    from PIL import Image
+
+    image = Image.frombuffer("RGBA", size, data, "raw", "BGRA", stride, 1)
+    return size, image.tobytes()
+
+
 def _apply_images(page, edits):
     """編輯器移動、縮放、刪除過的圖片:只改這次載入的頁面(關掉頁面就還原),原檔不動。
     edits:[(編號, 新的範圍 (左, 下, 右, 上) 或 None 表示刪除)]。"""
@@ -165,22 +249,32 @@ def _apply_images(page, edits):
         raw.FPDFPageObj_Transform(obj, sx, 0, 0, sy, box[0] - left * sx, box[1] - bottom * sy)
 
 
-def render(doc, index, scale, rotation=0, crop=(0, 0, 0, 0), hidden=(), images=()):
+def render(doc, index, scale, rotation=0, crop=(0, 0, 0, 0), hidden=(), images=(), box=None):
     """把第 index 頁(從 0 起算)畫成 RGB 圖片;scale 為 1 時 1 點 = 1 像素。
     rotation 是在頁面原本方向上再轉的角度;crop 是旋轉後從左、下、右、上各切掉多少點(只畫看得到的範圍時用);
-    hidden 是這次不要畫的註解編號(被編輯器改過或刪掉的原註解);images 是移動、刪除過的圖片(見 _apply_images)。"""
+    hidden 是這次不要畫的註解編號(被編輯器改過或刪掉的原註解);images 是移動、刪除過的圖片(見 _apply_images);
+    box 是要畫的頁面範圍 (左, 下, 右, 上)(編輯器裁切過的頁面),畫完改回原本的範圍。"""
     with LOCK:
         page = doc[index]
+        original = None
         try:
             _apply_hidden(doc, page, index, hidden)
             if images:
                 _apply_images(page, images)
+            if box is not None:
+                original = page.get_cropbox()
+                if any(abs(a - b) > 0.01 for a, b in zip(original, box)):
+                    page.set_cropbox(*box)
+                else:
+                    original = None
             bitmap = page.render(scale=scale, rotation=rotation, crop=crop)
             # to_pil 和點陣圖共用記憶體,複製一份再釋放,之後在鎖外面使用才安全
             image = bitmap.to_pil().convert("RGB").copy()
             bitmap.close()
             return image
         finally:
+            if original is not None:
+                page.set_cropbox(*original)         # 裁切範圍會留在文件裡,改回來才不會影響其他地方
             page.close()
 
 

@@ -1128,7 +1128,7 @@ def convert(source, out_dir, progress=None, cancel=None, layout="flow", ocr=None
     """把 PDF 轉成 Word;回傳產生的檔案。
 
     layout:"flow" 重新排版(好編輯)、"exact" 照原樣(每塊固定在原位)。
-    ocr:文字辨識模組(plugins/documents/ocr.py);有給就會辨識掃描頁,沒給則把掃描頁整頁放成圖片。
+    ocr:文字辨識模組(core/ocr.py);有給就會辨識掃描頁,沒給則把掃描頁整頁放成圖片。
     """
     source = Path(source)
     document = pdfium.open_document(source.read_bytes())

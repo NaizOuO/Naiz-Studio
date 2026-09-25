@@ -11,7 +11,7 @@ from . import geometry
 
 MARKUP = ("highlight", "underline", "strike")
 SHAPES = ("line", "arrow", "rect", "ellipse", "ink")
-IMAGES = ("image", "signature")     # 插入的圖片、簽名:存成圖章註解,外觀就是那張圖
+IMAGES = ("image", "signature", "stamp")    # 插入的圖片、簽名、印章:存成圖章註解,外觀就是那張圖
 PAGE_IMAGE = "pageimage"            # 原檔頁面上本來就有的圖片:可以移動、縮放、刪除,儲存時直接改頁面內容
 MIN_PAGE_IMAGE = 8.0                # 比這個小(點)的圖通常是線條或裝飾,不讓它被選到
 SCAN_COVER = 0.85                   # 蓋住整頁這麼多的圖是掃描檔的底圖,不讓它被選到
@@ -27,7 +27,7 @@ DEFAULT_COLORS = {     # 和顏色選單裡的標準色一致
     "note": (255, 192, 0), "line": (255, 0, 0), "arrow": (255, 0, 0), "rect": (255, 0, 0),
     "ellipse": (255, 0, 0), "ink": (0, 112, 192), "other": (150, 150, 150),
     "image": (0, 0, 0), "signature": (0, 0, 0), "replace": (0, 0, 0), "redact": (0, 0, 0),
-    PAGE_IMAGE: (0, 0, 0),
+    PAGE_IMAGE: (0, 0, 0), "link": (0, 112, 192), "stamp": (0, 0, 0),
 }
 _SUBTYPES = {"Highlight": "highlight", "Underline": "underline", "StrikeOut": "strike", "FreeText": "textbox",
              "Text": "note", "Line": "line", "Square": "rect", "Circle": "ellipse", "Ink": "ink"}
@@ -57,6 +57,9 @@ class Annot:
     latin: str = ""                 # 英數字、符號用的字型(像 Word 一樣中文和英文分開設定);空的表示和主字型相同
     latin_fallback: str = ""        # 英數字的原檔字型沒有的字,用這個補
     wrap: bool = False              # 改字:True 是整段編輯(自動換行),False 是只改幾個字(框跟著字變寬)
+    symbols: str = ""               # 改字:原檔的符號字型(數學符號等),好幾個用逗號隔開;認不出的符號用它畫
+    bold: bool = False              # 文字框、改字:粗體(字的外框加描邊,任何字型都能用)
+    italic: bool = False            # 文字框、改字:斜體(字往右斜)
     pixels: tuple = ()              # 圖片的像素寬高;改大小時維持這個比例
     origin: int = -1                # 原檔這一頁 /Annots 的第幾個;-1 是在編輯器裡新增的
     number: int = -1                # 原檔圖片:頁面上的第幾張圖片(core.pdfium 的圖片編號)
@@ -136,6 +139,20 @@ def moved(annot, dx, dy):
     return replace(annot, **changes)
 
 
+def translated(annot, dx, dy):
+    """整個註解平移(含改字蓋住原字的範圍);裁切頁面時用,看起來位置不變。"""
+    changes = {}
+    if annot.rects:
+        changes["rects"] = tuple((x0 + dx, y0 + dy, x1 + dx, y1 + dy) for x0, y0, x1, y1 in annot.rects)
+    if annot.kind in ("line", "arrow"):
+        changes["points"] = tuple((x + dx, y + dy) for x, y in annot.points)
+    elif annot.kind == "ink":
+        changes["points"] = tuple(tuple((x + dx, y + dy) for x, y in stroke) for stroke in annot.points)
+    x0, y0, x1, y1 = annot.box
+    changes["box"] = (x0 + dx, y0 + dy, x1 + dx, y1 + dy)
+    return replace(annot, **changes)
+
+
 def handles(annot):
     """可以拖曳改大小的控制點:[(名稱, 位置)]。"""
     if annot.kind in ("line", "arrow"):
@@ -146,7 +163,7 @@ def handles(annot):
         return [("w", (x0, cy)), ("e", (x1, cy))]
     if annot.kind in IMAGES or annot.kind == PAGE_IMAGE:
         return [("nw", (x0, y0)), ("ne", (x1, y0)), ("se", (x1, y1)), ("sw", (x0, y1))]
-    if annot.kind in ("rect", "ellipse", "ink"):
+    if annot.kind in ("rect", "ellipse", "ink", "link"):
         return [("nw", (x0, y0)), ("n", (cx, y0)), ("ne", (x1, y0)), ("e", (x1, cy)),
                 ("se", (x1, y1)), ("s", (cx, y1)), ("sw", (x0, y1)), ("w", (x0, cy))]
     return []
@@ -205,7 +222,7 @@ def editable(annot):
 
 def styled(annot, **settings):
     """套用顏色、粗細等設定;不適用這種註解的設定會被略過。"""
-    if annot.kind == PAGE_IMAGE:
+    if annot.kind in (PAGE_IMAGE, "link"):
         return annot
     allowed = set() if annot.kind in IMAGES else {"color"}
     if annot.kind in MARKUP or annot.kind in SHAPES or annot.kind in IMAGES or annot.kind == "textbox":
@@ -215,7 +232,7 @@ def styled(annot, **settings):
     if annot.kind in ("rect", "ellipse", "textbox", "replace"):
         allowed.add("background")
     if annot.kind in TEXTS:
-        allowed |= {"font", "font_size"}
+        allowed |= {"font", "font_size", "bold", "italic"}
     changes = {key: value for key, value in settings.items() if key in allowed}
     return replace(annot, **changes) if changes else annot
 
@@ -304,6 +321,15 @@ def _page_point(m, x, y):
 def parse(obj, index, to_page):
     """把一個 PDF 註解字典轉成 Annot;不需要處理的類型回傳 None。to_page:使用者座標 → 頁面座標的矩陣。"""
     subtype = str(obj.get("/Subtype", ""))[1:]
+    if subtype == "Link":
+        # 開網頁的連結可以在編輯器裡修改;跳頁等其他連結照原樣保留
+        action = obj.get("/A")
+        uri = action.get("/URI") if action is not None and hasattr(action, "get") else None
+        if uri is None or "/Rect" not in obj or len(obj.Rect) != 4:
+            return None
+        box = geometry.transform_box(to_page, [float(v) for v in obj.Rect])
+        return Annot("link", uid=next(_ids), box=box, text=str(uri), origin=index, subtype=subtype,
+                     color=DEFAULT_COLORS["link"])
     if not subtype or subtype in SKIPPED_SUBTYPES:
         return None
     if int(_number(obj.get("/F", 0), 0)) & 2:       # 隱藏的註解:保留但不顯示在編輯器
@@ -339,6 +365,7 @@ def parse(obj, index, to_page):
             else:
                 background = _color(obj.get("/C"), ()) if "/C" in obj else ()
             return Annot(kind, box=box, width=_border_width(obj, 0.0), font=str(obj.get("/NaizFont", "")),
+                         bold=bool(obj.get("/NaizBold", False)), italic=bool(obj.get("/NaizItalic", False)),
                          background=background,
                          font_size=_number(size.group(1), 12.0) if size else 12.0, **common)
         if kind == "note":
@@ -418,4 +445,4 @@ def read_page(page_obj, size, base_rotation, origin):
 
 LABELS = {"highlight": "螢光筆", "underline": "底線", "strike": "刪除線", "textbox": "文字框", "note": "便利貼",
           "line": "直線", "arrow": "箭頭", "rect": "方框", "ellipse": "圓形", "ink": "手繪", "other": "其他註解",
-          "image": "圖片", "signature": "簽名", "replace": "改字", "redact": "塗黑", PAGE_IMAGE: "圖片"}
+          "image": "圖片", "signature": "簽名", "replace": "改字", "redact": "塗黑", PAGE_IMAGE: "圖片", "link": "連結", "stamp": "印章"}

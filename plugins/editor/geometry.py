@@ -69,6 +69,13 @@ def ref_to_user(ref):
     return page_to_user(ref.size, ref.base_rotation, ref.origin)
 
 
+def user_box(ref):
+    """頁面框在 PDF 使用者座標的範圍 (左, 下, 右, 上)。"""
+    width, height = unrotated_size(ref.size, ref.base_rotation)
+    x0, y0 = ref.origin
+    return x0, y0, x0 + width, y0 + height
+
+
 def ref_from_user(ref):
     return user_to_page(ref.size, ref.base_rotation, ref.origin)
 

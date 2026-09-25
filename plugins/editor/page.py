@@ -6,15 +6,19 @@ from pathlib import Path
 
 import pygame
 
-from core import deps, large_files, paths, theme, widgets, winfile
+from core import deps, large_files, paths, pdfium, theme, widgets, winfile
 from core.drag_sort import DragSort, move_items
 from core.plugins import Page
 from core.scroll import ScrollView
 from core.widgets import Button, Dropdown, TextInput, draw_text, rounded_panel
 
-from . import model, ops
+from . import annot_view, geometry, model, ops
 from .dialog import Dialog
 from .render import MAX_PIXELS, PageRenderer
+from .bookmarks import BookmarkPanel
+from .crop import CropMode
+from .ocrlayer import OcrBanner
+from .search import SearchBar
 from .tools import BAR_H, AnnotController
 
 SIDEBAR_W = 196
@@ -87,11 +91,21 @@ class EditorPage(Page):
         self.btn_delete = Button("刪除", filled=False, size=13)
         self.btn_blank = Button("空白頁", filled=False, size=13)
         self.btn_insert = Button("插入檔案", filled=False, size=13)
-        self.btn_extract = Button("擷取選取的頁面", filled=False, size=13)
+        self.btn_extract = Button("擷取頁面", filled=False, size=13)
+        self.btn_crop = Button("裁切", filled=False, size=13)
         self.btn_save_as = Button("選擇位置儲存", filled=False, size=13)
         self.btn_output = Button("輸出資料夾", filled=False, size=13)
+        self.btn_search = Button("搜尋", filled=False, size=13)
         self.btn_empty_open = Button("選擇 PDF 檔案", accent=accent, size=15)
         self.annot = AnnotController(self)
+        self.search = SearchBar(self, accent)
+        self.crop = CropMode(self, accent)
+        self.bookmarks = BookmarkPanel(self, accent)
+        self.ocr = OcrBanner(self, accent)
+        self._images_done = set()   # 已經找過原檔圖片的 (來源, 第幾頁)
+        self._image_uids = {}
+        self.side_tab = "pages"     # 左側欄:pages 頁面縮圖、bookmarks 書籤
+        self.side_tabs = []
 
     # ------------------------------------------------------------ 資料
 
@@ -179,6 +193,12 @@ class EditorPage(Page):
             return False
         view_state = (self.zoom_mode, self.zoom, self.view.scroll, self.current_index()) if keep_view else None
         self.close_documents()
+        self._images_done.clear()
+        self._image_uids.clear()
+        self.search.reset()
+        self.crop.stop()
+        self.bookmarks.reset()
+        self.ocr.reset()
         self.docs[str(path)] = doc
         if data is not None:
             self.data[str(path)] = data
@@ -209,6 +229,8 @@ class EditorPage(Page):
         self.zoom_mode = "fit_width"
         self.message = None
         self.annot.reset()
+        self.search.reset()
+        self.crop.stop()
         self.deactivate()
 
     def close_documents(self):
@@ -474,6 +496,45 @@ class EditorPage(Page):
         """主畫面上 1 點是幾個像素。"""
         return POINT_PX * self.zoom
 
+    def ensure_images(self, index):
+        """第 index 頁第一次顯示時才找原檔的圖片(開檔時不一頁一頁解析,幾百頁的書才開得快)。"""
+        ref = self.pages[index]
+        if ref.kind != "pdf" or (ref.source, ref.index) in self._images_done:
+            return
+        key = (ref.source, ref.index)
+        self._images_done.add(key)
+        doc = self.docs.get(ref.source)
+        if doc is None:
+            return
+        try:
+            found = pdfium.page_images(doc, ref.index)
+        except Exception:
+            return
+        if not found:
+            return
+
+        def add(page):
+            if page.kind == "pdf" and (page.source, page.index) == key:
+                return ops.with_page_images(page, found, self._image_uids)
+            return page
+
+        self.history.patch(add)
+
+    def index_of(self, uid):
+        return next((i for i, page in enumerate(self.pages) if page.uid == uid), None)
+
+    def scroll_to_box(self, index, box):
+        """捲到第 index 頁的 box(頁面座標)那裡,放在畫面上方三分之一的位置(搜尋跳到找到的地方用)。"""
+        page = self.pages[index]
+        scale = POINT_PX * self.zoom
+        _, top, _, _ = geometry.shown_box(box, page.size, page.rotation)
+        for i, rect in self.layout:
+            if i == index:
+                self.view.set_scroll(rect.y + top * scale - self.view_rect.height / 3)
+                break
+        self.selected = {page.uid}
+        self.anchor = page.uid
+
     def scroll_to_page(self, index):
         index = max(0, min(len(self.pages) - 1, index))
         for i, rect in self.layout:
@@ -521,7 +582,8 @@ class EditorPage(Page):
         self.btn_zoom_in.draw(screen, pygame.Rect(x, y, 32, h), mouse_pos)
         x += 48
         save_w = 70
-        room = rect.right - save_w - 12
+        search_x = rect.right - save_w - 8 - 56
+        room = search_x - 12
         if has_doc and x + 50 <= room:
             if not self.page_input.focused:
                 self.page_input.set_text(str(self.current_index() + 1))
@@ -533,6 +595,8 @@ class EditorPage(Page):
             # 視窗太窄時不顯示頁碼,避免和「儲存」重疊
             self.page_input.blur()
             self.page_input.rect = pygame.Rect(0, 0, 0, 0)
+        self.btn_search.enabled = has_doc and not self.busy
+        self.btn_search.draw(screen, pygame.Rect(search_x, y, 56, h), mouse_pos)
         self.btn_save.enabled = has_doc and not self.busy
         self.btn_save.draw(screen, pygame.Rect(rect.right - save_w, y, save_w, h), mouse_pos)
         self.zoom_menu.draw_menu(screen, mouse_pos)
@@ -606,6 +670,7 @@ class EditorPage(Page):
             screen_rect = rect.move(round(offset_x), area.y - self.view.scroll)
             if screen_rect.bottom < area.y or screen_rect.top > area.bottom:
                 continue
+            self.ensure_images(index)
             page = self.pages[index]
             self.page_hits.append((index, screen_rect))
             shadow = screen_rect.move(3, 4)
@@ -616,10 +681,12 @@ class EditorPage(Page):
             if full_pixels <= MAX_PIXELS:
                 key = self.renderer.key(page, scale, extra=hidden)
                 surface = self.renderer.get(key)
+                self.annot.page_shown(page.uid, surface is not None)
                 if surface is None:
                     requests.append((key, page, scale, None))
-                    self._blit_fallback(page, screen_rect)
+                    self._blit_fallback(page, screen_rect, scale)
                 else:
+                    self.renderer.shown(key, surface)
                     screen.blit(surface, screen_rect.topleft)
             else:
                 # 放很大時只畫看得到的範圍;以 200 點為一格對齊,捲動一點點不用重畫
@@ -633,17 +700,24 @@ class EditorPage(Page):
                 crop = (x0, height_pt - y1, width_pt - x1, y0)
                 key = self.renderer.key(page, scale, crop, hidden)
                 surface = self.renderer.get(key)
+                self.annot.page_shown(page.uid, surface is not None)
                 if surface is None:
                     requests.append((key, page, scale, crop))
                     self._blit_fallback(page, screen_rect)
                 else:
                     screen.blit(surface, (screen_rect.x + round(x0 * scale), screen_rect.y + round(y0 * scale)))
             self.annot.draw_page(index, screen_rect, scale)
+            mapper = annot_view.Mapper(page, screen_rect, scale)
+            self.search.draw_page(screen, page, mapper)
+            self.crop.draw_page(screen, index, mapper)
             if self.renderer.failed(self.renderer.key(page, scale, extra=hidden)):
                 draw_text(screen, "這一頁無法顯示", screen_rect.center, 14, theme.DANGER, center=True)
             if index in selected and len(self.pages) > 1:
                 pygame.draw.rect(screen, self.tool.accent, screen_rect.inflate(6, 6), 2, border_radius=3)
         self.annot.draw_view_overlay()
+        self.search.draw(screen, area, mouse_pos)
+        self.crop.draw_bar(screen, area, mouse_pos)
+        self.ocr.draw(screen, area, mouse_pos)
         screen.set_clip(None)
         self._thumb_requests_main = requests
         self.view.draw(screen, mouse_pos)
@@ -654,7 +728,22 @@ class EditorPage(Page):
             pygame.draw.rect(screen, theme.PANEL_LIGHT, track, border_radius=2)
             pygame.draw.rect(screen, self.tool.accent, (left, track.y, bar_w, 3), border_radius=2)
 
-    def _blit_fallback(self, page, rect):
+    def prerender(self, index):
+        """馬上畫好這一頁目前該有的樣子(例如按下原檔圖片、那張圖先不畫);頁面很大、只畫局部時不處理。"""
+        page = self.pages[index]
+        scale = POINT_PX * self.zoom
+        width, height = page.shown_size
+        if width * scale * height * scale > MAX_PIXELS:
+            return
+        key = self.renderer.key(page, scale, extra=self.annot.extra_hidden(page))
+        self.renderer.render_now(key, page, scale)
+
+    def _blit_fallback(self, page, rect, scale=None):
+        # 同一個大小上一次畫的圖(例如剛移動圖片、新的樣子還在畫)直接頂著,不用縮放,也不會閃
+        recent = self.renderer.last_shown(page, scale) if scale is not None else None
+        if recent is not None and abs(recent.get_width() - rect.width) <= 2 and abs(recent.get_height() - rect.height) <= 2:
+            self.screen.blit(recent, rect.topleft)
+            return
         fallback = self.renderer.fallback(page)
         if fallback is not None:
             self.screen.blit(pygame.transform.scale(fallback, rect.size), rect.topleft)
@@ -672,9 +761,27 @@ class EditorPage(Page):
         rounded_panel(screen, side, theme.PANEL, radius=0, alpha=240)
         pygame.draw.line(screen, theme.PANEL_EDGE, (side.right - 1, side.y), (side.right - 1, side.bottom))
         count = len(self.selected_indexes())
-        draw_text(screen, f"頁面 ({len(self.pages)})", (side.x + 14, side.y + 12), 14, theme.TEXT, bold=True)
-        if count:
-            draw_text(screen, f"已選 {count} 頁", (side.right - 14, side.y + 21), 12, accent, right=True)
+        # 上面兩個分頁:頁面、書籤
+        self.side_tabs = []
+        x = side.x + 10
+        marks = sum(len(page.bookmarks) for page in self.pages)
+        for key, label in (("pages", f"頁面 ({len(self.pages)})"), ("bookmarks", f"書籤 ({marks})")):
+            tab = pygame.Rect(x, side.y + 6, theme.font(13).size(label)[0] + 18, 28)
+            active = self.side_tab == key
+            if active:
+                rounded_panel(screen, tab, tuple(int(c * 0.28) for c in accent), radius=7, border=accent)
+            elif tab.collidepoint(mouse_pos):
+                rounded_panel(screen, tab, theme.PANEL_LIGHT, radius=7)
+            draw_text(screen, label, tab.center, 13, accent if active else theme.TEXT_DIM, bold=active, center=True)
+            self.side_tabs.append((key, tab))
+            x = tab.right + 6
+        if self.side_tab == "bookmarks":
+            self.thumb_area = pygame.Rect(0, 0, 0, 0)
+            self.thumb_slots = []
+            self.drag.set_slots([], len(self.pages))
+            self.bookmarks.draw(screen, pygame.Rect(side.x, side.y + 40, side.width, side.height - 40), mouse_pos)
+            self.renderer.want(getattr(self, "_thumb_requests_main", []))
+            return
         area = pygame.Rect(side.x, side.y + 40, side.width, side.height - 40 - OPS_H)
         self.thumb_area = area
         self.thumb_view.layout(area, len(self.pages) * THUMB_SLOT + 10)
@@ -729,14 +836,12 @@ class EditorPage(Page):
         x, y = rect.x + 12, rect.y + 10
         half = (rect.width - 24 - 8) // 2
         rows = ((self.btn_rotate_left, self.btn_rotate_right), (self.btn_duplicate, self.btn_delete),
-                (self.btn_blank, self.btn_insert))
+                (self.btn_blank, self.btn_insert), (self.btn_crop, self.btn_extract))
         for left, right in rows:
             for button, bx in ((left, x), (right, x + half + 8)):
                 button.enabled = not self.busy and (has_selection or button in (self.btn_blank, self.btn_insert))
                 button.draw(screen, pygame.Rect(bx, y, half, 32), mouse_pos)
             y += 38
-        self.btn_extract.enabled = has_selection and not self.busy
-        self.btn_extract.draw(screen, pygame.Rect(x, y, rect.width - 24, 32), mouse_pos)
 
     def _draw_status(self, rect, mouse_pos):
         screen = self.screen
@@ -752,6 +857,9 @@ class EditorPage(Page):
             return
         name = draw_text(screen, widgets.clip_text(Path(self.path).name, 13, 260), (x, rect.y + 14), 13, theme.TEXT)
         info = f"{len(self.pages)} 頁"
+        chosen = len(self.selected_indexes())
+        if chosen > 1:
+            info += f" · 已選 {chosen} 頁"
         if self.history.dirty:
             info += " · 有尚未儲存的變更"
         draw_text(screen, info, (name.right + 12, rect.y + 14), 13,
@@ -801,13 +909,16 @@ class EditorPage(Page):
     # ------------------------------------------------------------ 事件
 
     def modal_open(self):
-        return self.dialog.is_open or self.annot.picker.is_open or self.annot.signatures.is_open
+        return self.dialog.is_open or self.annot.picker.is_open or self.annot.signatures.is_open \
+            or self.annot.stamps.is_open
 
     def draw_modal(self, mouse_pos):
         if self.annot.picker.is_open:
             self.annot.picker.draw(mouse_pos)
         elif self.annot.signatures.is_open:
             self.annot.signatures.draw(mouse_pos)
+        elif self.annot.stamps.is_open:
+            self.annot.stamps.draw(mouse_pos)
         else:
             self.dialog.draw(mouse_pos)
 
@@ -816,6 +927,8 @@ class EditorPage(Page):
             self.annot.picker.handle_event(event, mouse_pos)
         elif self.annot.signatures.is_open:
             self.annot.signatures.handle_event(event, mouse_pos)
+        elif self.annot.stamps.is_open:
+            self.annot.stamps.handle_event(event, mouse_pos)
         else:
             self.dialog.handle_event(event, mouse_pos)
 
@@ -850,6 +963,12 @@ class EditorPage(Page):
             self.page_input.handle(event, mouse_pos)
         if self.page_input.focused:
             return
+        if self.path is not None and self.crop.handle_event(event, mouse_pos):
+            return
+        if self.path is not None and self.ocr.handle_event(event, mouse_pos):
+            return
+        if self.path is not None and self.search.handle_event(event, mouse_pos):
+            return
         if self.path is not None and self.annot.handle_event(event, mouse_pos):
             self._pending_single = None
             return
@@ -860,12 +979,23 @@ class EditorPage(Page):
             self.selected = {self._pending_single}
             self._pending_single = None
         if event.type == pygame.KEYDOWN:
+            # 書籤分頁選了書籤時,Delete、F2 是刪除、改名書籤,不是刪除頁面
+            if self.side_tab == "bookmarks" and self.bookmarks.handle_event(event, mouse_pos):
+                return
             self._handle_key(event)
             return
         if event.type == pygame.MOUSEWHEEL:
             self._handle_wheel(event, mouse_pos)
             return
         if self.path is not None and self.sidebar_rect.collidepoint(mouse_pos):
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                for key, tab in self.side_tabs:
+                    if tab.collidepoint(mouse_pos):
+                        self.side_tab = key
+                        return
+            if self.side_tab == "bookmarks":
+                self.bookmarks.handle_event(event, mouse_pos)
+                return
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self._press_thumb(mouse_pos):
                 return
             if self.thumb_view.handle_event(event, mouse_pos):
@@ -991,6 +1121,7 @@ class EditorPage(Page):
             (self.btn_zoom_out, lambda: self.step_zoom(-1)),
             (self.btn_zoom_in, lambda: self.step_zoom(1)),
             (self.btn_save, self.save),
+            (self.btn_search, self.search.open),
             (self.btn_save_as, self.save_as),
             (self.btn_rotate_left, lambda: self.rotate(270)),
             (self.btn_rotate_right, lambda: self.rotate(90)),
@@ -999,6 +1130,7 @@ class EditorPage(Page):
             (self.btn_blank, self.insert_blank),
             (self.btn_insert, self.ask_insert_file),
             (self.btn_extract, self.extract),
+            (self.btn_crop, self.crop.start),
         ]
         for button, action in actions:
             if button.clicked(pos, True):

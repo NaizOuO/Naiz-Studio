@@ -99,7 +99,7 @@ def _textbox_surface(mapper, annot, cache):
     _, result = pdfwrite.text_layout(annot)
     if result is not None:
         inset = (annots.TEXT_PAD + annot.width) * scale
-        fonts.draw_layout(draw, result, (inset, inset), scale, color)
+        fonts.draw_layout(draw, result, (inset, inset), scale, color, annot.bold, annot.italic)
     surface = pygame.image.frombytes(image.tobytes(), image.size, "RGBA")
     if mapper.rotation:
         surface = pygame.transform.rotate(surface, -mapper.rotation)
@@ -129,13 +129,52 @@ def _image_surface(mapper, annot, cache):
     return surface
 
 
+def dashed_rect(screen, color, rect, dash=6, gap=4):
+    for x0, y0, x1, y1 in ((rect.left, rect.top, rect.right, rect.top), (rect.left, rect.bottom - 1, rect.right, rect.bottom - 1),
+                           (rect.left, rect.top, rect.left, rect.bottom), (rect.right - 1, rect.top, rect.right - 1, rect.bottom)):
+        length = max(abs(x1 - x0), abs(y1 - y0))
+        for start in range(0, length, dash + gap):
+            end = min(length, start + dash)
+            if x0 == x1:
+                pygame.draw.line(screen, color, (x0, y0 + start), (x0, y0 + end))
+            else:
+                pygame.draw.line(screen, color, (x0 + start, y0), (x0 + end, y0))
+
+
+def draw_picture(screen, mapper, box, picture, cache):
+    """把畫好的圖(pygame 的圖)縮放到 box(頁面座標)畫上去;同一個大小只縮放一次。"""
+    area = mapper.box(box)
+    size = (max(1, area.width), max(1, area.height)) if mapper.rotation % 180 == 0 else \
+        (max(1, area.height), max(1, area.width))
+    if size[0] * size[1] > 40_000_000:
+        return
+    key = ("picture", id(picture), size, mapper.rotation)
+    surface = cache.get(key)
+    if surface is None:
+        surface = pygame.transform.smoothscale(picture, size)
+        if mapper.rotation:
+            surface = pygame.transform.rotate(surface, -mapper.rotation)
+        cache.put(key, surface)
+    screen.blit(surface, area.topleft)
+
+
 def draw_annot(screen, mapper, annot, cache):
     kind = annot.kind
     scale = mapper.scale
     color = tuple(annot.color)
-    if kind == annots.PAGE_IMAGE and not annot.image:
-        return                      # 原檔的圖片由 PDFium 畫;只有拖曳中才帶著圖在這裡畫
-    if kind in annots.IMAGES or kind == annots.PAGE_IMAGE:
+    if kind == annots.PAGE_IMAGE:
+        return                      # 原檔的圖片由 PDFium 畫;拖曳中另外用 draw_picture 畫
+    if kind == "link":
+        # 連結在 PDF 裡看不到,編輯器裡用淡色底加虛線框標出範圍
+        area = mapper.box(annot.box)
+        visible = area.clip(screen.get_clip())
+        if visible.width > 0 and visible.height > 0:
+            layer = pygame.Surface(visible.size, pygame.SRCALPHA)
+            layer.fill(color + (40,))
+            screen.blit(layer, visible.topleft)
+        dashed_rect(screen, color, area)
+        return
+    if kind in annots.IMAGES:
         surface = _image_surface(mapper, annot, cache)
         if surface is not None:
             if annot.opacity < 0.999:

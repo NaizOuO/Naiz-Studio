@@ -482,10 +482,20 @@ def match_pdf_font(name, serif=False, bold=False, cjk=True):
             if face is not None and face.usable:
                 return face
     else:
-        face = CATALOG.system_file("times.ttf" if serif else "arial.ttf")
+        # 看名稱判斷字型的樣子(PDF 記的旗標常常不準):有沒有襯線、粗體、斜體,挑最像的 Times 或 Arial
+        serif = (serif or any(word in plain for word in _SERIF_WORDS)) and "sans" not in plain
+        bold = bold or any(word in plain for word in ("bold", "black", "heavy", "semibold", "demi"))
+        italic = any(word in plain for word in ("italic", "oblique", "ital"))
+        family = ("times", "timesbd", "timesi", "timesbi") if serif else ("arial", "arialbd", "ariali", "arialbi")
+        face = CATALOG.system_file(family[(1 if bold else 0) + (2 if italic else 0)] + ".ttf")
         if face is not None and face.usable:
             return face
     return CATALOG.default()
+
+
+_SERIF_WORDS = ("times", "roman", "serif", "baskerville", "garamond", "minion", "georgia", "caslon", "palatino",
+                "century", "bookman", "cambria", "antiqua", "schoolbook", "bodoni", "didot", "charter", "cmr",
+                "lmroman", "utopia", "plantin", "sabon", "janson", "goudy", "mincho", "ming", "song")
 
 
 # ------------------------------------------------------------ 排版
@@ -594,12 +604,18 @@ def _align(lines, text, faces, width, align, offsets):
     """把每一行依對齊方式與縮排移到該在的位置;兩端對齊時把多出來的寬度平均分給字和字之間。"""
     for row, line in enumerate(lines):
         offset = offsets[0] if row == 0 else offsets[1]
-        room = width - offset - line.width
+        visible = line.end
+        while visible > line.start and text[visible - 1] == " ":
+            visible -= 1            # 行尾的空白看不見,對齊時不算
+        room = width - offset - line.xs[visible - line.start]
         count = line.end - line.start
         ends_paragraph = row == len(lines) - 1 or line.end < len(text) and text[line.end] == "\n"
         gap = 0.0
+        # 英文等有空白的行:多出來的寬度只分給字和字之間的空白(字母本身不拉開);中文才平均分給每個字
+        spaces = [i for i in range(line.start, visible - 1) if text[i] == " "]
+        by_word = bool(spaces) and not any(_cjk(text[i]) for i in range(line.start, line.end))
         if align == "justify" and not ends_paragraph and count > 1 and room > 0:
-            gap = room / (count - 1)
+            gap = room / (len(spaces) if by_word else count - 1)
             shift = offset
         elif align == "center":
             shift = offset + max(0.0, room) / 2
@@ -609,7 +625,16 @@ def _align(lines, text, faces, width, align, offsets):
             shift = offset
         if not shift and not gap:
             continue
-        line.xs = [x + shift + gap * min(i, count - 1) for i, x in enumerate(line.xs)]
+        if by_word and gap:
+            before, added = set(spaces), []
+            total = 0.0
+            for i in range(count + 1):
+                added.append(total)
+                if line.start + i in before:
+                    total += gap
+            line.xs = [x + shift + added[i] for i, x in enumerate(line.xs)]
+        else:
+            line.xs = [x + shift + gap * min(i, count - 1) for i, x in enumerate(line.xs)]
         if gap:
             line.runs = [(faces[i], text[i].replace("\t", " "), line.xs[i - line.start])
                          for i in range(line.start, line.end)]
@@ -632,7 +657,9 @@ def arrange(text, advances, faces=None, max_width=None, offsets=(0.0, 0.0)):
             continue
         if limit and x + advances[i] > limit and i > start:
             cut = i
-            if _wordish(ch) and _wordish(text[i - 1]):
+            if ch == " ":
+                cut = i + 1         # 剛好在空白處換行:空白留在上一行的行尾(看不見),下一行不會多一個空白開頭
+            elif _wordish(ch) and _wordish(text[i - 1]):
                 space = text.rfind(" ", start, i)
                 if space >= start:
                     cut = space + 1
@@ -673,15 +700,34 @@ def preview_font(face, size):
     return font
 
 
-def draw_layout(draw, result, origin, scale, fill):
-    """用 Pillow 把排好的文字畫出來;origin 是文字區左上角的像素位置。"""
+BOLD_STROKE = 0.05          # 粗體:外框描邊的粗細(字級的倍數;PDF 的線一半在字外面)
+ITALIC_SLANT = 0.21         # 斜體:每往上 1 點往右斜多少
+
+
+def draw_layout(draw, result, origin, scale, fill, bold=False, italic=False):
+    """用 Pillow 把排好的文字畫出來;origin 是文字區左上角的像素位置。
+    粗體是字的外框加描邊;斜體是每一行各自以底線為準往右斜(和存檔時的做法一樣)。"""
+    from PIL import Image, ImageDraw
+
     ox, oy = origin
+    stroke = result.size * scale * BOLD_STROKE / 2 if bold else 0      # Pillow 的描邊是往外長的寬度
+    target = draw._image
     for row, line in enumerate(result.lines):
         baseline = oy + result.baseline(row) * scale
+        layer = Image.new("RGBA", target.size, (0, 0, 0, 0)) if italic else None
+        pen = ImageDraw.Draw(layer) if italic else draw
         for face, text, x in line.runs:
             if text.strip():
-                draw.text((ox + x * scale, baseline), text, font=data(face).pil(result.size * scale), fill=fill,
-                          anchor="ls")
+                pen.text((ox + x * scale, baseline), text, font=data(face).pil(result.size * scale), fill=fill,
+                         anchor="ls", stroke_width=stroke, stroke_fill=fill if stroke else None)
+        if italic:
+            # 輸出的 (x, y) 取輸入的 (x - 斜率 × (底線 - y), y):底線以上的部分往右移
+            layer = layer.transform(layer.size, Image.Transform.AFFINE,
+                                    (1, ITALIC_SLANT, -ITALIC_SLANT * baseline, 0, 1, 0), Image.Resampling.BICUBIC)
+            if target.mode == "RGBA":
+                target.alpha_composite(layer)
+            else:
+                target.paste(layer, (0, 0), layer)
 
 
 def missing_chars(text, face, fallback):

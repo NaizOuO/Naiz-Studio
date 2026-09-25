@@ -1,6 +1,7 @@
 """PDF 編輯器的檔案處理:開啟(含密碼)、讀取頁面資訊、依頁面清單儲存新檔、修復損壞的 PDF。"""
 
 import io
+from dataclasses import replace
 from pathlib import Path
 
 import pikepdf
@@ -9,7 +10,7 @@ from PIL import Image, ImageOps
 from core import pdfium
 from core.files import atomic_path, free_path
 
-from . import annots, model, pdfwrite
+from . import annots, geometry, model, pdfwrite
 
 IMAGE_DPI = 96      # 插入圖片時,每 96 像素算 1 英吋(和圖片工具轉 PDF 一樣)
 MEMORY_LIMIT = 400 * 1024 * 1024    # 超過這個大小的 PDF 不讀進記憶體,改成直接開檔
@@ -57,33 +58,105 @@ def open_pdf(path, password=None):
     return doc, pages, data
 
 
-def read_annotations(path, password, infos, data=None):
-    """每一頁原本就有的註解;infos 是 PDFium 讀到的 [(寬高, 旋轉, 頁面框原點)]。讀不到時當作沒有註解。"""
-    found = [()] * len(infos)
+def _inherited(obj, key):
+    """頁面的屬性;頁面自己沒有時往上層找(旋轉、頁面框可以寫在上層)。"""
+    node, depth = obj, 0
+    while node is not None and depth < 64:
+        if key in node:
+            return node[key]
+        node, depth = node.get("/Parent"), depth + 1
+    return None
+
+
+def _box(value):
+    try:
+        x0, y0, x1, y1 = (float(v) for v in value)
+    except (TypeError, ValueError):
+        return None
+    box = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+    return box if box[2] > box[0] and box[3] > box[1] else None
+
+
+def _page_boxes(obj):
+    """(旋轉, 頁面框, 紙張範圍),和 PDFium 的算法一樣:沒有 MediaBox 用 Letter,裁切範圍要落在紙張裡面。"""
+    try:
+        rotate = int(float(_inherited(obj, "/Rotate") or 0))
+    except (TypeError, ValueError):
+        rotate = 0
+    quarter = abs(rotate) // 90 * (1 if rotate >= 0 else -1)
+    media = _box(_inherited(obj, "/MediaBox")) or (0.0, 0.0, 612.0, 792.0)
+    crop = _box(_inherited(obj, "/CropBox"))
+    if crop is None:
+        crop = media
+    else:
+        crop = (max(crop[0], media[0]), max(crop[1], media[1]), min(crop[2], media[2]), min(crop[3], media[3]))
+        if crop[2] <= crop[0] or crop[3] <= crop[1]:
+            crop = media
+    return (quarter % 4) * 90, crop, media
+
+
+def read_pages(doc, path, password, data=None):
+    """每一頁的 (寬高, 旋轉, 頁面框原點, 紙張範圍, 原本的註解)。
+
+    不逐頁載入 PDFium 的頁面(要解析整頁內容,幾百頁的書會慢好幾秒):寬高用 PDFium 不解析內容的讀法,
+    旋轉與頁面框直接讀 PDF 的頁面資料。讀不到時改用 PDFium 一頁一頁讀,這時沒有原本的註解。"""
+    count = pdfium.page_count(doc)
+    sizes = pdfium.page_sizes(doc)
     try:
         with pikepdf.open(io.BytesIO(data) if data is not None else path, password=password or "") as pdf:
-            if len(pdf.pages) != len(infos):
-                return found
+            if len(pdf.pages) != count:
+                raise ValueError("頁數不一致")
+            result = []
             for index, page in enumerate(pdf.pages):
+                rotation, crop, media = _page_boxes(page.obj)
+                size, origin = sizes[index], (crop[0], crop[1])
+                found = ()
                 if "/Annots" in page.obj:
-                    size, rotation, origin = infos[index]
-                    found[index] = annots.read_page(page.obj, size, rotation, origin)
+                    try:
+                        found = annots.read_page(page.obj, size, rotation, origin)
+                    except Exception:
+                        found = ()
+                result.append((size, rotation, origin, media, found))
+            return result
     except Exception:
-        pass
-    return found
+        result = []
+        for index in range(count):
+            size, rotation, origin = pdfium.page_info(doc, index)
+            result.append((size, rotation, origin, pdfium.media_box(doc, index), ()))
+        return result
+
+
+def _full_page(media, size, rotation, origin):
+    """原檔就有裁切的頁面:記下完整紙張的 (寬高, 原點),才能「還原原本大小」;沒有裁切時是空的。"""
+    left, bottom, right, top = media
+    width, height = right - left, top - bottom
+    full_size = (height, width) if rotation % 180 else (width, height)
+    if abs(left - origin[0]) < 0.5 and abs(bottom - origin[1]) < 0.5 \
+            and abs(full_size[0] - size[0]) < 0.5 and abs(full_size[1] - size[1]) < 0.5:
+        return ()
+    return full_size, (left, bottom)
 
 
 def page_refs(doc, path, password=None, data=None):
-    """PDF 每一頁的頁面資料(含原本的註解)。"""
-    infos = [pdfium.page_info(doc, index) for index in range(pdfium.page_count(doc))]
-    found = read_annotations(path, password, infos, data)
+    """PDF 每一頁的頁面資料(含原本的註解、書籤);原檔的圖片等頁面顯示時才找(見 load_page_images)。"""
+    marks = [[] for _ in range(pdfium.page_count(doc))]
+    for level, title, index in pdfium.outline(doc):
+        if index < len(marks):
+            marks[index].append((title, level))
     refs = []
-    for index, (size, rotation, origin) in enumerate(infos):
-        # 原檔的圖片放在最前面:點選時註解優先,圖片在最底下
-        items = annots.page_images(pdfium.page_images(doc, index), size, rotation, origin) + found[index]
+    for index, (size, rotation, origin, media, found) in enumerate(read_pages(doc, path, password, data)):
         refs.append(model.new_ref("pdf", source=str(path), index=index, size=size, base_rotation=rotation,
-                                  origin=origin, annots=items, originals=items))
+                                  origin=origin, annots=found, originals=found,
+                                  full=_full_page(media, size, rotation, origin), bookmarks=tuple(marks[index])))
     return refs
+
+
+def with_page_images(ref, found, uids):
+    """把原檔的圖片加到這一頁(放在最前面:點選時註解優先,圖片在最底下)。
+    found 是 core.pdfium.page_images 的結果;uids 是 (頁面 uid, 圖片編號) → 註解 uid,同一頁每個版本用同一個 uid。"""
+    images = annots.page_images(found, ref.size, ref.base_rotation, ref.origin)
+    images = tuple(replace(image, uid=uids.setdefault((ref.uid, image.number), image.uid)) for image in images)
+    return replace(ref, annots=images + ref.annots, originals=images + ref.originals)
 
 
 def load_image(path):
@@ -148,10 +221,15 @@ def build(pages, out_path, passwords=None, progress=None, cancel=None, flatten=F
                     dst.add_blank_page(page_size=ref.size)
                 # 旋轉用 PDFium 讀到的角度重新設定,連從上層繼承來的旋轉也算進去
                 dst.pages[-1].obj.Rotate = (ref.base_rotation + ref.rotation) % 360
+                if ref.kind == "pdf" and ref.full:
+                    # 裁切過的頁面:只改看得到的範圍,內容都還在
+                    dst.pages[-1].obj.CropBox = [round(v, 3) for v in geometry.user_box(ref)]
                 pdfwrite.write_page(dst, dst.pages[-1], ref, embedder)
                 if progress:
                     progress(number, len(pages))
             embedder.finish()
+            pdfwrite.connect_links(dst, embedder, [ref.uid for ref in pages])
+            _write_outline(dst, pages)
             if report is not None:
                 report["kept_text"] = embedder.kept_text
                 report["kept_images"] = embedder.kept_images
@@ -164,6 +242,21 @@ def build(pages, out_path, passwords=None, progress=None, cancel=None, flatten=F
         for pdf in (*opened.values(), *extra):
             pdf.close()
     return out_path
+
+
+def _write_outline(pdf, pages):
+    """依頁面順序寫出書籤;層級比前一個深的放在它底下。"""
+    if not any(ref.bookmarks for ref in pages):
+        return
+    with pdf.open_outline() as outline:
+        stack = [(-1, outline.root)]
+        for number, ref in enumerate(pages):
+            for title, level in ref.bookmarks:
+                item = pikepdf.OutlineItem(title, number)
+                while stack[-1][0] >= level:
+                    stack.pop()
+                stack[-1][1].append(item)
+                stack.append((level, item.children))
 
 
 def default_output(folder, source, suffix="_edited"):

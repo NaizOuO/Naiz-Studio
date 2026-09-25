@@ -132,7 +132,29 @@ def _signature(draw):
     _fill(draw, [(12.4, 18.2), (13.2, 15.6), (14.9, 17.3)])
 
 
-DRAW = {"select": _select, "highlight": _highlight, "underline": _underline, "strike": _strike,
+def _link(draw):
+    # 兩個斜放的環扣在一起:先畫粗線當外框,再用細線挖空中間
+    for (x0, y0), (x1, y1) in (((5.5, 17.5), (10.5, 12.5)), ((13.5, 11.5), (18.5, 6.5))):
+        draw.line(_pt([(x0, y0), (x1, y1)]), fill=255, width=round(7.5 * SCALE))
+        for x, y in ((x0, y0), (x1, y1)):
+            r = 3.75 * SCALE
+            draw.ellipse((x * SCALE - r, y * SCALE - r, x * SCALE + r, y * SCALE + r), fill=255)
+        draw.line(_pt([(x0, y0), (x1, y1)]), fill=0, width=round(3.7 * SCALE))
+        for x, y in ((x0, y0), (x1, y1)):
+            r = 1.85 * SCALE
+            draw.ellipse((x * SCALE - r, y * SCALE - r, x * SCALE + r, y * SCALE + r), fill=0)
+    _line(draw, [(9.5, 14.5), (14.5, 9.5)], 2.0)
+
+
+def _stamp(draw):
+    # 蓋章用的印章:握把、頸部、印面,下面一條印出來的線
+    draw.ellipse(tuple(v * SCALE for v in (8.5, 2.5, 15.5, 9.5)), outline=255, width=round(1.8 * SCALE))
+    _line(draw, [(10.5, 9.5), (10, 13), (14, 13), (13.5, 9.5)], 1.8)
+    _box(draw, (4, 13, 20, 17.5), 1.8, 1.2)
+    _line(draw, [(4, 21), (20, 21)], 2.0)
+
+
+DRAW = {"select": _select, "link": _link, "stamp": _stamp, "highlight": _highlight, "underline": _underline, "strike": _strike,
         "textbox": _textbox, "replace": _replace, "redact": _redact, "note": _note, "line": _straight,
         "arrow": _arrow, "rect": _rect, "ellipse": _ellipse, "ink": _ink, "image": _image, "signature": _signature}
 

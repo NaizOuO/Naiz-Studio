@@ -6,6 +6,9 @@
 import itertools
 from dataclasses import dataclass, replace
 
+from . import annots as annot_mod
+from . import geometry
+
 HISTORY_LIMIT = 200
 A4 = (595.0, 842.0)
 _ids = itertools.count(1)
@@ -23,6 +26,9 @@ class PageRef:
     origin: tuple = (0.0, 0.0)  # 頁面框左下角在 PDF 裡的座標(大多是 0, 0)
     annots: tuple = ()          # 目前的註解(annots.Annot),座標見 geometry 的說明
     originals: tuple = ()       # 開檔時讀到的註解;沒被改過的原註解儲存時原封不動保留
+    full: tuple = ()            # 裁切過的頁面:裁切前的 (寬高, 頁面框原點),還原用;沒裁切過是空的
+    bookmarks: tuple = ()       # 指到這一頁的書籤:((標題, 層級), ...),依加入的先後
+    ocr: tuple = ()             # 掃描頁辨識出來的字:((文字, 範圍, 底線 y), ...),頁面座標;存檔時變成看不見的文字層
 
     @property
     def shown_size(self):
@@ -58,6 +64,54 @@ def duplicate(pages, indexes):
             result.append(replace(page, uid=next(_ids)))
             copies.append(len(result) - 1)
     return result, copies
+
+
+def crop(pages, indexes, box):
+    """把選取的頁面裁成 box(頁面座標,左上為原點);box 超出某一頁時只取那一頁裡面的部分。
+    註解跟著平移,位置看起來不變。回傳新的頁面清單。"""
+    chosen = set(indexes)
+    result = []
+    for i, page in enumerate(pages):
+        if i not in chosen:
+            result.append(page)
+            continue
+        width, height = page.size
+        x0, y0 = max(0.0, box[0]), max(0.0, box[1])
+        x1, y1 = min(width, box[2]), min(height, box[3])
+        if x1 - x0 < 10 or y1 - y0 < 10:
+            result.append(page)
+            continue
+        corners = [geometry.apply(geometry.ref_to_user(page), p) for p in ((x0, y0), (x1, y1))]
+        origin = (min(c[0] for c in corners), min(c[1] for c in corners))
+        size = (x1 - x0, y1 - y0)
+        full = page.full or (page.size, page.origin)
+        result.append(replace(page, size=size, origin=origin, full=full,
+                              annots=tuple(annot_mod.translated(a, -x0, -y0) for a in page.annots),
+                              originals=tuple(annot_mod.translated(a, -x0, -y0) for a in page.originals)))
+    return result
+
+
+def uncrop(pages, indexes):
+    """還原選取頁面裁切前的大小;註解跟著平移回去。"""
+    chosen = set(indexes)
+    result = []
+    for i, page in enumerate(pages):
+        if i not in chosen or not page.full:
+            result.append(page)
+            continue
+        size, origin = page.full
+        restored = replace(page, size=size, origin=origin, full=())
+        # 舊的左上角在還原後的頁面座標
+        corner = geometry.apply(geometry.ref_from_user(restored),
+                                geometry.apply(geometry.ref_to_user(page), (0.0, 0.0)))
+        dx, dy = corner
+        result.append(replace(restored, annots=tuple(annot_mod.translated(a, dx, dy) for a in page.annots),
+                              originals=tuple(annot_mod.translated(a, dx, dy) for a in page.originals)))
+    return result
+
+
+def set_bookmarks(pages, index, marks):
+    return [replace(page, bookmarks=tuple(marks)) if i == index else page for i, page in enumerate(pages)]
 
 
 def set_annots(pages, index, annots):
@@ -115,3 +169,11 @@ class History:
 
     def mark_saved(self):
         self._saved = tuple(self.pages)
+
+    def patch(self, change):
+        """每一個版本(目前、復原、重做、上次儲存)的每一頁都套用 change;用在補上晚一點才讀到的資料
+        (例如頁面第一次顯示時才找的原檔圖片),不算一次修改,也不影響「有沒有未儲存的變更」。"""
+        self.pages = [change(page) for page in self.pages]
+        self._undo = [tuple(change(page) for page in pages) for pages in self._undo]
+        self._redo = [tuple(change(page) for page in pages) for pages in self._redo]
+        self._saved = tuple(change(page) for page in self._saved)

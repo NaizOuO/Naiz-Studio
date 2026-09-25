@@ -4,6 +4,11 @@ PDF 裡的字型大多只留下用到的字(子集),而且對照表常常被拿�
 這裡把字型檔取出來,依 PDF 記的「代碼 → 文字」(ToUnicode)與「代碼 → 字形」重建一份正常的對照表,
 存成字型檔放在 fonts\\pdf\\,之後就能和電腦上的字型一樣排版、預覽、嵌入。
 原檔沒有用到的字不在子集裡,打這些字時會自動改用相近的字型補上。
+
+舊式的 Type1 字型(教科書、LaTeX 產生的 PDF 常見,CFF 或 PFB 格式、只有 256 個代碼)沒有正常的對照表,
+這裡依 PDF 記的編碼與字形名稱,把每個字形重新畫進一個新的 OpenType 字型。
+數學符號這類認不出是哪個字的字形(PDFium 讀出來是控制字元),對應到私用區 U+F000+代碼,
+段落文字裡也換成同一個字,這樣符號照樣用原字型畫,不會變成方框。
 """
 
 import hashlib
@@ -17,6 +22,13 @@ from core import paths
 from . import fonts
 
 _cache = {}         # (來源, 字型名稱) → FontFace 或 None
+SYMBOL_BASE = 0xF000    # 認不出是哪個字的字形:私用區 U+F000 + 代碼
+
+
+def symbol_text(ch):
+    """PDFium 讀出來的控制字元(認不出的符號)→ 私用區的字;其他字照舊。"""
+    code = ord(ch)
+    return chr(SYMBOL_BASE + code) if code < 0x20 and ch not in "\n\r" else ch
 
 
 def cache_dir():
@@ -63,7 +75,9 @@ def _find_font(resources, name, depth=0):
     if resources is None or depth > 4:
         return None
     for font in (resources.get("/Font") or {}).values():
-        if str(font.get("/BaseFont", ""))[1:] == name:
+        base = str(font.get("/BaseFont", ""))[1:]
+        # PDFium 回報的名稱有時不含子集前綴(ABCDEF+),兩種都要比
+        if base == name or _family(base) == _family(name):
             return font
     for xobject in (resources.get("/XObject") or {}).values():
         if isinstance(xobject, pikepdf.Stream) and str(xobject.get("/Subtype", "")) == "/Form":
@@ -83,6 +97,152 @@ def _program(descriptor):
     if font_file is not None and str(font_file.get("/Subtype", "")) == "/OpenType":
         return font_file.read_bytes()
     return None
+
+
+# ------------------------------------------------------------ 舊式 Type1 字型
+
+def _win_ansi():
+    from fontTools import agl
+
+    names = []
+    for code in range(256):
+        try:
+            ch = bytes([code]).decode("cp1252")
+        except UnicodeDecodeError:
+            names.append(".notdef")
+            continue
+        names.append(agl.UV2AGL.get(ord(ch), ".notdef") if code >= 0x20 else ".notdef")
+    return names
+
+
+def _base_encoding(name):
+    from fontTools.encodings.MacRoman import MacRoman
+    from fontTools.encodings.StandardEncoding import StandardEncoding
+
+    if name == "/MacRomanEncoding":
+        return list(MacRoman)
+    if name == "/WinAnsiEncoding":
+        return _win_ansi()
+    if name == "/StandardEncoding":
+        return list(StandardEncoding)
+    return None
+
+
+def _code_names(font_dict, builtin):
+    """代碼 0～255 各是哪個字形名稱:PDF 的編碼(含 Differences),沒寫時用字型自己的編碼。"""
+    encoding = font_dict.get("/Encoding")
+    base, differences = None, {}
+    if isinstance(encoding, pikepdf.Name):
+        base = _base_encoding(str(encoding))
+    elif isinstance(encoding, pikepdf.Dictionary):
+        if "/BaseEncoding" in encoding:
+            base = _base_encoding(str(encoding.BaseEncoding))
+        code = 0
+        for item in encoding.get("/Differences", []):
+            if isinstance(item, pikepdf.Name):
+                differences[code] = str(item)[1:]
+                code += 1
+            else:
+                code = int(item)
+    if base is None:
+        base = list(builtin) if builtin else _base_encoding("/StandardEncoding")
+    names = (list(base) + [".notdef"] * 256)[:256]
+    for code, name in differences.items():
+        if 0 <= code < 256:
+            names[code] = name
+    return names
+
+
+def _type1_glyphs(descriptor):
+    """(字形名稱 → 畫字形的函式, 字型自己的編碼, 單位換算);讀不懂時回傳 None。"""
+    font_file = descriptor.get("/FontFile3")
+    if font_file is not None and str(font_file.get("/Subtype", "")) == "/Type1C":
+        from fontTools.cffLib import CFFFontSet
+
+        cff = CFFFontSet()
+        cff.decompile(io.BytesIO(font_file.read_bytes()), None)
+        top = cff[cff.fontNames[0]]
+        if hasattr(top, "ROS"):
+            return None             # CID 字型另外處理(目前不支援)
+        strings = top.CharStrings
+        builtin = top.Encoding if isinstance(top.Encoding, list) else None
+        scale = float(top.FontMatrix[0]) * 1000 if hasattr(top, "FontMatrix") else 1.0
+        return {name: strings[name].draw for name in strings.keys()}, builtin, scale
+    if "/FontFile" in descriptor:
+        import tempfile
+        from pathlib import Path
+
+        from fontTools.t1Lib import T1Font
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "font.pfa"
+            path.write_bytes(descriptor.FontFile.read_bytes())
+            font = T1Font(str(path))
+            font.parse()
+        glyph_set = font.getGlyphSet()
+        encoding = font.font.get("Encoding")
+        builtin = encoding if isinstance(encoding, list) else None
+        matrix = font.font.get("FontMatrix", [0.001])
+        return {name: glyph_set[name].draw for name in glyph_set.keys()}, builtin, float(matrix[0]) * 1000
+    return None
+
+
+def _type1_font(font_dict, descriptor, family):
+    """舊式 Type1 字型 → (新的 OpenType 字型檔內容, 對照到的字數);做不出來時回傳 None。"""
+    from fontTools import agl
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.pens.boundsPen import BoundsPen
+    from fontTools.pens.t2CharStringPen import T2CharStringPen
+    from fontTools.pens.transformPen import TransformPen
+
+    found = _type1_glyphs(descriptor)
+    if found is None:
+        return None
+    draws, builtin, scale = found
+    names = _code_names(font_dict, builtin)
+    unicode = _unicode_map(font_dict.ToUnicode) if "/ToUnicode" in font_dict else {}
+    first = int(font_dict.get("/FirstChar", 0))
+    widths = [float(v) for v in font_dict.get("/Widths", [])]
+    missing = float(descriptor.get("/MissingWidth", 0))
+    cmap, advance = {}, {}
+    for code, name in enumerate(names):
+        if name == ".notdef" or name not in draws:
+            continue
+        if first <= code < first + len(widths):
+            advance.setdefault(name, widths[code - first])
+        text = unicode.get(code) or agl.toUnicode(name)
+        if len(text) == 1 and text.isprintable():
+            cmap.setdefault(ord(text), name)
+        cmap[SYMBOL_BASE + code] = name        # 認不出是哪個字時,段落文字會換成這個私用區的字
+    if not cmap:
+        return None
+    order = [".notdef"] + sorted(set(cmap.values()))
+    charstrings, metrics = {}, {}
+    for name in order:
+        width = round(advance.get(name, missing))
+        pen = T2CharStringPen(width, None)
+        bounds = BoundsPen(None)
+        if name in draws:
+            for target in (pen, bounds):
+                draws[name](TransformPen(target, (scale, 0, 0, scale, 0, 0)) if abs(scale - 1) > 1e-6 else target)
+        charstrings[name] = pen.getCharString()
+        metrics[name] = (width, round(bounds.bounds[0]) if bounds.bounds else 0)
+    ascent = round(float(descriptor.get("/Ascent", 800)) or 800)
+    descent = round(float(descriptor.get("/Descent", -200)) or -200)
+    ps_name = re.sub(r"[^A-Za-z0-9-]", "", family) or "PDFFont"
+    builder = FontBuilder(1000, isTTF=False)
+    builder.setupGlyphOrder(order)
+    builder.setupCharacterMap(cmap)
+    builder.setupCFF(ps_name, {"FullName": family, "FamilyName": family}, charstrings, {})
+    builder.setupHorizontalMetrics(metrics)
+    builder.setupHorizontalHeader(ascent=ascent, descent=descent)
+    builder.setupNameTable({"familyName": family, "styleName": "Regular", "psName": ps_name})
+    builder.setupOS2(sTypoAscender=ascent, sTypoDescender=descent, usWinAscent=ascent, usWinDescent=abs(descent),
+                     fsType=0)
+    builder.setupPost()
+    buffer = io.BytesIO()
+    builder.save(buffer)
+    return buffer.getvalue(), len(cmap)
 
 
 def _glyph_map(font_dict, font):
@@ -200,10 +360,36 @@ def face_for(key, pdf, page_number, font_name):
             program = _program(descriptor)
             if program is not None:
                 face = _make_face(program, font_dict, font_name)
+            elif descriptor is not None and str(font_dict.get("/Subtype", "")) in ("/Type1", "/MMType1"):
+                face = _make_type1_face(font_dict, descriptor, font_name)
     except Exception:
         face = None
     _cache[cache_key] = face
     return face
+
+
+def _family(font_name):
+    return font_name.split("+", 1)[1] if len(font_name) > 7 and font_name[6] == "+" else font_name
+
+
+def _make_type1_face(font_dict, descriptor, font_name):
+    family = _family(font_name)
+    key = descriptor.get("/FontFile3") or descriptor.get("/FontFile")
+    if key is None:
+        return None
+    raw = key.read_raw_bytes() + repr(font_dict.get("/Encoding")).encode("utf-8")
+    digest = hashlib.sha1(raw + b"type1-v1").hexdigest()[:16]
+    folder = cache_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{digest}.otf"
+    if not path.is_file():
+        made = _type1_font(font_dict, descriptor, family)
+        if made is None:
+            return None
+        temp = path.with_suffix(".part")
+        temp.write_bytes(made[0])
+        temp.replace(path)
+    return fonts.FontFace(f"pdf:{path.name}", f"{family}(原檔字型)", "pdf", path)
 
 
 def _make_face(program, font_dict, font_name):
@@ -215,7 +401,7 @@ def _make_face(program, font_dict, font_name):
     font.close()
     if status != "ok" or len(glyph_map) < 1:
         return None                 # 字型授權不允許拿來編輯,或對照不出任何字
-    family = font_name.split("+", 1)[1] if len(font_name) > 7 and font_name[6] == "+" else font_name
+    family = _family(font_name)
     digest = hashlib.sha1(program + repr(sorted(glyph_map.items())).encode("utf-8")).hexdigest()[:16]
     folder = cache_dir()
     folder.mkdir(parents=True, exist_ok=True)
