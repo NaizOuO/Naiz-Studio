@@ -408,7 +408,6 @@ def _stamp_image(obj):
         import io
 
         import pikepdf
-        from PIL import Image
 
         form = obj.AP.N
         xobject = next(iter(form.Resources.XObject.values()))

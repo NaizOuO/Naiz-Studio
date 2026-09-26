@@ -6,14 +6,14 @@ from pathlib import Path
 
 import pygame
 
-from core import deps, large_files, paths, pdfium, theme, widgets, winfile
+from core import large_files, paths, pdfium, theme, widgets, winfile
 from core.drag_sort import DragSort, move_items
 from core.plugins import Page
 from core.scroll import ScrollView
 from core.widgets import Button, Dropdown, TextInput, draw_text, rounded_panel
 
 from . import annot_view, geometry, model, ops
-from .dialog import Dialog
+from core.dialog import Dialog
 from .render import MAX_PIXELS, PageRenderer
 from .bookmarks import BookmarkPanel
 from .crop import CropMode
@@ -259,7 +259,7 @@ class EditorPage(Page):
 
         self.dialog.open("檔案可能損壞", [f"「{path.name}」{reason}。",
                                      "可以嘗試修復：重建檔案的索引，救回還能讀取的頁面。",
-                                     f"修復結果會另存到 output\\editor\\，不會改動原檔。"],
+                                     "修復結果會另存到 output\\editor\\，不會改動原檔。"],
                          [("cancel", "取消", False), ("repair", "嘗試修復", True)], choice)
 
     def _repaired(self, result):
@@ -663,7 +663,7 @@ class EditorPage(Page):
         scale = POINT_PX * self.zoom
         self.view_offset = (round(offset_x), area.y - self.view.scroll)
         selected = set(self.selected_indexes())
-        requests, thumb_requests = [], []
+        requests = []
         self.page_hits = []
         screen.set_clip(area)
         for index, rect in self.layout:

@@ -22,8 +22,9 @@ bin/
 models/
 fonts/
 
-# 使用者存的簽名屬於個人資料
+# 使用者存的簽名、畫到一半的電路圖屬於個人資料
 signatures/
+circuits/
 
 # 測試或處理中的 PDF 屬於個人檔案
 *.pdf
@@ -39,3 +40,7 @@ images/*
 !images/app_icon.png
 !images/app_icon.ico
 !images/ui_*.png
+
+# 擴充模組存的資料、更新時的暫存
+mods_data/
+update/

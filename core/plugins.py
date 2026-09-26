@@ -23,6 +23,13 @@ class Tool:
     min_app = ""
     version = ""
     author = ""
+    folder = ""         # 載入時填上:工具所在的資料夾名稱
+
+    def data_dir(self):
+        """存設定、快取的資料夾(mods_data\\工具代號);模組移除後還留著,重新安裝不會遺失。"""
+        from . import mods
+
+        return mods.data_dir(self.id)
 
     def create_page(self, app):
         raise NotImplementedError
@@ -97,8 +104,10 @@ def _ensure_namespace(namespace):
         sys.modules[namespace] = module
 
 
-def load_tools(folder, namespace):
-    """回傳 (工具清單, [(資料夾名, 錯誤訊息)]);單一插件壞掉不會影響其他插件。"""
+def load_tools(folder, namespace, only=None):
+    """回傳 (工具清單, [(資料夾名, 錯誤訊息)]);單一插件壞掉不會影響其他插件。
+    only 是允許載入的資料夾名稱(擴充模組只載入已啟用的);資料夾裡有 lib 的話加進 sys.path,
+    模組可以把自己需要的套件放在 lib 裡。"""
     tools, errors = [], []
     folder = Path(folder)
     if not folder.is_dir():
@@ -107,8 +116,11 @@ def load_tools(folder, namespace):
 
     for entry in sorted(folder.iterdir()):
         init = entry / "__init__.py"
-        if not entry.is_dir() or not init.is_file():
+        if not entry.is_dir() or not init.is_file() or (only is not None and entry.name not in only):
             continue
+        lib = entry / "lib"
+        if lib.is_dir() and str(lib) not in sys.path:
+            sys.path.append(str(lib))               # 放最後:主程式已經有的套件優先,不會被模組換掉
         module_name = f"{namespace}.{entry.name}"
         for key in [k for k in sys.modules if k == module_name or k.startswith(module_name + ".")]:
             del sys.modules[key]
@@ -118,7 +130,10 @@ def load_tools(folder, namespace):
             module = importlib.util.module_from_spec(spec)
             sys.modules[module_name] = module
             spec.loader.exec_module(module)
-            tools.extend(tool_cls() for tool_cls in getattr(module, "TOOLS", []))
+            for tool_cls in getattr(module, "TOOLS", []):
+                tool = tool_cls()
+                tool.folder = entry.name
+                tools.append(tool)
         except Exception:
             sys.modules.pop(module_name, None)
             errors.append((entry.name, traceback.format_exc()))

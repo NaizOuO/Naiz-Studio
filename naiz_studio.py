@@ -6,6 +6,7 @@ import os
 import platform
 import sys
 import time
+import traceback
 from pathlib import Path
 
 # SDL 預設會丟掉「讓視窗變成作用中」的那一下點擊。從檔案總管拖檔進來後作用中的是檔案總管,
@@ -32,7 +33,9 @@ import pygame
 if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from core import paths, plugins, tempclean, theme, version, widgets
+from core import mods, paths, plugins, tempclean, theme, updater, version, widgets
+from core.contextmenu import ContextMenu
+from core.dialog import Dialog
 from core.consent import ConsentDialog
 from core.large_files import LargeFileDialog
 from core.scroll import ScrollView
@@ -91,6 +94,10 @@ class App:
         self.title_clicks = []
         self.btn_home = Button("首頁", filled=False, size=14)
         self.copy_toast = None
+        self.tool_error = None          # (工具名稱, 時間):工具或模組出錯被關掉時,首頁顯示提示
+        self.dialog = Dialog(lambda: self.screen, theme.ACCENT)
+        self.home_menu = ContextMenu(theme.ACCENT)
+        self.pending_mods = []          # 放進 mods 但還沒啟用的模組
         self._swallow_click = False
         self.quit_requested = False
         self._quit_confirmed = set()    # 關閉程式時已經確認過「不儲存」的工具
@@ -103,6 +110,14 @@ class App:
         self.home_view = ScrollView(indicator=True)     # 工具變多、視窗矮時首頁可以捲動
         self.reload_tools()
         tempclean.start()   # 插件載入後才開始,插件登記的暫存資料夾才算得進去
+        # 檢查更新:只有 exe 版會檢查(從原始碼執行的人用 git 更新);在背景進行,不會拖慢開啟
+        updater.cleanup()
+        self.update_check = updater.Checker().start() if updater.can_self_update() else None
+        self.update_info = None         # 有新版本時的資訊(版本、說明、下載位置)
+        self.update_job = None          # 正在下載或已換好的更新
+        self.update_prompted = False    # 這次開啟已經跳過通知
+        self.update_badge = pygame.Rect(0, 0, 0, 0)
+        self.relaunch = False
 
     # ------------------------------------------------------------ 狀態
 
@@ -113,11 +128,12 @@ class App:
     def reload_tools(self):
         plugins.reset_extensions()
         tools, errors = plugins.load_tools(paths.PLUGINS_DIR, "naiz_plugins")
-        mods, mod_errors = plugins.load_tools(paths.MODS_DIR, "naiz_mods")
-        for tool in mods:
+        mod_tools, mod_errors = plugins.load_tools(paths.MODS_DIR, "naiz_mods", only=mods.enabled())
+        for tool in mod_tools:
             tool.category = MODS_CATEGORY
-        tools += mods
+        tools += mod_tools
         errors += mod_errors
+        self.pending_mods = mods.pending()
         if self.dev_mode:
             dev_tools, dev_errors = plugins.load_tools(paths.DEV_DIR, "naiz_dev")
             tools += dev_tools
@@ -156,7 +172,7 @@ class App:
 
     def deactivate_page(self):
         if self.current and self.current.id in self.pages:
-            self.pages[self.current.id].deactivate()
+            self.guard(self.current, self.pages[self.current.id].deactivate)
 
     def open_tool(self, tool):
         missing = [dep for dep in tool.requires if not dep.installed()]
@@ -164,8 +180,31 @@ class App:
             self.consent.open(tool.name, missing, on_done=lambda: self.open_tool(tool))
             return
         if tool.id not in self.pages:
-            self.pages[tool.id] = tool.create_page(self)
+            page = self.guard(tool, tool.create_page, self)
+            if page is None:
+                return
+            self.pages[tool.id] = page
         self.current = tool
+
+    def guard(self, tool, func, *args):
+        """呼叫工具或模組的程式;出錯時不讓整個程式關掉,改成關掉這個工具、回到首頁,錯誤寫進 error.log。"""
+        try:
+            return func(*args)
+        except Exception:
+            self.tool_failed(tool, traceback.format_exc())
+            return None
+
+    def tool_failed(self, tool, detail):
+        print(detail, file=sys.stderr)
+        try:
+            with open(paths.APP_DIR / "error.log", "a", encoding="utf-8") as log:
+                log.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {tool.name}({tool.id})\n{detail}")
+        except OSError:
+            pass
+        self.pages.pop(tool.id, None)           # 出錯的畫面狀態可能壞了,下次打開重新建立
+        if self.current is tool or (self.current and self.current.id == tool.id):
+            self.current = None
+        self.tool_error = (tool.name, time.monotonic())
 
     def toggle_fullscreen(self):
         self.fullscreen = not self.fullscreen
@@ -199,6 +238,15 @@ class App:
         pygame.draw.rect(self.screen, accent, (22, 22, 5, 22), border_radius=3)
         self.title_rect = draw_text(self.screen, "Naiz Studio", (38, 20), 21, theme.TEXT, bold=True)
         crumb_right = self.title_rect.right
+        self.update_badge = pygame.Rect(0, 0, 0, 0)
+        badge = self.badge_text() if not self.current else None
+        if badge:
+            text, color = badge
+            self.update_badge = pygame.Rect(crumb_right + 16, 19, theme.font(13).size(text)[0] + 24, 28)
+            hover = self.update_badge.collidepoint(mouse_pos)
+            rounded_panel(self.screen, self.update_badge, tuple(int(c * (0.4 if hover else 0.25)) for c in color),
+                          radius=14, border=color)
+            draw_text(self.screen, text, self.update_badge.center, 13, color, bold=True, center=True)
 
         if self.current:
             draw_text(self.screen, "/", (crumb_right + 14, 22), 18, theme.TEXT_FAINT)
@@ -213,11 +261,14 @@ class App:
             home = pygame.Rect(width - 150, 17, 74, 32)
             self.btn_home.draw(self.screen, home, mouse_pos)
             toolbar = pygame.Rect(crumb_right + 24, 16, home.x - 12 - (crumb_right + 24), 34)
-            self.pages[self.current.id].draw_toolbar(toolbar, mouse_pos)
+            self.guard(self.current, self.pages[self.current.id].draw_toolbar, toolbar, mouse_pos)
 
     def draw_home(self, rect, mouse_pos):
         draw_text(self.screen, "工具", (rect.x, rect.y), 24, theme.TEXT, bold=True)
         draw_text(self.screen, "選擇要使用的功能", (rect.x, rect.y + 36), 13, theme.TEXT_DIM)
+        if self.tool_error and time.monotonic() - self.tool_error[1] < 12:
+            draw_text(self.screen, f"「{self.tool_error[0]}」發生錯誤，已回到首頁；詳細內容寫在 error.log",
+                      (rect.x + 150, rect.y + 36), 13, theme.WARN)
 
         categories = [c for c in CATEGORY_ORDER if any(t.category == c for t in self.tools)]
         categories += sorted({t.category for t in self.tools} - set(categories) - {MODS_CATEGORY})
@@ -238,9 +289,10 @@ class App:
         for category in categories:
             items = [tool for tool in self.tools if tool.category == category]
             if category == MODS_CATEGORY:
-                items.append(None)
+                items += [("pending", name) for name in self.pending_mods] + [None]
             label = draw_text(self.screen, category, (rect.x, y), 15, theme.TEXT, bold=True)
-            draw_text(self.screen, str(len([t for t in items if t])), (label.right + 10, y + 2), 13, theme.TEXT_FAINT)
+            count = len([t for t in items if t and not isinstance(t, tuple)])
+            draw_text(self.screen, str(count), (label.right + 10, y + 2), 13, theme.TEXT_FAINT)
             pygame.draw.line(self.screen, theme.PANEL_EDGE, (rect.x, y + 30), (rect.right, y + 30))
             y += 44
 
@@ -251,6 +303,9 @@ class App:
                 hover = card.collidepoint(mouse_pos) and area.collidepoint(mouse_pos)
                 if tool is None:
                     self._draw_mods_card(card, hover)
+                    continue
+                if isinstance(tool, tuple):
+                    self._draw_pending_card(tool[1], card, hover)
                     continue
                 if not version.at_least(tool.min_app):
                     self._draw_old_app_card(tool, card)
@@ -282,9 +337,65 @@ class App:
                       border=theme.ACCENT if hover else theme.PANEL_EDGE)
         draw_text(self.screen, "＋  加入擴充模組", (card.x + 18, card.y + 17), 18,
                   theme.ACCENT if hover else theme.TEXT_DIM, bold=True)
-        note = "把模組資料夾放進 mods 資料夾，重新開啟程式後就會出現；點這裡打開 mods 資料夾"
+        note = "把模組的 zip 拖進這個視窗就能安裝；或點這裡打開 mods 資料夾自己放進去"
         for row, line in enumerate(widgets.wrap_text(note, 13, card.width - 36, max_lines=3)):
             draw_text(self.screen, line, (card.x + 18, card.y + 54 + row * 19), 13, theme.TEXT_FAINT)
+
+    def _draw_pending_card(self, name, card, hover):
+        """放進來還沒啟用的模組:點一下說明並詢問要不要啟用。"""
+        info = mods.describe_folder(name)
+        rounded_panel(self.screen, card, theme.PANEL_LIGHT if hover else theme.PANEL, radius=12, alpha=180,
+                      border=theme.WARN if hover else theme.PANEL_EDGE)
+        draw_text(self.screen, widgets.clip_text(info["name"] or name, 18, card.width - 40, bold=True),
+                  (card.x + 18, card.y + 17), 18, theme.TEXT_DIM, bold=True)
+        note = "新放進來的模組，點一下查看並啟用"
+        for row, line in enumerate(widgets.wrap_text(note, 13, card.width - 36, max_lines=3)):
+            draw_text(self.screen, line, (card.x + 18, card.y + 54 + row * 19), 13, theme.WARN)
+
+    def ask_enable(self, name):
+        info = mods.describe_folder(name)
+        self._confirm_mod(info, name, "啟用", lambda: (mods.enable(name), self.reload_tools()))
+
+    def _confirm_mod(self, info, folder, verb, action):
+        lines = [f"模組：{info['name'] or folder}(資料夾 {folder})"]
+        if info["version"] or info["author"]:
+            lines.append(f"版本：{info['version'] or '未標示'}　作者：{info['author'] or '未標示'}")
+        if info["min_app"] and not version.at_least(info["min_app"]):
+            lines.append(f"需要主程式 v{info['min_app'].lstrip('vV')} 以上，目前是 v{version.VERSION}，可能無法使用")
+        lines += ["模組是程式碼，會在本地直接執行，和這個程式有一樣的權限。", "請只" + verb + "信得過的模組。"]
+
+        def choice(key, _):
+            if key == "ok":
+                action()
+        self.dialog.open(f"{verb}擴充模組", lines, [("cancel", "取消", False), ("ok", verb, True)], choice)
+
+    def install_mod(self, path):
+        """拖進首頁的 zip:先說明來源並詢問,同意才安裝(已經有同名模組時是更新)。"""
+        try:
+            folder, _, info = mods.inspect_zip(path)
+        except mods.InstallError as error:
+            self.dialog.open("無法安裝", [str(error)], [("ok", "知道了", True)], lambda *_: None)
+            return
+        verb = "更新" if (paths.MODS_DIR / folder).is_dir() else "安裝"
+
+        def run():
+            try:
+                mods.install_zip(path)
+            except (OSError, mods.InstallError) as error:
+                self.dialog.open("無法安裝", [str(error)], [("ok", "知道了", True)], lambda *_: None)
+                return
+            self.pages.pop(next((t.id for t in self.tools if t.folder == folder), ""), None)
+            self.reload_tools()
+        self._confirm_mod(info, folder, verb, run)
+
+    def ask_remove(self, tool):
+        def choice(key, _):
+            if key == "ok":
+                self.pages.pop(tool.id, None)
+                mods.remove(tool.folder)
+                self.reload_tools()
+        self.dialog.open("移除擴充模組", [f"要移除「{tool.name}」嗎？", "模組資料夾會丟進資源回收筒；它存的設定、資料會留著，重新安裝還在。"],
+                         [("cancel", "取消", False), ("ok", "移除", True)], choice)
 
     def _draw_old_app_card(self, tool, card):
         """模組需要比較新的主程式:卡片變暗,不能開啟。"""
@@ -313,21 +424,26 @@ class App:
 
         body = pygame.Rect(0, HEADER_H, width, height - HEADER_H)
         if self.current:
-            self.pages[self.current.id].draw(body, mouse_pos)
-        else:
+            self.guard(self.current, self.pages[self.current.id].draw, body, mouse_pos)
+        if not self.current:
             self.draw_home(body.inflate(-64, -56), mouse_pos)
 
         self.draw_header(width, mouse_pos)
         page = self.pages.get(self.current.id) if self.current else None
-        if page is not None and page.modal_open():
+        if page is not None and self.guard(self.current, page.modal_open):
             widgets.mark_text_layer()
-            page.draw_modal(mouse_pos)
+            self.guard(self.current, page.draw_modal, mouse_pos)
         if self.settings.is_open:
             widgets.mark_text_layer()
             self.settings.draw(mouse_pos)
         if self.consent.is_open:
             widgets.mark_text_layer()
             self.consent.draw(mouse_pos)
+        if self.current is None:
+            self.home_menu.draw(self.screen, mouse_pos)
+        if self.dialog.is_open:
+            widgets.mark_text_layer()
+            self.dialog.draw(mouse_pos)
         if self.large_files.is_open:
             widgets.mark_text_layer()
             self.large_files.draw(mouse_pos)
@@ -367,6 +483,97 @@ class App:
         if self.request_quit():
             self.quit_requested = True
 
+    # ------------------------------------------------------------ 更新
+
+    def poll_update(self):
+        """背景檢查完成後:有新版本就記下來,第一次看到時跳通知(使用者選過「不再顯示」就只在標題旁顯示)。"""
+        check = self.update_check
+        if check is not None and check.done:
+            self.update_check = None
+            self.update_info = check.result
+        if self.update_info and not self.update_prompted and self.config.get("update_notice", True) \
+                and not self.dialog.is_open and not self.consent.is_open and not self.settings.is_open \
+                and not self.large_files.is_open:
+            self.update_prompted = True
+            self.ask_update(first=True)
+        job = self.update_job
+        if job is not None and job.state == "ready" and not getattr(job, "announced", False):
+            job.announced = True
+            self.dialog.open("新版本已經下載好", [f"已經換成 {self.update_info['tag']}，重新開啟程式就是新版。"],
+                             [("later", "稍後", False), ("restart", "重新開啟", True)],
+                             lambda key, _: key == "restart" and self.restart_for_update())
+
+    def ask_update(self, first=False):
+        info = self.update_info
+        lines = [f"目前是 v{version.VERSION}，最新版是 {info['tag']}。"]
+        notes = []
+        for raw in info["notes"]:           # Release 說明是 Markdown:去掉符號,小標題不加項目符號
+            text = raw.replace("`", "").replace("**", "").strip()
+            if text.startswith(("距離上一個", "Naiz Studio v")) or text.lstrip("# ").startswith(("下載與使用", "詳細說明")):
+                continue
+            if text.startswith("#"):
+                if text.lstrip("# ").startswith("下載"):
+                    break
+                notes.append(text.lstrip("# "))
+            elif text[:1] in "-*・" or text[:2].rstrip(".").isdigit():
+                notes.append("・" + text.lstrip("-*・0123456789. "))
+        if notes:
+            lines += ["", "更新內容："] + notes[:8]
+        if updater.can_self_update():
+            lines += ["", "按「更新」會下載新版並自動換好，你的設定、下載的元件與輸出都不會動到。"]
+        else:
+            lines += ["", "按「更新」會打開下載頁面。"]
+        buttons = ([("never", "不再顯示", False)] if first else []) + [("cancel", "取消", False), ("ok", "更新", True)]
+
+        def choice(key, _):
+            if key == "ok":
+                self.start_update()
+            elif key == "never":        # 不再跳通知;標題旁的「新版本」還在,想更新時再點
+                self.config["update_notice"] = False
+                stored = theme.load_config(str(paths.APP_DIR))
+                stored["update_notice"] = False
+                theme.save_config(str(paths.APP_DIR), stored)
+        self.dialog.open("有新版本", lines, buttons, choice)
+
+    def start_update(self):
+        if updater.can_self_update() and self.update_info.get("url"):
+            self.update_job = updater.Updater(self.update_info).start()
+        else:
+            self.open_release_page()
+
+    def open_release_page(self):
+        import webbrowser
+
+        webbrowser.open((self.update_info or {}).get("page") or updater.RELEASES_PAGE)
+
+    def restart_for_update(self):
+        """重新開啟:照一般關閉程式的流程(有未儲存的變更會先詢問),關閉後開新版。"""
+        self.relaunch = True
+        self._quit_confirmed.clear()
+        if self.request_quit():
+            self.quit_requested = True
+
+    def badge_text(self):
+        job = self.update_job
+        if job is not None:
+            if job.state == "downloading":
+                return f"下載更新 {int(job.progress * 100)}%", theme.ACCENT
+            if job.state == "ready":
+                return "重新開啟以完成更新", theme.ACCENT
+            return "更新失敗，點這裡到網頁下載", theme.WARN
+        if self.update_info:
+            return f"有新版本 {self.update_info['tag']}", theme.ACCENT
+        return None
+
+    def click_badge(self):
+        job = self.update_job
+        if job is not None and job.state == "ready":
+            self.restart_for_update()
+        elif job is not None and job.state == "failed":
+            self.open_release_page()
+        elif job is None and self.update_info:
+            self.ask_update()
+
     def go_home(self):
         self.current = None
 
@@ -390,6 +597,22 @@ class App:
 
         if self.dev_mode and self._copy_click(event, mouse_pos):
             return True
+        if self.dialog.is_open:
+            self.dialog.handle_event(event, mouse_pos)
+            return True
+        if self.home_menu.handle_event(event, mouse_pos):
+            return True
+        if self.current is None and event.type == pygame.WINDOWFOCUSGAINED:
+            self.pending_mods = mods.pending()          # 自己把模組資料夾放進 mods 後切回來,首頁馬上出現
+        if self.current is None and event.type == pygame.DROPFILE and event.file.lower().endswith(".zip"):
+            self.install_mod(event.file)
+            return True
+        if self.current is None and event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+            for tool, card in self.card_rects:
+                if card.collidepoint(mouse_pos) and tool is not None and not isinstance(tool, tuple) \
+                        and tool.category == MODS_CATEGORY:
+                    self.home_menu.open(mouse_pos, [("移除模組", "", True, lambda t=tool: self.ask_remove(t))])
+                    return True
         if self.large_files.is_open:
             self.large_files.handle_event(event, mouse_pos)
             return True
@@ -400,9 +623,9 @@ class App:
             self.settings.handle_event(event, mouse_pos)
             return True
         page = self.pages.get(self.current.id) if self.current else None
-        if page is not None and page.modal_open():
+        if page is not None and self.guard(self.current, page.modal_open):
             # 頁面自己的彈出視窗開著時,事件只給視窗,標題列和頁面都不會被點到
-            page.handle_modal_event(event, mouse_pos)
+            self.guard(self.current, page.handle_modal_event, event, mouse_pos)
             return True
 
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -414,21 +637,26 @@ class App:
                 self.deactivate_page()
                 self.settings.open()
                 return True
+            if self.update_badge.collidepoint(mouse_pos):
+                self.click_badge()
+                return True
             if self.current and self.btn_home.clicked(mouse_pos, True):
                 self.deactivate_page()
-                self.pages[self.current.id].leave(self.go_home)   # 有未儲存的變更時工具會先詢問
+                self.guard(self.current, self.pages[self.current.id].leave, self.go_home)  # 有未儲存的變更時工具會先詢問
                 return True
             if self.current is None:
                 for tool, card in self.card_rects:
                     if card.collidepoint(mouse_pos):
                         if tool is None:
                             self.open_mods_folder()
+                        elif isinstance(tool, tuple):
+                            self.ask_enable(tool[1])
                         elif version.at_least(tool.min_app):
                             self.open_tool(tool)
                         return True
 
         if self.current:
-            self.pages[self.current.id].handle_event(event, mouse_pos)
+            self.guard(self.current, self.pages[self.current.id].handle_event, event, mouse_pos)
         else:
             self.home_view.handle_event(event, mouse_pos)
         return True
@@ -483,14 +711,19 @@ class App:
             running = self.process_events(events)
             mouse_pos = pygame.mouse.get_pos()
             self.consent.update()
+            self.poll_update()
             if self.current:
-                self.pages[self.current.id].update()
+                self.guard(self.current, self.pages[self.current.id].update)
             rate = self.frame_rate(time.monotonic() - last_input)
             if rate:
                 self.draw_frame(mouse_pos)
                 pygame.display.flip()
             self.clock.tick(rate or 5)
         pygame.quit()
+        if self.relaunch:
+            import subprocess
+
+            subprocess.Popen([sys.executable], cwd=str(paths.APP_DIR), close_fds=True)
 
 
 def main():

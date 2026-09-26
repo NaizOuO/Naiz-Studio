@@ -2,6 +2,9 @@
 
 用法:python build.py v1.9.2
 產出:dist/Naiz Studio/(exe、images、README.md、LICENSE)與 dist/Naiz Studio v1.9.2.zip
+
+換圖示:python build.py icon 畫好的圖.png(建議 1024×1024、透明背景)
+產出 images/app_icon.png(視窗圖示,256)與 images/app_icon.ico(16～256 各種尺寸)
 發布資料夾裡自己放的測試檔案(下載的元件、輸出、設定等)不會被刪除,也不會被放進 zip。
 """
 
@@ -15,6 +18,9 @@ ROOT = Path(__file__).resolve().parent
 NAME = "Naiz Studio"
 # 插件是執行時才從資料夾讀入,PyInstaller 看不到它們用了哪些套件,要自己列出來
 EXTRA_IMPORTS = ["pypdfium2", "resvg_py", "pikepdf", "opencc", "pillow_heif", "vtracer", "queue"]
+# 主程式沒用到、但擴充模組可能會用的內建模組;不列出來的話 exe 裡沒有,模組 import 會失敗
+STDLIB_FOR_MODS = ["sqlite3", "configparser", "tomllib", "shelve", "dbm", "wave", "sched", "csv",
+                   "http.server", "xml.dom.minidom", "statistics", "fractions", "difflib", "calendar"]
 # 已經不用的套件,以及 fontTools 的繪圖、比對工具才需要的重量級相依(我們只用子集與字重固定,用不到)
 EXCLUDE = ["tkinter", "pymupdf", "fitz", "scipy", "matplotlib", "sympy"]
 # fontTools 讀字型表格時是依名稱動態匯入模組,要整包收進去
@@ -48,7 +54,7 @@ def pyinstaller_args(script, name, windowed=True, workdir=None):
         args += ["--exclude-module", module]
     if windowed:
         args.append("--windowed")
-    for module in plugin_modules() + EXTRA_IMPORTS:
+    for module in plugin_modules() + EXTRA_IMPORTS + STDLIB_FOR_MODS:
         args += ["--hidden-import", module]
     for package in COLLECT:
         args += ["--collect-submodules", package]
@@ -107,5 +113,31 @@ def main():
     print(f"\n完成:{release}\n壓縮檔:{archive}({archive.stat().st_size / 1024 / 1024:.1f} MB)")
 
 
+ICON_SIZES = [16, 20, 24, 32, 40, 48, 64, 128, 256]
+
+
+def make_icon(source):
+    """從一張大圖做出程式圖示:每個尺寸都從原圖縮小(不是從 256 再縮),小尺寸稍微銳利一點比較清楚。"""
+    from PIL import Image, ImageFilter
+
+    art = Image.open(source).convert("RGBA")
+    side = max(art.size)
+    square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    square.paste(art, ((side - art.width) // 2, (side - art.height) // 2))
+    frames = []
+    for size in ICON_SIZES:
+        frame = square.resize((size, size), Image.Resampling.LANCZOS)
+        if size <= 48:
+            frame = frame.filter(ImageFilter.UnsharpMask(radius=0.6, percent=60, threshold=2))
+        frames.append(frame)
+    images = ROOT / "images"
+    frames[-1].save(images / "app_icon.png")
+    frames[-1].save(images / "app_icon.ico", sizes=[(s, s) for s in ICON_SIZES], append_images=frames[:-1])
+    print(f"已更新 {images / 'app_icon.png'} 與 app_icon.ico({len(ICON_SIZES)} 種尺寸)")
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 2 and sys.argv[1] == "icon":
+        make_icon(sys.argv[2])
+    else:
+        main()
