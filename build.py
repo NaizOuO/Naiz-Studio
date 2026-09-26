@@ -3,6 +3,8 @@
 用法:python build.py v1.9.2
 產出:dist/Naiz Studio/(exe、images、README.md、LICENSE)與 dist/Naiz Studio v1.9.2.zip
 
+打包擴充模組:python build.py mod circuit → dist/circuit-v0.1.0.zip(版本照模組 __init__.py 的 version)
+
 換圖示:python build.py icon 畫好的圖.png(建議 1024×1024、透明背景)
 產出 images/app_icon.png(視窗圖示,256)與 images/app_icon.ico(16～256 各種尺寸)
 發布資料夾裡自己放的測試檔案(下載的元件、輸出、設定等)不會被刪除,也不會被放進 zip。
@@ -136,8 +138,26 @@ def make_icon(source):
     print(f"已更新 {images / 'app_icon.png'} 與 app_icon.ico({len(ICON_SIZES)} 種尺寸)")
 
 
+def make_mod(name):
+    """把 mods 裡的一個模組壓成 zip(裡面是「模組名稱/…」),別人拖進首頁就能安裝。"""
+    sys.path.insert(0, str(ROOT))
+    from core import mods
+
+    folder = ROOT / "mods" / name
+    info = mods.describe((folder / "__init__.py").read_text(encoding="utf-8"))
+    archive = ROOT / "dist" / f"{name}-v{info['version'] or '0.0.0'}.zip"
+    archive.parent.mkdir(exist_ok=True)
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in sorted(folder.rglob("*")):
+            if path.is_file() and "__pycache__" not in path.parts:
+                zf.write(path, Path(name) / path.relative_to(folder))
+    print(f"完成:{archive}({archive.stat().st_size / 1024:.0f} KB)")
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "icon":
         make_icon(sys.argv[2])
+    elif len(sys.argv) > 2 and sys.argv[1] == "mod":
+        make_mod(sys.argv[2])
     else:
         main()
