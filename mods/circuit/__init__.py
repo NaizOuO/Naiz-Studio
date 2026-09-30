@@ -7,7 +7,7 @@ class CircuitTool(Tool):
     id = "circuit"
     name = "電路圖"
     min_app = "1.14.4"
-    version = "1.0.0"
+    version = "1.0.1"
     author = "Naiz"
     description = "畫類比電路圖，輸出圖片，或產生可以貼進筆記的 Python 程式碼"
     accent = (250, 196, 84)

@@ -88,6 +88,7 @@ class CircuitPage(Page):
         self._grid = (None, None)
         self._icons = {}
         self._changed_at = None
+        self._dirty = False         # 打開後有沒有改過;沒改過就不存,讀檔失敗時才不會用空白蓋掉原本的檔案
         self.path = None
 
         self.style = ChoiceGrid([(key, draw.STYLES[key]["name"]) for key in draw.STYLE_ORDER], 2, accent=accent)
@@ -139,12 +140,30 @@ class CircuitPage(Page):
     def _load_autosave(self):
         try:
             elements, settings = model.loads(autosave_path().read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            self._apply_settings(self._load_defaults())
+            return
         except (OSError, ValueError, UnicodeDecodeError):
+            self._keep_broken()
             self._apply_settings(self._load_defaults())
             return
         self.elements = elements
         self._apply_settings(settings)
         self.path = settings.get("path") and os.path.exists(settings["path"]) and settings["path"] or None
+
+    def _keep_broken(self):
+        """自動保存的檔案讀不懂:另存一份再從空白開始,之後的自動保存不會把它蓋掉。"""
+        source = autosave_path()
+        target = source.with_name(time.strftime("autosave 讀不到 %Y-%m-%d %H%M%S.json"))
+        try:
+            files.write_bytes(target, source.read_bytes())
+        except OSError:
+            return
+        self.say(f"上次自動保存的內容讀不到，已另存成 circuits\\{target.name}")
+
+    def _touch(self):
+        self._changed_at = time.monotonic()
+        self._dirty = True
 
     def _apply_settings(self, settings):
         for slider, key in ((self.text_scale, "text_scale"), (self.line_scale, "line_scale")):
@@ -197,7 +216,7 @@ class CircuitPage(Page):
             self.future.clear()
             self._pending = None
         self.version += 1
-        self._changed_at = time.monotonic()
+        self._touch()
 
     def end(self):
         self._pending = None
@@ -223,7 +242,7 @@ class CircuitPage(Page):
     def _after_restore(self):
         self.selected = {i for i in self.selected if i < len(self.elements)}
         self.version += 1
-        self._changed_at = time.monotonic()
+        self._touch()
         self._sync_inputs()
 
     def update(self):
@@ -232,11 +251,14 @@ class CircuitPage(Page):
             self._autosave()
 
     def _autosave(self):
+        if not self._dirty:
+            return
         settings = dict(self.settings(), path=str(self.path) if self.path else "")
         try:
             autosave_path().parent.mkdir(parents=True, exist_ok=True)
             data = model.dumps(self.elements, settings).encode("utf-8")
             files.write_bytes(autosave_path(), data)
+            self._dirty = False
             self._backup(data)
         except OSError:
             pass
@@ -709,7 +731,7 @@ class CircuitPage(Page):
                     chosen[0][key] = box.text
                     self.changed()
         if self.caption.handle(event, mouse_pos):
-            self._changed_at = time.monotonic()
+            self._touch()
         if self.search.handle(event, mouse_pos):
             self.palette_view.set_scroll(0)
         if self.square.handle(event, mouse_pos):
@@ -719,7 +741,7 @@ class CircuitPage(Page):
             if slider.handle(event, mouse_pos):
                 self.apply_look()
                 self.version += 1
-                self._changed_at = time.monotonic()
+                self._touch()
                 return
         if event.type == pygame.KEYUP and event.key == pygame.K_SPACE:
             self.space_held = False
@@ -827,11 +849,11 @@ class CircuitPage(Page):
         if not self.side_area.collidepoint(pos):
             return False
         if self.resolution.clicked(pos, True):
-            self._changed_at = time.monotonic()
+            self._touch()
             return True
         if self.style.clicked(pos, True) or self.resistor.clicked(pos, True):
             self.version += 1
-            self._changed_at = time.monotonic()
+            self._touch()
             return True
         if self.direction.clicked(pos, True):
             self._editing = None
