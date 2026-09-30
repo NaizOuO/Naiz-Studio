@@ -33,7 +33,7 @@ import pygame
 if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from core import mods, paths, plugins, tempclean, theme, updater, version, widgets
+from core import mods, paths, plugins, shortcut, tempclean, theme, updater, version, widgets
 from core.contextmenu import ContextMenu
 from core.dialog import Dialog
 from core.consent import ConsentDialog
@@ -118,6 +118,8 @@ class App:
         self.update_prompted = False    # 這次開啟已經跳過通知
         self.update_badge = pygame.Rect(0, 0, 0, 0)
         self.relaunch = False
+        self.shortcut_job = None        # 正在建立桌面捷徑
+        self.shortcut_asked = False     # 這次開啟已經檢查過要不要問
 
     # ------------------------------------------------------------ 狀態
 
@@ -483,7 +485,37 @@ class App:
         if self.request_quit():
             self.quit_requested = True
 
-    # ------------------------------------------------------------ 更新
+    # ------------------------------------------------------------ 捷徑與更新
+
+    def save_setting(self, key, value):
+        """只改 config.json 裡的一項(面板上還沒按儲存的其他改動不會跟著存進去)。"""
+        self.config[key] = value
+        stored = theme.load_config(str(paths.APP_DIR))
+        stored[key] = value
+        theme.save_config(str(paths.APP_DIR), stored)
+
+    def poll_shortcut(self):
+        """exe 版第一次開啟時詢問要不要建立桌面捷徑;不論選哪個都只問一次,桌面已經有捷徑就不問。"""
+        job = self.shortcut_job
+        if job is not None and job.done:
+            self.shortcut_job = None
+            if not job.ok:
+                self.dialog.open("無法建立捷徑", ["可以在 exe 上按右鍵，選「傳送到」→「桌面(建立捷徑)」。"],
+                                 [("ok", "知道了", True)], lambda *_: None)
+        if self.shortcut_asked or not updater.can_self_update() or not self.config.get("shortcut_prompt", True) \
+                or self.dialog.is_open or self.consent.is_open or self.settings.is_open or self.large_files.is_open:
+            return
+        self.shortcut_asked = True
+        if shortcut.exists():
+            self.save_setting("shortcut_prompt", False)
+            return
+
+        def choice(key, _):
+            self.save_setting("shortcut_prompt", False)
+            if key == "ok":
+                self.shortcut_job = shortcut.Creator().start()
+        self.dialog.open("建立桌面捷徑", ["要在桌面建立 Naiz Studio 的捷徑嗎？", "之後更新也會沿用同一個捷徑。"],
+                         [("no", "不用", False), ("ok", "建立", True)], choice)
 
     def poll_update(self):
         """背景檢查完成後:有新版本就記下來,第一次看到時跳通知(使用者選過「不再顯示」就只在標題旁顯示)。"""
@@ -529,10 +561,7 @@ class App:
             if key == "ok":
                 self.start_update()
             elif key == "never":        # 不再跳通知;標題旁的「新版本」還在,想更新時再點
-                self.config["update_notice"] = False
-                stored = theme.load_config(str(paths.APP_DIR))
-                stored["update_notice"] = False
-                theme.save_config(str(paths.APP_DIR), stored)
+                self.save_setting("update_notice", False)
         self.dialog.open("有新版本", lines, buttons, choice)
 
     def start_update(self):
@@ -711,6 +740,7 @@ class App:
             running = self.process_events(events)
             mouse_pos = pygame.mouse.get_pos()
             self.consent.update()
+            self.poll_shortcut()
             self.poll_update()
             if self.current:
                 self.guard(self.current, self.pages[self.current.id].update)
