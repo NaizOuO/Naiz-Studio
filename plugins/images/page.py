@@ -358,7 +358,8 @@ class ImagePage(Page):
         draw_text(screen, "把圖片拖曳到這個視窗", (cx, area.centery + 30), 16, theme.TEXT_DIM, center=True)
         draw_text(screen, "支援 JPG、PNG、WebP、AVIF、HEIC、GIF、SVG、ICO、BMP、TIFF",
                   (cx, area.centery + 54), 13, theme.TEXT_FAINT, center=True)
-        draw_text(screen, "可一次拖多張或整個資料夾", (cx, area.centery + 74), 13, theme.TEXT_FAINT, center=True)
+        draw_text(screen, "可一次拖多張或整個資料夾；每張圖的「編輯」可以裁切、旋轉、四點校正",
+                  (cx, area.centery + 74), 13, theme.TEXT_FAINT, center=True)
 
     def draw_list(self, rect, mouse_pos):
         screen = self.screen

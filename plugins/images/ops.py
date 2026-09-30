@@ -67,8 +67,10 @@ class Settings:
 
 @dataclass
 class Edit:
-    """單張圖的編輯,內部依序套用:任意角度(順時針為正)→ 右轉 quarter 次 90 度 → 水平翻轉 → 裁切。
-    crop 是 (左, 上, 右, 下) 占「旋轉、翻轉後畫面」的比例,套用到尺寸不同的圖時會照比例裁。
+    """單張圖的編輯,內部依序套用:任意角度(順時針為正)→ 右轉 quarter 次 90 度 → 水平翻轉 → 四點校正 → 裁切。
+    warp 是四點校正的四個角(左上、右上、右下、左下),位置是占「旋轉、翻轉後畫面」的比例;
+    這四點圍起來的範圍會拉正成長方形(拍斜的文件、消失點不在中間的照片)。
+    crop 是 (左, 上, 右, 下) 占「校正後畫面」的比例,套用到尺寸不同的圖時會照比例裁。
     下面的操作都以使用者看到的畫面為準,會自動換算成上面的順序。"""
 
     angle: float = 0.0
@@ -76,16 +78,22 @@ class Edit:
     flip: bool = False
     crop: tuple = None
     fill: str = "clear"     # 旋轉、擴展畫布多出來的地方補什麼:clear 透明、white 白色、black 黑色
+    warp: tuple = None
 
     @property
     def active(self):
-        return bool(self.angle % 360 or self.quarter % 4 or self.flip or self.crop)
+        return bool(self.angle % 360 or self.quarter % 4 or self.flip or self.crop or self.warp)
 
     def copy(self):
         return replace(self)
 
     def reset(self):
         self.angle, self.quarter, self.flip, self.crop, self.fill = 0.0, 0, False, None, "clear"
+        self.warp = None
+
+    def _move_warp(self, change):
+        if self.warp:
+            self.warp = order_corners([change(x, y) for x, y in self.warp])
 
     @property
     def view_angle(self):
@@ -102,12 +110,15 @@ class Edit:
         for _ in range(turns % 4 if self.crop else 0):
             left, top, right, bottom = self.crop
             self.crop = (1 - bottom, left, 1 - top, right)
+        for _ in range(turns % 4):
+            self._move_warp(lambda x, y: (1 - y, x))
 
     def flip_horizontal(self):
         self.flip = not self.flip
         if self.crop:
             left, top, right, bottom = self.crop
             self.crop = (1 - right, top, 1 - left, bottom)
+        self._move_warp(lambda x, y: (1 - x, y))
 
     def flip_vertical(self):
         # 垂直翻轉 = 水平翻轉再轉 180 度
@@ -116,6 +127,62 @@ class Edit:
         if self.crop:
             left, top, right, bottom = self.crop
             self.crop = (left, 1 - bottom, right, 1 - top)
+        self._move_warp(lambda x, y: (x, 1 - y))
+
+
+FULL_CORNERS = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
+
+
+def order_corners(points):
+    """四個點排成左上、右上、右下、左下(繞中心的角度排序,從最靠左上的開始),拖到交叉也不會扭成蝴蝶結。"""
+    cx = sum(x for x, _ in points) / 4
+    cy = sum(y for _, y in points) / 4
+    ring = sorted(points, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+    start = min(range(4), key=lambda i: ring[i][0] + ring[i][1])
+    return tuple(tuple(ring[(start + i) % 4]) for i in range(4))
+
+
+def warp_size(size, warp):
+    """四點校正後的像素尺寸:上下兩邊取長的當寬、左右兩邊取長的當高,細節不會被壓縮掉。"""
+    width, height = size
+    tl, tr, br, bl = [(x * width, y * height) for x, y in warp]
+    new_w = max(math.dist(tl, tr), math.dist(bl, br))
+    new_h = max(math.dist(tl, bl), math.dist(tr, br))
+    return max(1, round(new_w)), max(1, round(new_h))
+
+
+def _solve(matrix, values):
+    """解 n 元一次方程組(高斯消去法,選最大的主元比較不會算歪)。"""
+    n = len(values)
+    rows = [list(row) + [value] for row, value in zip(matrix, values)]
+    for col in range(n):
+        pivot = max(range(col, n), key=lambda r: abs(rows[r][col]))
+        if abs(rows[pivot][col]) < 1e-12:
+            raise ValueError("四個點不能排成一直線")
+        rows[col], rows[pivot] = rows[pivot], rows[col]
+        for r in range(n):
+            if r != col:
+                factor = rows[r][col] / rows[col][col]
+                rows[r] = [a - factor * b for a, b in zip(rows[r], rows[col])]
+    return [rows[i][n] / rows[i][i] for i in range(n)]
+
+
+def warp_image(image, warp):
+    """把四個角圍起來的範圍拉正成長方形。"""
+    width, height = image.size
+    out_w, out_h = warp_size(image.size, warp)
+    matrix, values = [], []
+    # 輸出圖上的每個點 (x, y) 對應到原圖的 (u, v):u = (ax+by+c)/(gx+hy+1)、v = (dx+ey+f)/(gx+hy+1)
+    for (x, y), (u, v) in zip(((0, 0), (out_w, 0), (out_w, out_h), (0, out_h)),
+                              [(px * width, py * height) for px, py in warp]):
+        matrix.append([x, y, 1, 0, 0, 0, -u * x, -u * y])
+        values.append(u)
+        matrix.append([0, 0, 0, x, y, 1, -v * x, -v * y])
+        values.append(v)
+    if image.mode not in ("RGB", "RGBA", "L", "LA"):
+        image = image.convert("RGBA")
+    return image.transform((out_w, out_h), Image.Transform.PERSPECTIVE, _solve(matrix, values),
+                           Image.Resampling.BICUBIC)
 
 
 QUARTER_TURNS = {1: Image.Transpose.ROTATE_270, 2: Image.Transpose.ROTATE_180, 3: Image.Transpose.ROTATE_90}
@@ -140,6 +207,8 @@ def apply_edit(image, edit):
         image = image.transpose(QUARTER_TURNS[edit.quarter % 4])
     if edit.flip:
         image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+    if edit.warp:
+        image = warp_image(image, edit.warp)
     if edit.crop:
         box = crop_box(image.size, edit.crop)
         if box[0] < 0 or box[1] < 0 or box[2] > image.width or box[3] > image.height:
@@ -163,6 +232,8 @@ def edited_size(size, edit, with_crop=True):
         if edit.quarter % 2:
             width, height = height, width
     width, height = max(1, round(width)), max(1, round(height))
+    if edit is not None and edit.warp:
+        width, height = warp_size((width, height), edit.warp)
     if edit is not None and with_crop and edit.crop:
         # 和實際裁切用同一套取整數,顯示的尺寸才不會差 1
         left, top, right, bottom = crop_box((width, height), edit.crop)

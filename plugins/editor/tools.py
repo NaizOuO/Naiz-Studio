@@ -27,7 +27,7 @@ from .toolbar import ToolBar
 BAR_H = 86
 TOOLS = [("select", "選取"), ("highlight", "螢光筆"), ("underline", "底線"), ("strike", "刪除線"), ("textbox", "文字框"),
          ("redact", "塗黑"), ("note", "便利貼"), ("link", "連結"), ("line", "直線"), ("arrow", "箭頭"), ("rect", "方框"),
-         ("ellipse", "圓形"), ("ink", "手繪"), ("image", "圖片"), ("signature", "簽名"), ("stamp", "印章")]
+         ("ellipse", "圓形"), ("ink", "手繪"), ("eraser", "橡皮擦"), ("image", "圖片"), ("signature", "簽名"), ("stamp", "印章")]
 WIDTH_OPTIONS = [(f"{v:g}", f"{v:g} pt") for v in (1, 2, 3, 5, 8)]
 SHAPE_WIDTH_OPTIONS = [("0", "無線條")] + WIDTH_OPTIONS
 BORDER_OPTIONS = [("0", "無外框")] + [(f"{v:g}", f"外框 {v:g} pt") for v in (1, 2, 3)]
@@ -55,6 +55,8 @@ TOOL_HINTS = {
     "stamp": "在頁面上點一下放置印章，或拖曳出想要的大小",
 }
 DOUBLE_CLICK_MS = 400
+ERASER_RADIUS = 7           # 橡皮擦的半徑(螢幕像素)
+ERASER_HINT = "拖過手繪的線條就會整條擦掉；擦錯可以按 Ctrl+Z 復原"
 HINT = "點文字直接修改，拖曳選字可以複製；點註解、圖片可以移動，按住 Ctrl 拖曳會對齊；右鍵可以複製、貼上"
 
 
@@ -197,7 +199,7 @@ class AnnotController(TextEditMixin, ClipboardMixin, SnapMixin):
         found = self.selected_annot()
         if found is not None and annots.editable(found[1]):
             return found[1].kind, _values(found[1])
-        if self.tool != "select":
+        if self.tool not in ("select", "eraser"):
             return self.tool, self.settings[self.tool]
         return None, None
 
@@ -445,6 +447,10 @@ class AnnotController(TextEditMixin, ClipboardMixin, SnapMixin):
             return True
         point = self.mapper(index).to_page(pos)
         self.selected = None
+        if self.tool == "eraser":
+            self.action = dict(type="erase", index=index, last=point, count=0)
+            self._erase(self.action, point)
+            return True
         if self.tool == "replace":
             tolerance = 3 / self.scale()
             done = next((a for a in reversed(self.pages[index].annots)
@@ -534,6 +540,8 @@ class AnnotController(TextEditMixin, ClipboardMixin, SnapMixin):
             action["moved"] = True
             action["point"] = point
             self._update_markup(point)
+        elif kind == "erase":
+            self._erase(action, point)
         else:
             if action["kind"] in ("line", "arrow") and pygame.key.get_mods() & pygame.KMOD_SHIFT:
                 point = self._snap(action["start"], point)
@@ -558,6 +566,9 @@ class AnnotController(TextEditMixin, ClipboardMixin, SnapMixin):
                 if action.get("picture") is not None:
                     self._settling = dict(page_uid=self.pages[index].uid, box=action["preview"].box,
                                           picture=action["picture"])
+        elif kind == "erase":
+            if action["count"]:
+                self.page.notify(f"已擦掉 {action['count']} 條手繪線條")
         elif kind == "markup":
             if action["tool"] == "replace":
                 made = self._make_paragraph(index, action) if not action["moved"] else None
@@ -589,6 +600,8 @@ class AnnotController(TextEditMixin, ClipboardMixin, SnapMixin):
                 self.start_editing(index, annot, new=True)
             elif annot.kind == "link":
                 self.ask_link(index, annot, new=True)
+            elif annot.kind == "ink":
+                self._set(index, self.pages[index].annots + (annot,), None)      # 連續手寫:不選取、不跳提示
             else:
                 self.add(index, annot)
                 if annot.kind in annots.IMAGES:
@@ -597,6 +610,36 @@ class AnnotController(TextEditMixin, ClipboardMixin, SnapMixin):
 
     # ------------------------------------------------------------ 整段修改
 
+
+    def _erase(self, action, point):
+        """擦掉橡皮擦從上一個位置拖到 point 經過的手繪線條(整條);同一次拖曳擦掉的算一步,復原時一起回來。"""
+        index = action["index"]
+        reach = ERASER_RADIUS / self.scale()
+        start, action["last"] = action["last"], point
+        steps = max(1, int(math.hypot(point[0] - start[0], point[1] - start[1]) / reach))
+        path = [(start[0] + (point[0] - start[0]) * i / steps, start[1] + (point[1] - start[1]) * i / steps)
+                for i in range(steps + 1)]
+        removed = 0
+        items = []
+        for annot in self.pages[index].annots:
+            if annot.kind == "ink":
+                reach_line = reach + annot.width / 2
+                kept = tuple(stroke for stroke in annot.points if not any(
+                    geometry.distance_to_segment(spot, a, b) <= reach_line
+                    for spot in path for a, b in (zip(stroke, stroke[1:]) if len(stroke) > 1 else [(stroke[0],) * 2])))
+                removed += len(annot.points) - len(kept)
+                if not kept:
+                    continue
+                if len(kept) != len(annot.points):
+                    annot = replace(annot, points=kept)
+            items.append(annot)
+        if not removed:
+            return
+        if action["count"]:
+            self.page.history.amend(model.set_annots(self.pages, index, tuple(items)))
+        else:
+            self._set(index, tuple(items), None)
+        action["count"] += removed
 
     def _created(self, action, final=False):
         """拖曳出來的新註解;final 為 False 時只是畫面預覽。"""
@@ -788,7 +831,8 @@ class AnnotController(TextEditMixin, ClipboardMixin, SnapMixin):
         kind, values = self.target()
         cy = row.centery
         if kind is None:
-            draw_text(screen, widgets.clip_text(HINT, 12, row.width), (row.x, cy - 8), 12, theme.TEXT_FAINT)
+            hint = ERASER_HINT if self.tool == "eraser" else HINT
+            draw_text(screen, widgets.clip_text(hint, 12, row.width), (row.x, cy - 8), 12, theme.TEXT_FAINT)
             return
         x = row.x
         if row.width >= 900:    # 視窗窄時省略種類名稱,選取框已經看得出是哪一個註解
@@ -943,9 +987,13 @@ class AnnotController(TextEditMixin, ClipboardMixin, SnapMixin):
 
 
     def draw_view_overlay(self):
-        """便利貼的內容視窗:選取時顯示內容,打字時可以直接編輯。"""
+        """便利貼的內容視窗:選取時顯示內容,打字時可以直接編輯。橡皮擦工具時畫出擦的範圍。"""
         self._note_popup = None
         screen = self.page.screen
+        mouse = pygame.mouse.get_pos()
+        if self.tool == "eraser" and self.page.view_rect.collidepoint(mouse) and not self.menu.is_open:
+            pygame.draw.circle(screen, (255, 255, 255), mouse, ERASER_RADIUS + 1, 1)
+            pygame.draw.circle(screen, (30, 30, 30), mouse, ERASER_RADIUS, 1)
         editing = self.editing
         if editing is not None and editing["annot"].kind == "note":
             index = self.index_of(editing["page_uid"])

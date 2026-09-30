@@ -1,5 +1,7 @@
-"""圖片編輯視窗:在預覽上拖曳裁切框、旋轉、翻轉。細調時畫面分成四格,各自放大裁切框的一個角;動畫可以播放預覽。"""
+"""圖片編輯視窗:在預覽上拖曳裁切框、旋轉、翻轉、四點校正。細調時畫面分成四格,各自放大裁切框的一個角;
+四點校正時拖曳四個角對準文件邊緣,旁邊有放大鏡;動畫可以播放預覽。"""
 
+import math
 import threading
 
 import pygame
@@ -29,6 +31,10 @@ NUDGE = {pygame.K_LEFT: (-1, 0), pygame.K_RIGHT: (1, 0), pygame.K_UP: (0, -1), p
 FILL_OPTIONS = [("clear", "透明"), ("white", "白色"), ("black", "黑色")]
 FILL_PREVIEW = {"white": (255, 255, 255), "black": (0, 0, 0)}
 IMAGE_EDGE = (150, 158, 173)   # 擴展畫布時原圖範圍的細框
+WARP_GRAB = 16        # 四點校正時滑鼠離角多近算是抓到
+LOUPE = 170           # 四點校正放大鏡的邊長
+LOUPE_ZOOM = 4
+WARP_HINT = "四點校正：拖曳四個角對準拍斜的文件、白板或畫面的邊緣，會拉正成長方形；滑鼠停在角上可用方向鍵逐像素移動"
 
 _checker = None
 _icons = {}
@@ -108,6 +114,9 @@ class ImageEditor:
         self.error = ""
         self.message = ""
         self.fine = False
+        self.warping = False     # 四點校正模式:畫面顯示校正前的圖和四個角
+        self.warp_points = None  # 校正模式中正在調整的四個角(比例座標)
+        self.warp_hover = None
         self.locked = False
         self.lock_ratio = None   # 固定比例時的寬高比(像素)
         self.expand = False      # 擴展畫布:裁切框可以拉到圖片外,多出的部分補空白
@@ -131,10 +140,12 @@ class ImageEditor:
         self.btn_play = Button("播放", accent=accent, filled=False, size=13)
         self.btn_fine = Button("細調", accent=accent, filled=False, size=13)
         self.btn_clear_crop = Button("清除裁切", filled=False, size=13)
-        self.btn_left = Button("左轉 90°", filled=False, size=13)
-        self.btn_right = Button("右轉 90°", filled=False, size=13)
-        self.btn_flip_h = Button("水平翻轉", filled=False, size=13)
-        self.btn_flip_v = Button("垂直翻轉", filled=False, size=13)
+        self.btn_left = Button("左轉", filled=False, size=13)
+        self.btn_right = Button("右轉", filled=False, size=13)
+        self.btn_flip_h = Button("左右翻", filled=False, size=13)
+        self.btn_flip_v = Button("上下翻", filled=False, size=13)
+        self.btn_warp = Button("四點校正", accent=accent, filled=False, size=13)
+        self.btn_clear_warp = Button("清除校正", filled=False, size=13)
         self.btn_reset = Button("重設", filled=False, size=13)
         self.btn_all = Button("套用到全部", filled=False, size=13)
         self.btn_cancel = Button("取消", filled=False, size=14)
@@ -151,6 +162,7 @@ class ImageEditor:
         self.frames, self.frame_index, self.playing = [], 0, False
         self.error = self.message = ""
         self.fine, self.drag = False, None
+        self.warping, self.warp_points, self.warp_hover = False, None, None
         self.locked, self.lock_ratio = False, None
         crop = item.edit.crop
         self.expand = bool(crop) and (crop[0] < 0 or crop[1] < 0 or crop[2] > 1 or crop[3] > 1)
@@ -209,9 +221,51 @@ class ImageEditor:
             self.on_change(self.item)
 
     def _full_view(self):
-        """原圖旋轉、翻轉後(還沒裁切)的像素尺寸;數字欄和裁切都以它為準。"""
+        """原圖旋轉、翻轉、校正後(還沒裁切)的像素尺寸;數字欄和裁切都以它為準。"""
+        e = self.edit
+        return ops.edited_size(self.full_size, ops.Edit(e.angle, e.quarter, e.flip, warp=e.warp))
+
+    def _turned_size(self):
+        """旋轉、翻轉後、還沒校正的像素尺寸;四點校正的座標以它為準。"""
         e = self.edit
         return ops.edited_size(self.full_size, ops.Edit(e.angle, e.quarter, e.flip))
+
+    # ------------------------------------------------------------ 四點校正
+
+    def _start_warp(self):
+        self.fine, self.drag = False, None
+        self.warping = True
+        self.warp_points = list(self.edit.warp or ops.FULL_CORNERS)
+
+    def _finish_warp(self):
+        """離開校正模式:四個角都還在圖片的四個角上就等於沒有校正。"""
+        points = ops.order_corners(self.warp_points)
+        unchanged = all(abs(a - b) < 1e-4 for p, q in zip(points, ops.FULL_CORNERS) for a, b in zip(p, q))
+        area = abs(sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1) in zip(points, points[1:] + points[:1]))) / 2
+        if not unchanged and area < 0.002:
+            self.message = "四個角圍起來的範圍太小，請把四個角拉開一點"
+            return
+        before = self.edit.warp
+        self.edit.warp = None if unchanged else points
+        self.warping, self.warp_points, self.warp_hover, self.drag = False, None, None, None
+        if self.edit.warp != before:
+            cleared = bool(self.edit.crop)
+            self.edit.crop = None       # 校正後是另一張圖,原本的裁切範圍對不上,清掉重新框
+            self._changed()
+            if cleared:
+                self.message = "已校正；原本的裁切範圍已清除，需要的話再重新框選"
+
+    def _warp_screen(self):
+        rect = self.image_rect
+        return [(rect.x + x * rect.width, rect.y + y * rect.height) for x, y in self.warp_points]
+
+    def _warp_at(self, pos):
+        found = [(abs(pos[0] - x) + abs(pos[1] - y), i) for i, (x, y) in enumerate(self._warp_screen())]
+        distance, index = min(found)
+        return index if distance <= WARP_GRAB * 1.5 else None
+
+    def _move_warp(self, index, point):
+        self.warp_points[index] = (min(max(point[0], 0.0), 1.0), min(max(point[1], 0.0), 1.0))
 
     def _crop_pixels(self):
         width, height = self._full_view()
@@ -512,6 +566,8 @@ class ImageEditor:
     def handle_event(self, event, pos):
         typing = self.angle_input.focused or any(field.focused for field in self.fields.values())
         ready = self.base is not None
+        if self.warping and self._handle_warp(event, pos):
+            return
         if event.type == pygame.KEYDOWN and not typing:
             if event.key == pygame.K_ESCAPE:
                 self.close(keep=False)
@@ -541,6 +597,8 @@ class ImageEditor:
                     return
         if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
             return
+        if self.warping and not (self.btn_warp.clicked(pos, True) or self.btn_clear_warp.clicked(pos, True)):
+            self._finish_warp()     # 按其他設定(旋轉、裁切、完成…)時先結束校正
 
         if self.btn_cancel.clicked(pos, True):
             self.close(keep=False)
@@ -570,6 +628,20 @@ class ImageEditor:
             self.edit.fill = self.fill.value
             self._changed()
             return
+        if self.btn_warp.clicked(pos, True):
+            if self.warping:
+                self._finish_warp()
+            else:
+                self._start_warp()
+            return
+        if self.btn_clear_warp.clicked(pos, True):
+            self.warp_points = list(ops.FULL_CORNERS)
+            if self.warping:
+                self._finish_warp()
+            else:
+                self.warping = True
+                self._finish_warp()
+            return
         if self.btn_fine.clicked(pos, True):
             self.fine = not self.fine
             self.fine_centers = {}   # 每次進入細調都重新以四個角為中心
@@ -589,6 +661,7 @@ class ImageEditor:
                 self._changed()
                 return
         if self.btn_reset.clicked(pos, True):
+            self.warping, self.warp_points = False, None
             self.edit.reset()
             self.ratio.index = 0
             self.locked, self.lock_ratio = False, None
@@ -597,24 +670,53 @@ class ImageEditor:
         elif self.btn_all.clicked(pos, True):
             self._apply_to_all()
 
+    def _handle_warp(self, event, pos):
+        """四點校正模式的滑鼠、鍵盤;用掉事件時回傳 True。"""
+        if event.type == pygame.KEYDOWN:
+            if event.key in (pygame.K_ESCAPE, pygame.K_RETURN, pygame.K_KP_ENTER):
+                self._finish_warp()
+                return True
+            if event.key in NUDGE and self.warp_hover is not None:
+                width, height = self._turned_size()
+                dx, dy = NUDGE[event.key]
+                x, y = self.warp_points[self.warp_hover]
+                self._move_warp(self.warp_hover, (x + dx / width, y + dy / height))
+                return True
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self.canvas.collidepoint(pos):
+            index = self._warp_at(pos)
+            if index is not None:
+                self.drag = {"warp": index}
+            return True
+        if self.drag is not None and "warp" in self.drag:
+            self.warp_hover = self.drag["warp"]
+            if event.type == pygame.MOUSEMOTION:
+                self._move_warp(self.drag["warp"], self._point(pos))
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                self.drag = None
+            return True
+        if event.type == pygame.MOUSEMOTION and self.canvas.collidepoint(pos):
+            self.warp_hover = self._warp_at(pos)
+        return False
+
     # ------------------------------------------------------------ 繪製
 
-    def _view_key(self, fine):
+    def _view_key(self, fine, warp=True):
         frame = self.frame_index if self.frames and not fine else 0
-        return fine, self.edit.angle, self.edit.quarter, self.edit.flip, self.edit.fill, frame
+        return (fine, self.edit.angle, self.edit.quarter, self.edit.flip, self.edit.fill,
+                self.edit.warp if warp else None, frame)
 
-    def _view(self, fine):
-        """旋轉、翻轉後(還沒裁切)的預覽。動畫播放時每一格都留著,編輯改變後才清掉。"""
-        key = self._view_key(fine)
+    def _view(self, fine, warp=True):
+        """旋轉、翻轉、校正後(還沒裁切)的預覽;warp 為 False 時是校正前。動畫播放時每一格都留著,編輯改變後才清掉。"""
+        key = self._view_key(fine, warp)
         surface = self._views.get(key)
         if surface is None:
             if fine or not self.frames:
                 source = self.base if fine else self.small
             else:
-                source = self.frames[key[5]][0]
-            image = ops.apply_edit(source, ops.Edit(key[1], key[2], key[3], None, key[4]))
+                source = self.frames[key[6]][0]
+            image = ops.apply_edit(source, ops.Edit(key[1], key[2], key[3], None, key[4], key[5])).convert("RGBA")
             surface = pygame.image.frombytes(image.tobytes(), image.size, "RGBA")
-            self._views = {k: v for k, v in self._views.items() if k[0] != fine or k[:5] == key[:5]}
+            self._views = {k: v for k, v in self._views.items() if k[0] != fine or k[:6] == key[:6]}
             if len(self._views) > 150:
                 self._views = {}
             self._views[key] = surface
@@ -645,7 +747,8 @@ class ImageEditor:
             text, color = self.message, self.accent
         elif self.base is not None:
             out_w, out_h = ops.edited_size(self.full_size, self.edit)
-            hint = ("拖曳任意格做細微調整；滑鼠停在格子上可用方向鍵逐像素移動" if self.fine
+            hint = (WARP_HINT if self.warping else
+                    "拖曳任意格做細微調整；滑鼠停在格子上可用方向鍵逐像素移動" if self.fine
                     else "拖曳框的角或邊調整範圍，在框外拖曳可重新框選；按鎖鏈可固定比例")
             text, color = f"編輯後 {out_w}×{out_h} px · {hint}", theme.TEXT_DIM
         else:
@@ -663,10 +766,69 @@ class ImageEditor:
             draw_text(screen, f"無法讀取：{self.error}", canvas.center, 14, theme.DANGER, center=True)
         elif self.base is None:
             draw_text(screen, "讀取中...", canvas.center, 14, theme.TEXT_DIM, center=True)
+        elif self.warping:
+            self._draw_warp(screen, mouse_pos)
         elif self.fine:
             self._draw_fine(screen, mouse_pos)
         else:
             self._draw_normal(screen, mouse_pos)
+
+    def _draw_warp(self, screen, mouse_pos):
+        """四點校正:整張校正前的圖、四個角圍起來的範圍,抓著或停在角上時旁邊顯示放大鏡。"""
+        canvas = self.canvas
+        area = pygame.Rect(canvas.x, canvas.y, canvas.width, canvas.height - (PLAY_BAR if self.frames else 0))
+        surface = self._view(False, warp=False)
+        view_w, view_h = surface.get_size()
+        full_w, _ = self._turned_size()
+        scale = min((area.width - 48) / view_w, (area.height - 48) / view_h, full_w / view_w)
+        size = (max(1, int(view_w * scale)), max(1, int(view_h * scale)))
+        rect = pygame.Rect((0, 0), size)
+        rect.center = area.center
+        self.image_rect = rect
+        cache_key = (self._view_key(False, warp=False), size)
+        if self._scaled is None or self._scaled[0] != cache_key:
+            self._scaled = (cache_key, pygame.transform.smoothscale(surface, size))
+        _blit_checker(screen, rect.clip(area), canvas.topleft)
+        screen.blit(self._scaled[1], rect.topleft)
+        corners = self._warp_screen()
+        veil = pygame.Surface(rect.size, pygame.SRCALPHA)
+        veil.fill(SHADE)
+        pygame.draw.polygon(veil, (0, 0, 0, 0), [(x - rect.x, y - rect.y) for x, y in corners])
+        screen.blit(veil, rect.topleft)
+        pygame.draw.polygon(screen, self.accent, corners, 2)
+        active = self.drag["warp"] if self.drag is not None and "warp" in self.drag else self.warp_hover
+        for index, (x, y) in enumerate(corners):
+            radius = 9 if index == active else 7
+            pygame.draw.circle(screen, theme.BG_DEEP, (x, y), radius + 2)
+            pygame.draw.circle(screen, self.accent, (x, y), radius, 0 if index == active else 3)
+        if active is not None:
+            self._draw_loupe(screen, area, active, corners[active])
+
+    def _draw_loupe(self, screen, area, index, spot):
+        """放大鏡:放在畫面四個角落裡離四個點最遠的那個,不會擋住要拖的角。"""
+        base = self._view(True, warp=False)
+        base_w, base_h = base.get_size()
+        px, py = self.warp_points[index][0] * base_w, self.warp_points[index][1] * base_h
+        corners = self._warp_screen()
+        spots = [pygame.Rect(left, top, LOUPE, LOUPE) for left in (area.x + 12, area.right - 12 - LOUPE)
+                 for top in (area.y + 12, area.bottom - 12 - LOUPE)]
+        box = max(spots, key=lambda r: min(math.dist(r.center, c) for c in corners))
+        half = LOUPE / LOUPE_ZOOM / 2
+        source = pygame.Rect(int(px - half) - 1, int(py - half) - 1, int(half * 2) + 3, int(half * 2) + 3)
+        rounded_panel(screen, box.inflate(6, 6), theme.PANEL, radius=8, border=self.accent)
+        clipped = source.clip(base.get_rect())
+        previous = screen.get_clip()
+        screen.set_clip(box)
+        _blit_checker(screen, box, box.topleft)
+        if clipped.width and clipped.height:
+            zoom = LOUPE / (half * 2)
+            left = round(box.centerx + (clipped.x - px) * zoom)
+            top = round(box.centery + (clipped.y - py) * zoom)
+            size = (max(1, round(clipped.width * zoom)), max(1, round(clipped.height * zoom)))
+            screen.blit(pygame.transform.scale(base.subsurface(clipped), size), (left, top))
+        pygame.draw.line(screen, self.accent, (box.centerx - 14, box.centery), (box.centerx + 14, box.centery), 1)
+        pygame.draw.line(screen, self.accent, (box.centerx, box.centery - 14), (box.centerx, box.centery + 14), 1)
+        screen.set_clip(previous)
 
     def _draw_normal(self, screen, mouse_pos):
         canvas = self.canvas
@@ -878,10 +1040,11 @@ class ImageEditor:
         pygame.draw.line(screen, theme.PANEL_EDGE, (x, y), (x + inner, y))
         y += 10
 
-        draw_text(screen, "旋轉與翻轉", (x, y), 14, theme.TEXT, bold=True)
+        draw_text(screen, "旋轉、翻轉與校正", (x, y), 14, theme.TEXT, bold=True)
         y += 24
-        for i, button in enumerate((self.btn_left, self.btn_right)):
-            button.draw(screen, pygame.Rect(x + i * (half + 12), y, half, 32), mouse_pos)
+        quarter = (inner - 18) // 4
+        for i, button in enumerate((self.btn_left, self.btn_right, self.btn_flip_h, self.btn_flip_v)):
+            button.draw(screen, pygame.Rect(x + i * (quarter + 6), y, quarter, 32), mouse_pos)
         y += 42
         view_angle = round(self.edit.view_angle, 1) + 0.0
         if not self.angle.dragging:
@@ -893,8 +1056,12 @@ class ImageEditor:
         self.angle_input.draw(screen, pygame.Rect(x + inner - 76, y, 60, 34), mouse_pos)
         draw_text(screen, "°", (x + inner - 12, y + 6), 15, theme.TEXT_DIM)
         y += 42
-        for i, button in enumerate((self.btn_flip_h, self.btn_flip_v)):
-            button.draw(screen, pygame.Rect(x + i * (half + 12), y, half, 32), mouse_pos)
+        self.btn_warp.filled = self.warping
+        self.btn_warp.label = "完成校正" if self.warping else "四點校正"
+        self.btn_warp.enabled = ready
+        self.btn_warp.draw(screen, pygame.Rect(x, y, half, 32), mouse_pos)
+        self.btn_clear_warp.enabled = self.edit.warp is not None or self.warping
+        self.btn_clear_warp.draw(screen, pygame.Rect(x + half + 12, y, half, 32), mouse_pos)
         y += 42
         pygame.draw.line(screen, theme.PANEL_EDGE, (x, y), (x + inner, y))
         y += 10

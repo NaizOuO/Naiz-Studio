@@ -40,6 +40,17 @@ def exists():
     return bool(link and link.exists())
 
 
+def in_temp(exe=None):
+    """exe 在暫存資料夾裡:直接在壓縮檔裡雙擊執行時,Windows 會把它解到暫存區,捷徑指過去之後會失效。"""
+    import tempfile
+
+    try:
+        Path(exe or sys.executable).resolve().relative_to(Path(tempfile.gettempdir()).resolve())
+        return True
+    except ValueError:
+        return False
+
+
 def create(exe=None):
     """建立桌面捷徑;成功回傳 True。"""
     link = link_path()

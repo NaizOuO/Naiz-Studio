@@ -1,7 +1,8 @@
 """用 PyInstaller 打包成單一 exe,並整理成可以直接上傳 Release 的資料夾與 zip。
 
 用法:python build.py v1.9.2
-產出:dist/Naiz Studio/(exe、images、README.md、LICENSE)與 dist/Naiz Studio v1.9.2.zip
+產出:dist/_new/Naiz Studio/(exe、images、README.md、LICENSE)與 dist/Naiz Studio v1.9.2.zip
+dist/Naiz Studio/ 不會被動到:那是自己用的一份,用程式內的更新功能換成新版(順便測試更新)。
 另外會用 dist 裡上一版的 zip 做出「從上一版升級」的補丁(需要 zstd 指令),和 zip 一起上傳到 Release,
 已經安裝的人更新時只要下載補丁。
 
@@ -10,7 +11,6 @@
 
 換圖示:python build.py icon 畫好的圖.png(建議 1024×1024、透明背景)
 產出 images/app_icon.png(視窗圖示,256)與 images/app_icon.ico(16～256 各種尺寸)
-發布資料夾裡自己放的測試檔案(下載的元件、輸出、設定等)不會被刪除,也不會被放進 zip。
 """
 
 import os
@@ -155,7 +155,7 @@ def main():
     if version and version.lstrip("vV") != VERSION:
         sys.exit(f"core/version.py 寫的是 {VERSION}，和要打包的 {version} 不同，請先更新")
     dist = ROOT / "dist"
-    release = dist / NAME
+    release = dist / "_new" / NAME       # 不放 dist/Naiz Studio:那份留給自己用更新功能換新版
     exe = release / f"{NAME}.exe"
     if exe.exists():
         # 先確認 exe 沒有在執行,免得打包好幾分鐘後才因為檔案被佔用而失敗
@@ -167,7 +167,6 @@ def main():
 
     PyInstaller.__main__.run(pyinstaller_args(ROOT / "naiz_studio.py", NAME))
 
-    # 發布資料夾裡可能有測試用的檔案,不刪除整個資料夾,只更新打包產生的檔案
     (release / "images").mkdir(parents=True, exist_ok=True)
     os.replace(dist / f"{NAME}.exe", exe)
     for source, relative in release_files():
@@ -175,7 +174,6 @@ def main():
 
     archive = dist / (f"{NAME} {version}.zip" if version else f"{NAME}.zip")
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
-        # 只放打包產生的檔案,資料夾裡其他測試檔案不會被放進去
         zf.write(exe, Path(NAME) / exe.name)
         for _, relative in release_files():
             zf.write(release / relative, Path(NAME) / relative)

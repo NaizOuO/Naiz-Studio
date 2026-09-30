@@ -506,6 +506,8 @@ class App:
                 or self.dialog.is_open or self.consent.is_open or self.settings.is_open or self.large_files.is_open:
             return
         self.shortcut_asked = True
+        if shortcut.in_temp():
+            return                      # 在壓縮檔裡直接執行:這次不問,解壓縮後開啟時再問
         if shortcut.exists():
             self.save_setting("shortcut_prompt", False)
             return

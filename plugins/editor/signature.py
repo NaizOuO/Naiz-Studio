@@ -25,6 +25,8 @@ PEN_RGB = {"black": (20, 20, 20), "blue": (18, 52, 140)}
 PEN_SIZES = [("thin", "細"), ("medium", "中"), ("thick", "粗")]
 PEN_WIDTH = {"thin": 2.2, "medium": 3.4, "thick": 5.0}      # 畫布上的像素
 OUTPUT_SCALE = 3            # 手寫簽名存檔時放大幾倍,放大列印才不會有鋸齒
+PEN_MODES = [("pen", "筆"), ("eraser", "橡皮擦")]
+ERASER_RADIUS = 9           # 簽名板橡皮擦的半徑(像素)
 
 
 def sign_dir():
@@ -82,6 +84,17 @@ def _crop(image, pad):
         return None
     x0, y0, x1, y1 = box
     return image.crop((max(0, x0 - pad), max(0, y0 - pad), min(image.width, x1 + pad), min(image.height, y1 + pad)))
+
+
+def _dense(stroke, step=3):
+    """筆畫上每隔 step 像素一個點(滑鼠移得快時取樣的點之間距離很遠,橡皮擦才不會從縫隙穿過去)。"""
+    if len(stroke) < 2:
+        return list(stroke)
+    points = []
+    for (x0, y0), (x1, y1) in zip(stroke, stroke[1:]):
+        count = max(1, int(max(abs(x1 - x0), abs(y1 - y0)) / step))
+        points += [(x0 + (x1 - x0) * i / count, y0 + (y1 - y0) * i / count) for i in range(count)]
+    return points + [stroke[-1]]
 
 
 def _smooth(points, rounds=2):
@@ -167,10 +180,15 @@ class SignaturePanel:
         self._cards = []
         self._armed = None          # 按過一次刪除、等待確認的簽名
         self.strokes = []
+        self._undo, self._redo = [], []     # 手寫時的復原、重做(每一步存整份筆畫)
         self.canvas = pygame.Rect(0, 0, 0, 0)
         self.drawing = False
+        self.erasing = False
         self.pen_color = SegmentedControl(PEN_COLORS, accent=accent)
         self.pen_size = SegmentedControl(PEN_SIZES, index=1, accent=accent)
+        self.pen_mode = SegmentedControl(PEN_MODES, accent=accent)
+        self.btn_undo = Button("復原", filled=False, size=13)
+        self.btn_redo = Button("重做", filled=False, size=13)
         self.btn_draw = Button("手寫新簽名", accent=accent, size=13)
         self.btn_import = Button("匯入簽名照片", filled=False, size=13)
         self.btn_cancel = Button("取消", filled=False, size=13)
@@ -189,6 +207,35 @@ class SignaturePanel:
     def close(self):
         self.is_open = False
         self.drawing = False
+        self.erasing = False
+
+    # ------------------------------------------------------------ 手寫的復原、重做
+
+    def _remember(self):
+        """改筆畫之前先記下目前的樣子。"""
+        self._undo.append([list(stroke) for stroke in self.strokes])
+        self._redo.clear()
+
+    def undo(self):
+        if self._undo and not self.drawing:
+            self._redo.append(self.strokes)
+            self.strokes = self._undo.pop()
+
+    def redo(self):
+        if self._redo and not self.drawing:
+            self._undo.append(self.strokes)
+            self.strokes = self._redo.pop()
+
+    def _erase_at(self, pos):
+        """擦掉碰到的整條筆畫;同一次拖曳擦掉的算一步。"""
+        kept = [stroke for stroke in self.strokes
+                if not any(abs(x - pos[0]) <= ERASER_RADIUS and abs(y - pos[1]) <= ERASER_RADIUS and
+                           (x - pos[0]) ** 2 + (y - pos[1]) ** 2 <= ERASER_RADIUS ** 2 for x, y in _dense(stroke))]
+        if len(kept) != len(self.strokes):
+            if not self.erased_this_drag:
+                self._remember()
+                self.erased_this_drag = True
+            self.strokes = kept
 
     def refresh(self):
         self.files = signature_files()
@@ -251,6 +298,8 @@ class SignaturePanel:
                 return
             if self.btn_draw.clicked(pos, True):
                 self.mode, self.strokes = "draw", []
+                self._undo, self._redo = [], []
+                self.pen_mode.index = 0
                 self.message = ("", theme.TEXT_DIM)
                 return
             if self.btn_import.clicked(pos, True):
@@ -273,13 +322,30 @@ class SignaturePanel:
             self._armed = None
 
     def _handle_draw(self, event, pos):
+        if event.type == pygame.KEYDOWN and event.mod & pygame.KMOD_CTRL:
+            if event.key == pygame.K_z:
+                self.undo()
+            elif event.key == pygame.K_y:
+                self.redo()
+            return
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if self.canvas.collidepoint(pos):
-                self.drawing = True
-                self.strokes.append([pos])
+                if self.pen_mode.value == "eraser":
+                    self.erasing, self.erased_this_drag = True, False
+                    self._erase_at(pos)
+                else:
+                    self._remember()
+                    self.drawing = True
+                    self.strokes.append([pos])
                 return
             if self.btn_clear.clicked(pos, True):
-                self.strokes = []
+                if self.strokes:
+                    self._remember()
+                    self.strokes = []
+            elif self.btn_undo.clicked(pos, True):
+                self.undo()
+            elif self.btn_redo.clicked(pos, True):
+                self.redo()
             elif self.btn_back.clicked(pos, True):
                 self.mode = "list"
             elif self.btn_save.clicked(pos, True):
@@ -287,6 +353,9 @@ class SignaturePanel:
             else:
                 self.pen_color.clicked(pos, True)
                 self.pen_size.clicked(pos, True)
+                self.pen_mode.clicked(pos, True)
+        elif event.type == pygame.MOUSEMOTION and self.erasing:
+            self._erase_at(pos)
         elif event.type == pygame.MOUSEMOTION and self.drawing:
             x = max(self.canvas.left, min(self.canvas.right - 1, pos[0]))
             y = max(self.canvas.top, min(self.canvas.bottom - 1, pos[1]))
@@ -294,7 +363,7 @@ class SignaturePanel:
             if abs(x - last[0]) + abs(y - last[1]) >= 2:
                 self.strokes[-1].append((x, y))
         elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-            self.drawing = False
+            self.drawing = self.erasing = False
 
     # ------------------------------------------------------------ 繪製
 
@@ -369,7 +438,7 @@ class SignaturePanel:
     def _draw_pad(self, screen, panel, mouse_pos):
         x, inner = panel.x + 24, PANEL_W - 48
         draw_text(screen, "手寫簽名", (x, panel.y + 18), 17, theme.TEXT, bold=True)
-        draw_text(screen, "用滑鼠或觸控筆在白色區域簽名，筆畫會自動修得比較平順",
+        draw_text(screen, "用滑鼠或觸控筆在白色區域簽名，筆畫會自動修得比較平順；寫錯可以按 Ctrl+Z 復原",
                   (x, panel.y + 48), 12, theme.TEXT_FAINT)
         self.canvas = pygame.Rect(x, panel.y + 76, inner, panel.height - 76 - 150)
         pygame.draw.rect(screen, (255, 255, 255), self.canvas, border_radius=10)
@@ -386,12 +455,19 @@ class SignaturePanel:
                 pygame.draw.lines(screen, color, False, points, max(1, round(width)))
                 for point in points:
                     pygame.draw.circle(screen, color, point, width / 2)
+        if self.pen_mode.value == "eraser" and self.canvas.collidepoint(mouse_pos):
+            pygame.draw.circle(screen, (120, 120, 120), mouse_pos, ERASER_RADIUS, 1)
         row = self.canvas.bottom + 14
-        draw_text(screen, "筆的顏色", (x, row + 8), 13, theme.TEXT_DIM)
-        self.pen_color.draw(screen, pygame.Rect(x + 70, row, 150, 32), mouse_pos)
-        draw_text(screen, "粗細", (x + 244, row + 8), 13, theme.TEXT_DIM)
-        self.pen_size.draw(screen, pygame.Rect(x + 284, row, 170, 32), mouse_pos)
+        draw_text(screen, "顏色", (x, row + 8), 13, theme.TEXT_DIM)
+        self.pen_color.draw(screen, pygame.Rect(x + 40, row, 130, 32), mouse_pos)
+        draw_text(screen, "粗細", (x + 186, row + 8), 13, theme.TEXT_DIM)
+        self.pen_size.draw(screen, pygame.Rect(x + 226, row, 150, 32), mouse_pos)
+        self.pen_mode.draw(screen, pygame.Rect(panel.right - 24 - 150, row, 150, 32), mouse_pos)
         foot = panel.bottom - 52
         self.btn_clear.draw(screen, pygame.Rect(x, foot, 80, 34), mouse_pos)
+        self.btn_undo.enabled = bool(self._undo)
+        self.btn_undo.draw(screen, pygame.Rect(x + 90, foot, 80, 34), mouse_pos)
+        self.btn_redo.enabled = bool(self._redo)
+        self.btn_redo.draw(screen, pygame.Rect(x + 180, foot, 80, 34), mouse_pos)
         self.btn_save.draw(screen, pygame.Rect(panel.right - 24 - 112, foot, 112, 34), mouse_pos)
         self.btn_back.draw(screen, pygame.Rect(panel.right - 24 - 112 - 10 - 80, foot, 80, 34), mouse_pos)

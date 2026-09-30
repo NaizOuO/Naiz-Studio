@@ -145,6 +145,11 @@ class History:
         self.pages = list(pages)
         return True
 
+    def amend(self, pages):
+        """換掉目前的樣子但不多記一步復原;用在同一次拖曳的連續修改(例如橡皮擦),復原時整次一起回去。"""
+        self.pages = list(pages)
+        self._redo.clear()
+
     @property
     def can_undo(self):
         return bool(self._undo)

@@ -119,6 +119,13 @@ def _ink(draw):
     _line(draw, _wave(3.5, 20.5, 12.5, 4, 1.25))
 
 
+def _eraser(draw):
+    # 斜放的橡皮擦:前端實心、後端空心,下面一條擦過的線
+    _fill(draw, [(4.2, 14.8), (9.2, 9.8), (14.2, 14.8), (11.4, 17.6), (7, 17.6)])
+    _line(draw, [(9.2, 9.8), (13.8, 5.2), (19.8, 11.2), (14.2, 16.8)], 1.8)
+    _line(draw, [(4, 20.5), (20.5, 20.5)], 1.6)
+
+
 def _image(draw):
     _box(draw, (3, 4, 21, 20), 1.8, 2)
     draw.ellipse(tuple(v * SCALE for v in (7, 7.5, 10.6, 11.1)), fill=255)
@@ -156,7 +163,7 @@ def _stamp(draw):
 
 DRAW = {"select": _select, "link": _link, "stamp": _stamp, "highlight": _highlight, "underline": _underline, "strike": _strike,
         "textbox": _textbox, "replace": _replace, "redact": _redact, "note": _note, "line": _straight,
-        "arrow": _arrow, "rect": _rect, "ellipse": _ellipse, "ink": _ink, "image": _image, "signature": _signature}
+        "arrow": _arrow, "rect": _rect, "ellipse": _ellipse, "ink": _ink, "eraser": _eraser, "image": _image, "signature": _signature}
 
 
 def icon(name, size, color):
