@@ -2,7 +2,10 @@
 
 用法:python build.py v1.9.2
 產出:dist/Naiz Studio/(exe、images、README.md、LICENSE)與 dist/Naiz Studio v1.9.2.zip
+另外會用 dist 裡上一版的 zip 做出「從上一版升級」的補丁(需要 zstd 指令),和 zip 一起上傳到 Release,
+已經安裝的人更新時只要下載補丁。
 
+只重做補丁:python build.py patch v1.15.1(用 dist 裡這一版與上一版的 zip)
 打包擴充模組:python build.py mod circuit → dist/circuit-v0.1.0.zip(版本照模組 __init__.py 的 version)
 
 換圖示:python build.py icon 畫好的圖.png(建議 1024×1024、透明背景)
@@ -19,12 +22,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 NAME = "Naiz Studio"
 # 插件是執行時才從資料夾讀入,PyInstaller 看不到它們用了哪些套件,要自己列出來
-EXTRA_IMPORTS = ["pypdfium2", "resvg_py", "pikepdf", "opencc", "pillow_heif", "vtracer", "queue"]
+EXTRA_IMPORTS = ["pypdfium2", "resvg_py", "pikepdf", "opencc", "pillow_heif", "vtracer", "queue", "compression.zstd"]
 # 主程式沒用到、但擴充模組可能會用的內建模組;不列出來的話 exe 裡沒有,模組 import 會失敗
 STDLIB_FOR_MODS = ["sqlite3", "configparser", "tomllib", "shelve", "dbm", "wave", "sched", "csv",
                    "http.server", "xml.dom.minidom", "statistics", "fractions", "difflib", "calendar"]
 # 已經不用的套件,以及 fontTools 的繪圖、比對工具才需要的重量級相依(我們只用子集與字重固定,用不到)
-EXCLUDE = ["tkinter", "pymupdf", "fitz", "scipy", "matplotlib", "sympy"]
+EXCLUDE = ["tkinter", "pymupdf", "fitz", "scipy", "matplotlib", "mpl_toolkits", "reportlab", "sympy"]
 # fontTools 讀字型表格時是依名稱動態匯入模組,要整包收進去
 COLLECT = ["core", "PIL", "fontTools"]
 # python-docx 會讀自己附的範本檔,資料檔要一起收進去
@@ -77,6 +80,71 @@ def release_files():
     return files
 
 
+PATCH_MAX_RATIO = 0.5       # 補丁超過完整版的一半就不做,直接下載完整版比較單純
+
+
+def previous_release(current):
+    """dist 裡比 current 舊、版本最新的發布 zip;(版本, 路徑) 或 None。"""
+    from core.version import parse
+
+    found = []
+    for archive in (ROOT / "dist").glob(f"{NAME} v*.zip"):
+        tag = archive.stem[len(NAME) + 1:]
+        if parse(tag) != (0,) and parse(tag) < parse(current):
+            found.append((parse(tag), tag, archive))
+    return max(found)[1:] if found else None
+
+
+def make_patch(current, archive):
+    """做出從上一版升級到 current 的補丁:新舊 exe 的差異,加上有改過的隨附檔案。"""
+    import hashlib
+    import json
+    import subprocess
+    import tempfile
+
+    from core.updater import patch_name
+
+    previous = previous_release(current)
+    if previous is None:
+        print("dist 裡沒有上一版的 zip,不做補丁")
+        return None
+    old_tag, old_archive = previous
+    zstd = shutil.which("zstd")
+    if zstd is None:
+        print("找不到 zstd 指令,不做補丁(已經安裝的人會下載完整版)")
+        return None
+    root = f"{NAME}/"
+    with zipfile.ZipFile(old_archive) as old_zip, zipfile.ZipFile(archive) as new_zip:
+        old_exe = old_zip.read(root + f"{NAME}.exe")
+        new_exe = new_zip.read(root + f"{NAME}.exe")
+        old_names = set(old_zip.namelist())
+        changed = [n for n in new_zip.namelist() if n != root + f"{NAME}.exe" and not n.endswith("/")
+                   and (n not in old_names or old_zip.read(n) != new_zip.read(n))]
+        extra = {n[len(root):]: new_zip.read(n) for n in changed}
+    with tempfile.TemporaryDirectory() as temp:
+        temp = Path(temp)
+        (temp / "old.exe").write_bytes(old_exe)
+        (temp / "new.exe").write_bytes(new_exe)
+        subprocess.run([zstd, "-q", "-f", "-19", "--long=27", f"--patch-from={temp / 'old.exe'}",
+                        str(temp / "new.exe"), "-o", str(temp / "exe.zst")], check=True)
+        diff = (temp / "exe.zst").read_bytes()
+    patch = ROOT / "dist" / patch_name(old_tag, current)
+    manifest = dict(from_tag=old_tag, to_tag=current, from_sha256=hashlib.sha256(old_exe).hexdigest(),
+                    to_sha256=hashlib.sha256(new_exe).hexdigest())
+    with zipfile.ZipFile(patch, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("manifest.json", json.dumps(manifest, indent=1))
+        zf.writestr("exe.zst", diff, compress_type=zipfile.ZIP_STORED)
+        for relative, data in extra.items():
+            zf.writestr(f"files/{relative}", data)
+    size = patch.stat().st_size
+    if size > archive.stat().st_size * PATCH_MAX_RATIO:
+        patch.unlink()
+        print(f"補丁({size / 1024 / 1024:.1f} MB)和完整版差不多大,不做補丁")
+        return None
+    print(f"補丁:{patch}(從 {old_tag},{size / 1024 / 1024:.2f} MB;隨附檔案 {len(extra)} 個有改)")
+    return patch
+
+
 def main():
     import PyInstaller.__main__
 
@@ -113,6 +181,8 @@ def main():
             zf.write(release / relative, Path(NAME) / relative)
         zf.writestr(f"{NAME}/mods/", "")      # 空的擴充模組資料夾,下載的模組解壓縮到這裡
     print(f"\n完成:{release}\n壓縮檔:{archive}({archive.stat().st_size / 1024 / 1024:.1f} MB)")
+    if version:
+        make_patch("v" + VERSION, archive)
 
 
 ICON_SIZES = [16, 20, 24, 32, 40, 48, 64, 128, 256]
@@ -159,5 +229,8 @@ if __name__ == "__main__":
         make_icon(sys.argv[2])
     elif len(sys.argv) > 2 and sys.argv[1] == "mod":
         make_mod(sys.argv[2])
+    elif len(sys.argv) > 2 and sys.argv[1] == "patch":
+        sys.path.insert(0, str(ROOT))
+        make_patch("v" + sys.argv[2].lstrip("vV"), ROOT / "dist" / f"{NAME} v{sys.argv[2].lstrip('vV')}.zip")
     else:
         main()

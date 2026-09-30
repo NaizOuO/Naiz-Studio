@@ -586,7 +586,11 @@ class App:
         job = self.update_job
         if job is not None:
             if job.state == "downloading":
-                return f"下載更新 {int(job.progress * 100)}%", theme.ACCENT
+                left = job.remaining
+                if left is None:
+                    return f"下載更新 {int(job.progress * 100)}%", theme.ACCENT
+                left = "不到 1 分鐘" if left < 60 else f"約 {int(left // 60) + 1} 分鐘"
+                return f"下載更新 {int(job.progress * 100)}%，還要{left}", theme.ACCENT
             if job.state == "ready":
                 return "重新開啟以完成更新", theme.ACCENT
             return "更新失敗，點這裡到網頁下載", theme.WARN
