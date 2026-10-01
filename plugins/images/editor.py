@@ -7,6 +7,7 @@ import threading
 import pygame
 
 from core import paths, theme, widgets
+from core.scroll import ScrollView
 from core.widgets import (Button, ChoiceGrid, SegmentedControl, Slider, TextInput, Toggle, draw_text,
                           rounded_panel)
 
@@ -34,7 +35,7 @@ IMAGE_EDGE = (150, 158, 173)   # 擴展畫布時原圖範圍的細框
 WARP_GRAB = 16        # 四點校正時滑鼠離角多近算是抓到
 LOUPE = 170           # 四點校正放大鏡的邊長
 LOUPE_ZOOM = 4
-WARP_HINT = "四點校正：拖曳四個角對準拍斜的文件、白板或畫面的邊緣，會拉正成長方形；滑鼠停在角上可用方向鍵逐像素移動"
+WARP_HINT = "四點校正：拖曳四個角對準拍斜的文件、白板或畫面的邊緣，會拉正成長方形；滑鼠停在角上可用方向鍵逐像素移動；Enter 套用、Esc 取消"
 
 _checker = None
 _icons = {}
@@ -99,6 +100,8 @@ class ImageEditor:
         self.get_screen = get_screen
         self.accent = accent
         self.embedded = embedded   # 嵌在「圖片工具」頁面裡:沒有標題列、取消與完成,Esc 不會關掉
+        self.side_view = ScrollView(accent=accent, indicator=True)  # 嵌入時視窗小,設定區放不下就捲動
+        self.side_clip = pygame.Rect(0, 0, 0, 0)
         self.is_open = False
         self.item = None
         self.edit = ops.Edit()
@@ -565,6 +568,13 @@ class ImageEditor:
     # ------------------------------------------------------------ 事件
 
     def handle_event(self, event, pos):
+        if self.embedded:
+            if self.side_view.handle_event(event, pos):
+                return
+            # 嵌入時只理會畫面和設定區看得到的範圍:捲到外面、被底下按鈕蓋住的設定不能被點到
+            if event.type == pygame.MOUSEBUTTONDOWN and not self.canvas.collidepoint(pos) \
+                    and not self.side_clip.collidepoint(pos):
+                return
         typing = self.angle_input.focused or any(field.focused for field in self.fields.values())
         ready = self.base is not None
         if self.warping and self._handle_warp(event, pos):
@@ -678,7 +688,11 @@ class ImageEditor:
     def _handle_warp(self, event, pos):
         """四點校正模式的滑鼠、鍵盤;用掉事件時回傳 True。"""
         if event.type == pygame.KEYDOWN:
-            if event.key in (pygame.K_ESCAPE, pygame.K_RETURN, pygame.K_KP_ENTER):
+            if event.key == pygame.K_ESCAPE:       # 取消:這次拖的角都不要,回到進來之前的樣子
+                self.warping, self.warp_points, self.warp_hover, self.drag = False, None, None, None
+                self.message = ""
+                return True
+            if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 self._finish_warp()
                 return True
             if event.key in NUDGE and self.warp_hover is not None:
@@ -749,7 +763,15 @@ class ImageEditor:
         side = panel.inflate(-28, -28)
         self.canvas = pygame.Rect(area.x, area.y, panel.x - 16 - area.x, area.height)
         self._draw_canvas(screen, mouse_pos)
-        self._draw_side(screen, side, mouse_pos)
+        # 放不下時捲動;畫在範圍外的設定被切掉,也不能被點到(見 handle_event)
+        view = self.side_view
+        previous = screen.get_clip()
+        screen.set_clip(side)
+        bottom = self._draw_side(screen, pygame.Rect(side.x, side.y - view.scroll, side.width, side.height), mouse_pos)
+        screen.set_clip(previous)
+        view.layout(panel.inflate(-4, -16), bottom - (side.y - view.scroll) + 8)
+        view.draw(screen, mouse_pos)
+        self.side_clip = side
 
     def draw(self, mouse_pos):
         screen = self.get_screen()
@@ -1090,3 +1112,4 @@ class ImageEditor:
         self.btn_reset.draw(screen, pygame.Rect(x, y, half, 32), mouse_pos)
         self.btn_all.enabled = ready
         self.btn_all.draw(screen, pygame.Rect(x + half + 12, y, half, 32), mouse_pos)
+        return y + 32

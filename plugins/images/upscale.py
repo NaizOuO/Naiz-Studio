@@ -2,7 +2,9 @@
 也有不需要下載的「一般放大」。Real-ESRGAN 第一次使用時才下載(約 43 MB),放在 bin\\realesrgan\\。
 
 授權:Real-ESRGAN 本體與模型是 BSD-3-Clause,Windows 執行檔(ncnn-vulkan 版)是 MIT,都可以自由使用。
-「照片(自然)」的模型是 Philip Hofmann 的 4xNomosWebPhoto_esrgan(CC BY 4.0),官方只有 PyTorch/ONNX,
+「照片」同時跑兩個模型再依「質感」混合:銳利的是 realesrgan-x4plus(乾淨但會抹平細紋,有塑膠感),
+自然的是 Philip Hofmann 的 4xNomosWebPhoto_esrgan(保留紋理,但壓縮嚴重的圖會有顆粒、鋸齒;CC BY 4.0)。
+自然的模型官方只有 PyTorch/ONNX,
 這裡用的是轉成 ncnn 的版本(權重照官方 realesrgan-x4plus 的網路結構排好,舊版執行檔也能讀),
 放在 Naiz Studio 自己的「下載元件」Release(tag components),裝在 bin\\realesrgan-models\\(路徑裡一定要有 models,執行檔才肯讀)。
 需要支援 Vulkan 的顯示卡(近幾年的 NVIDIA、AMD、Intel 內顯都可以);沒有的話改用一般放大。
@@ -44,8 +46,7 @@ NATURAL = deps.Dependency(
 
 # (代號, 名稱, Real-ESRGAN 模型名稱或 None(一般放大), 說明)
 MODELS = [
-    ("natural", "照片（自然）", "realesrgan-x4plus-nomoswebphoto", "保留紋理、顏色忠實，比較不會有塑膠感"),
-    ("photo", "照片（銳利）", "realesrgan-x4plus", "邊緣最銳利乾淨，但細紋會被抹平"),
+    ("photo", "照片", "realesrgan-x4plus", "適合照片；用「質感」在銳利和自然之間調整"),
     ("anime", "插畫、動漫", "realesrgan-x4plus-anime", "線條銳利、色塊乾淨，適合插畫、貼圖、漫畫"),
     ("fast", "快速", "realesr-animevideov3", "最快，適合大量圖片、截圖；細節少一點"),
     ("plain", "一般放大", None, "不用 AI、不用下載；畫質提升有限"),
@@ -57,18 +58,42 @@ BIG_SIDE = 8000         # 放大後最長邊超過這個就提醒:檔案會很�
 # 這兩個模型指定 2、3 倍時輸出是壞的(Real-ESRGAN ncnn 版的問題),一律放大 4 倍再縮小
 FOUR_ONLY = {"realesrgan-x4plus", "realesrgan-x4plus-anime", "realesrgan-x4plus-nomoswebphoto"}
 EXTRA = {"realesrgan-x4plus-nomoswebphoto": NATURAL}    # 不在 Real-ESRGAN 壓縮檔裡、另外下載的模型
+NATURAL_NETWORK = "realesrgan-x4plus-nomoswebphoto"
+# 每個模型實際要跑的網路:照片跑銳利、自然兩個,依「質感」混合
+NETWORKS = {"photo": ["realesrgan-x4plus", NATURAL_NETWORK]}
+TEXTURE = 50            # 質感預設:銳利、自然各半(看起來最平衡:邊緣乾淨又有質感)
 
 
 class Cancelled(Exception):
     pass
 
 
+def networks(model):
+    """這個模型實際要跑的 Real-ESRGAN 網路;一般放大是空的。"""
+    network = dict((key, name) for key, _, name, _ in MODELS).get(model)
+    return NETWORKS.get(model, [network] if network else [])
+
+
 def required(model):
     """這個模型需要的元件(還沒下載的)。"""
-    network = dict((key, name) for key, _, name, _ in MODELS).get(model)
-    if network is None:
+    names = networks(model)
+    if not names:
         return []
-    return [dep for dep in (ESRGAN, EXTRA.get(network)) if dep is not None and not dep.installed()]
+    needed = [ESRGAN] + [EXTRA[name] for name in names if name in EXTRA]
+    return [dep for dep in needed if not dep.installed()]
+
+
+def combine(parts, texture=TEXTURE):
+    """照片的兩個結果依質感(0 銳利～100 自然)混合;其他模型只有一個結果,直接回傳。"""
+    if len(parts) == 1:
+        return parts[0]
+    sharp, natural = parts
+    texture = max(0, min(100, int(texture)))
+    if texture <= 0:
+        return sharp
+    if texture >= 100:
+        return natural
+    return Image.blend(sharp, natural.convert(sharp.mode), texture / 100)
 
 
 def needs_download(model):
@@ -115,13 +140,28 @@ def _bleed(rgb, alpha):
     return Image.fromarray(numpy.clip(filled, 0, 255).astype(numpy.uint8))
 
 
-def upscale(image, model, scale, progress=None, cancel=None):
+def upscale(image, model, scale, progress=None, cancel=None, texture=TEXTURE):
     """放大 scale 倍(1 是原尺寸:AI 放大後再縮回原本大小,細節更清楚);progress(0～1) 回報進度,
-    cancel 是 threading.Event,設定後中止。透明的地方保持透明。"""
+    cancel 是 threading.Event,設定後中止。透明的地方保持透明。照片依 texture 混合銳利與自然。"""
+    return combine(upscale_parts(image, model, scale, progress, cancel), texture)
+
+
+def upscale_parts(image, model, scale, progress=None, cancel=None):
+    """每個網路各自的結果(照片是 [銳利, 自然]);畫面上存起來,拉「質感」時只要重新混合、不用重跑。"""
     scale = int(scale)
-    network = dict((key, name) for key, _, name, _ in MODELS).get(model)
-    if network is None:
-        return _plain(image, scale)
+    names = networks(model)
+    if not names:
+        return [_plain(image, scale)]
+    parts = []
+    for index, network in enumerate(names):
+        step = None
+        if progress is not None:
+            step = (lambda v, i=index: progress((i + v) / len(names)))
+        parts.append(_one(image, network, scale, step, cancel))
+    return parts
+
+
+def _one(image, network, scale, progress, cancel):
     # 透明度另外放大(這個版本處理透明圖有問題):AI 只放大顏色
     alpha = image.getchannel("A") if image.mode in ("RGBA", "LA", "PA") else None
     rgb = image.convert("RGB")

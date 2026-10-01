@@ -441,7 +441,26 @@ def open_image(path, svg_side=None):
         return image
     if source == "heic" and pillow_heif is None:
         raise RuntimeError("缺少讀取 HEIC 的元件")
-    return Image.open(io.BytesIO(data))
+    return _eight_bit(Image.open(io.BytesIO(data)))
+
+
+def _eight_bit(image):
+    """16 位元、32 位元的灰階圖(科學影像、深度圖常見)換成一般的 8 位元灰階;
+    直接 convert 會把超過 255 的值全部截掉,整張變成白的。"""
+    if image.mode not in ("I;16", "I;16L", "I;16B", "I;16N", "I", "F") or getattr(image, "n_frames", 1) > 1:
+        return image
+    import numpy
+
+    values = numpy.asarray(image, dtype=numpy.float64)
+    top = float(values.max()) if values.size else 0.0
+    if image.mode.startswith("I;16") or top > 255:
+        values = values / 257                   # 0～65535 對應到 0～255
+    elif image.mode == "F" and top <= 1.0:
+        values = values * 255                   # 0～1 的浮點數
+    result = Image.fromarray(numpy.clip(values + 0.5, 0, 255).astype(numpy.uint8), "L")
+    result.info = dict(image.info)
+    result.format = image.format
+    return result
 
 
 def _probe_svg(path, thumb_box):

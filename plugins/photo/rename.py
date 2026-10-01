@@ -16,6 +16,8 @@ TOKENS = [("{名稱}", "原本的檔名"), ("{序號}", "依清單順序的編�
 BAD_CHARS = re.compile(r'[\\/:*?"<>|]')
 RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 DATE_TAGS = (36867, 36868, 306)     # 拍攝時間、數位化時間、修改時間(EXIF)
+MAX_NAME = 255                      # Windows 一個檔名最多 255 個字
+MAX_PATH = 259                      # 沒開長路徑支援時,連資料夾在內最多 259 個字
 
 
 def taken_date(path):
@@ -44,8 +46,14 @@ def new_names(paths, pattern, start=1, digits=3, dates=None):
     return names
 
 
-def problems(paths, names, in_place):
-    """每個新名字的問題(沒問題是空字串):不能用的字、重複、原資料夾已經有別的檔案叫這個名字。"""
+def _length(text):
+    """Windows 算長度的方式(UTF-16):少數罕用字算兩個字。"""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def problems(paths, names, in_place, folder=None):
+    """每個新名字的問題(沒問題是空字串):不能用的字、太長、重複、原資料夾已經有別的檔案叫這個名字。
+    folder 是另外輸出時的資料夾(用來檢查整個路徑會不會太長)。"""
     result = []
     lowered = [name.lower() for name in names]
     moving = {Path(p).resolve() for p in paths}
@@ -57,6 +65,10 @@ def problems(paths, names, in_place):
             result.append('檔名不能有 \\ / : * ? " < > | 這些字')
         elif stem.upper() in RESERVED or name.endswith((" ", ".")):
             result.append("Windows 不能用這個檔名")
+        elif _length(name) > MAX_NAME:
+            result.append(f"檔名太長，最多 {MAX_NAME} 個字")
+        elif (in_place or folder) and _length(str(Path(Path(path).parent if in_place else folder) / name)) > MAX_PATH:
+            result.append("連資料夾在內的路徑太長，請把檔名改短一點")
         elif lowered.count(low) > 1:
             result.append("和其他檔案改成同一個名字")
         elif in_place:

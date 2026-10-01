@@ -33,12 +33,13 @@ from . import rename
 MODES = [("adjust", "調整"), ("color", "色彩"), ("effect", "效果"), ("scan", "掃描"), ("hd", "高清"),
          ("rename", "改檔名")]
 HD_VIEWS = [("fit", "整張"), ("actual", "放大檢視")]
-SCAN_VIEWS = [("corners", "對準四角"), ("result", "看結果")]
+SCAN_BAR = 52          # 掃描畫面下方放「調整四個角/預覽結果」按鈕的高度
 SCAN_OUTPUTS = [("pdf", "合成 PDF"), ("jpg", "每張 JPG"), ("png", "每張 PNG")]
 SCAN_PAGES = [("a4", "A4"), ("fit", "依圖片大小")]
 SCAN_PAGE_NOTES = {"a4": "每張放進 A4 頁面，列印剛好", "fit": "頁面和拉正後的圖片一樣大"}
 COLOR_TABS = [("correct", "校正"), ("color", "色彩"), ("fine", "微調")]
 SIDE_PAD = 14               # 右邊設定區底板的內距
+HIDDEN = pygame.Rect(-10000, -10000, 0, 0)     # 捲到看不見的設定:移到畫面外,不會被點到
 LIST_W = 250
 ROW_H = 62
 THUMB = 44
@@ -106,7 +107,10 @@ class PhotoPage(Page):
         self.gallery = []           # 這一幀畫出來的縮圖:[(範圍, 要改的設定, 名稱)]
         self.hover_preset = None    # 滑鼠停在哪個縮圖上:(要改的設定, 名稱);大預覽先顯示套用後的樣子
         self._thumbs = {}
-        self.scan_view = SegmentedControl(SCAN_VIEWS, accent=accent)
+        self.side_views = {}        # 每個模式(色彩分頁)各自的捲動位置:視窗小、設定放不下時可以捲動
+        self._side_view = None
+        self.side_clip = pygame.Rect(0, 0, 0, 0)
+        self.btn_corners = Button("調整四個角", filled=False, size=13)   # 掃描:在結果與對準四角之間切換
         self.scan_output = SegmentedControl(SCAN_OUTPUTS, accent=accent)
         self.scan_page = SegmentedControl(SCAN_PAGES, accent=accent)
         self.btn_detect = Button("自動找邊", filled=False, size=13)
@@ -115,7 +119,9 @@ class PhotoPage(Page):
         self.btn_scan_all = Button("濾鏡套用到全部", filled=False, size=13)
         self.btn_export = Button("全部輸出", accent=accent, size=14)
         self.scan_checked = set()   # 掃描模式下已經自動找過邊的圖,不重複找(手動調整過的不會被蓋掉)
-        self.hd_model = "natural"
+        self.hd_model = "photo"
+        self.hd_texture = Slider(0, 100, upscale.TEXTURE, step=5, accent=accent)
+        self._hd_mix = None         # (哪幾張結果、質感, 混合後):拉質感時才重新混合
         self.hd_strength = Slider(0, 100, 100, step=5, accent=accent)
         self.hd_scale = SegmentedControl(upscale.SCALES, accent=accent)
         self.hd_view = SegmentedControl(HD_VIEWS, accent=accent)
@@ -123,7 +129,7 @@ class PhotoPage(Page):
         self.btn_hd_preview = Button("預覽這張", accent=accent, filled=False, size=13)
         self.btn_hd_save_all = Button("全部變清楚並儲存", accent=accent, size=14)
         self.hd_job = None          # 正在預覽:{key, progress, cancel, error}
-        self.hd_result = None       # (key, 原圖套用編輯後, 放大後)
+        self.hd_result = None       # (key, 原圖套用編輯後, [各網路放大後的結果])
         self.hd_split = 0.5         # 比較畫面的分隔線位置(0～1)
         self.hd_center = None       # 放大檢視時畫面中心(處理後的座標)
         self.hd_drag = None
@@ -360,6 +366,7 @@ class PhotoPage(Page):
         self._edited(item)
         if not found and quiet:
             self.notice = ("找不到文件的邊，請拖曳四個角對準文件；也可以按「用整張圖」", theme.WARN)
+        return found
 
     def use_whole(self):
         item = self.current
@@ -476,7 +483,7 @@ class PhotoPage(Page):
             try:
                 source = upscale.load_edited(path, edit)
                 job["stage"] = "處理中"
-                result = upscale.upscale(source, model, scale, lambda v: job.update(progress=v), job["cancel"])
+                result = upscale.upscale_parts(source, model, scale, lambda v: job.update(progress=v), job["cancel"])
             except upscale.Cancelled:
                 self.hd_job = None
                 return
@@ -505,7 +512,7 @@ class PhotoPage(Page):
 
     def _start_hd_save(self, items):
         model, scale, fmt = self.hd_model, int(self.hd_scale.value), self.hd_format.value
-        strength = int(self.hd_strength.value)
+        strength, texture = int(self.hd_strength.value), int(self.hd_texture.value)
         jobs = [(item, item.edit.copy(), self._hd_key(item)) for item in items]
         cached = self.hd_result
         for item in items:
@@ -517,11 +524,11 @@ class PhotoPage(Page):
             for number, (item, edit, key) in enumerate(jobs, 1):
                 try:
                     if cached is not None and cached[0] == key:
-                        source, result = cached[1], cached[2]       # 剛剛預覽過的直接用,不用再算一次
+                        source, parts = cached[1], cached[2]        # 剛剛預覽過的直接用,不用再算一次
                     else:
                         source = upscale.load_edited(item.path, edit)
-                        result = upscale.upscale(source, model, scale)
-                    result = upscale.blend(result, source, strength)
+                        parts = upscale.upscale_parts(source, model, scale)
+                    result = upscale.blend(upscale.combine(parts, texture), source, strength)
                     upscale.save(result, item.path, output_dir(), fmt, scale)
                     item.status = "done"
                     done += 1
@@ -556,7 +563,7 @@ class PhotoPage(Page):
                     if path not in self._dates:
                         self._dates[path] = rename.taken_date(path)
             names = rename.new_names(paths_now, self.pattern.text, start, int(self.digits.value), self._dates)
-            issues = rename.problems(paths_now, names, mode == "rename")
+            issues = rename.problems(paths_now, names, mode == "rename", None if mode == "rename" else output_dir())
         self._preview = (key, names, issues)
         return names, issues
 
@@ -676,6 +683,8 @@ class PhotoPage(Page):
             self.list_view.set_scroll(self.list_view.scroll + delta)
         self.list_view.update(mouse)
         self.rename_view.update(mouse)
+        if self._side_view is not None:
+            self._side_view.update(mouse)
         if self.current is not None:
             self.editor.update()
 
@@ -719,16 +728,17 @@ class PhotoPage(Page):
 
     def _draw_header(self, rect, mouse_pos):
         screen = self.screen
-        self.mode.draw(screen, pygame.Rect(rect.x, rect.y, 520, rect.height), mouse_pos)
+        tabs_w = min(520, rect.width - 180)
+        self.mode.draw(screen, pygame.Rect(rect.x, rect.y, tabs_w, rect.height), mouse_pos)
         if self.mode.value != "rename":
             record = self.history.get(self.current)
             self.btn_redo.enabled = bool(record and record["redo"])
             self.btn_undo.enabled = bool(record and record["undo"])
             self.btn_redo.draw(screen, pygame.Rect(rect.right - 76, rect.y, 76, rect.height), mouse_pos)
             self.btn_undo.draw(screen, pygame.Rect(rect.right - 160, rect.y, 76, rect.height), mouse_pos)
-            if self.current is not None:
-                name = widgets.clip_text(self.current.path.name, 13, rect.width - 520 - 190)
-                draw_text(screen, name, (rect.x + 536, rect.centery - 9), 13, theme.TEXT_DIM)
+            if self.current is not None and rect.width - tabs_w - 190 > 60:
+                name = widgets.clip_text(self.current.path.name, 13, rect.width - tabs_w - 190)
+                draw_text(screen, name, (rect.x + tabs_w + 16, rect.centery - 9), 13, theme.TEXT_DIM)
 
     def _draw_empty(self, area):
         screen = self.screen
@@ -824,12 +834,45 @@ class PhotoPage(Page):
         self.canvas = pygame.Rect(work.x, work.y, panel.x - 16 - work.x, work.height)
         return panel.inflate(-SIDE_PAD * 2, -SIDE_PAD * 2)
 
-    def _draw_preview(self, work, mouse_pos, draw_side):
+    def _scrolled_side(self, side, draw_side, mouse_pos):
+        """畫右邊的設定;放不下時可以捲動,畫在範圍外的被切掉,也不能被點到(不會點到底下的按鈕)。"""
+        key = self.mode.value + (":" + self.color_tab.value if self.mode.value == "color" else "")
+        view = self.side_views.get(key)
+        if view is None:
+            view = self.side_views[key] = ScrollView(accent=self.tool.accent, indicator=True)
+        screen = self.screen
+        previous = screen.get_clip()
+        screen.set_clip(side)
+        shifted = pygame.Rect(side.x, side.y - view.scroll, side.width, side.height)
+        bottom = draw_side(shifted, mouse_pos) or shifted.bottom
+        screen.set_clip(previous)
+        view.layout(side.inflate(SIDE_PAD * 2 - 4, 0), bottom - shifted.y)
+        view.draw(screen, mouse_pos)
+        self._side_view, self.side_clip = view, side
+        self._clip_side(side)
+
+    def _clip_side(self, clip):
+        def cut(rect):
+            return rect.clip(clip) if rect.colliderect(clip) else HIDDEN.copy()
+
+        for button in (self.btn_color_reset, self.btn_color_all, self.btn_effect_all, self.btn_compare, self.btn_detect,
+                       self.btn_whole, self.btn_detect_all, self.btn_scan_all, self.btn_hd_preview):
+            button.rect = cut(button.rect)
+        for control in (self.color_tab, self.scan_page, self.hd_scale, self.hd_view):
+            control.rects = [cut(rect) for rect in control.rects]
+        for slider in (*self.color_sliders.values(), self.effect_strength, self.hd_strength, self.hd_texture):
+            slider.rect = cut(slider.rect)      # 左右不會被切到,拖曳時換算的位置不變
+        self.gallery = [(cut(rect), changes, name) for rect, changes, name in self.gallery if rect.colliderect(clip)]
+        self.hd_rows = [(cut(row), key) for row, key in self.hd_rows if row.colliderect(clip)]
+
+    def _draw_preview(self, work, mouse_pos, draw_side, bar=0):
+        """左邊是套用編輯後的大預覽;bar 是底部留給按鈕的高度(預覽不會被蓋住)。"""
         screen = self.screen
         side = self._split_side(work)
         rounded_panel(screen, self.canvas, theme.BG_DEEP, radius=10, alpha=220)
+        self.canvas.height -= bar
         self.gallery = []
-        draw_side(side, mouse_pos)
+        self._scrolled_side(side, draw_side, mouse_pos)
         editor = self.editor
         if editor.error:
             draw_text(screen, f"無法讀取：{editor.error}", self.canvas.center, 14, theme.DANGER, center=True)
@@ -976,25 +1019,27 @@ class PhotoPage(Page):
                     draw_text(screen, COLOR_NOTES[key], (x + 56, y + 1), 11, theme.TEXT_FAINT)
                 slider.draw(screen, pygame.Rect(x + 8, y + 26, inner - 16, 14), mouse_pos)
                 y += 54
-        self._draw_side_footer(side, mouse_pos, self.btn_color_all,
-                               bool(edit.adjust or edit.recolor))
+        return self._draw_side_footer(side, mouse_pos, self.btn_color_all, bool(edit.adjust or edit.recolor), y)
 
-    def _draw_side_footer(self, side, mouse_pos, apply_all, changed):
-        """設定區最下面:滑鼠停在縮圖上的名稱、重設、套用到全部、按住看原圖。"""
+    def _draw_side_footer(self, side, mouse_pos, apply_all, changed, top):
+        """設定區最下面:滑鼠停在縮圖上的名稱、重設、套用到全部、按住看原圖。
+        放得下時貼齊底部,放不下時接在內容後面(可以捲動);回傳底部的 y。"""
         screen = self.screen
         x, inner = side.x, side.width
         half = (inner - 12) // 2
-        y = side.bottom - 32
-        self.btn_compare.draw(screen, pygame.Rect(x, y, inner, 32), mouse_pos)
-        y -= 42
+        y = max(top + 8, side.bottom - 90)
+        name = self.hover_preset[1] if self.hover_preset else ""
+        if name:
+            draw_text(screen, name, (x + inner // 2, y + 8), 12, theme.TEXT, center=True)
+        y += 16
         self.btn_color_reset.label = "移除效果" if self.mode.value == "effect" else "重設色彩"
         self.btn_color_reset.enabled = changed
         self.btn_color_reset.draw(screen, pygame.Rect(x, y, half, 32), mouse_pos)
         apply_all.enabled = len(self.items) > 1
         apply_all.draw(screen, pygame.Rect(x + half + 12, y, half, 32), mouse_pos)
-        name = self.hover_preset[1] if self.hover_preset else ""
-        if name:
-            draw_text(screen, name, (x + inner // 2, y - 16), 12, theme.TEXT, center=True)
+        y += 42
+        self.btn_compare.draw(screen, pygame.Rect(x, y, inner, 32), mouse_pos)
+        return y + 32
 
     def _draw_hd(self, work, mouse_pos):
         """高清:左邊是比較畫面(分隔線左邊一般放大、右邊 AI 放大),右邊是模型與倍數。"""
@@ -1027,7 +1072,7 @@ class PhotoPage(Page):
                 draw_text(screen, "按「預覽這張」看變清楚的效果", canvas.center, 15, theme.TEXT, center=True)
         else:
             draw_text(screen, "讀取中...", canvas.center, 14, theme.TEXT_DIM, center=True)
-        self._draw_hd_side(side, mouse_pos, result is not None)
+        self._scrolled_side(side, lambda rect, mouse: self._draw_hd_side(rect, mouse, result is not None), mouse_pos)
 
     def _compare_rect(self, size):
         """比較畫面要顯示放大後圖片的哪一塊(放大後的座標)和畫在畫面上的大小。"""
@@ -1043,9 +1088,17 @@ class PhotoPage(Page):
         self.hd_center = (cx, cy)
         return pygame.Rect(int(cx - view_w / 2), int(cy - view_h / 2), view_w, view_h), (view_w, view_h)
 
+    def _hd_big(self, result):
+        """預覽結果依目前的「質感」混合;質感沒變時沿用。"""
+        parts = result[2]
+        key = (id(parts), int(self.hd_texture.value))
+        if self._hd_mix is None or self._hd_mix[0] != key:
+            self._hd_mix = (key, upscale.combine(parts, int(self.hd_texture.value)))
+        return self._hd_mix[1]
+
     def _draw_compare(self, result, mouse_pos):
         screen = self.screen
-        _, source, big = result
+        source, big = result[1], self._hd_big(result)
         view, shown = self._compare_rect(big.size)
         strength = int(self.hd_strength.value)
         key = (id(big), tuple(view), shown, strength)
@@ -1054,7 +1107,8 @@ class PhotoPage(Page):
             box = (view.x / factor, view.y / factor, view.right / factor, view.bottom / factor)
             # 左邊用一般的放大方式(和一般看圖軟體放大時一樣),才看得出 AI 補了多少細節
             plain = source.resize(shown, Image.Resampling.BICUBIC, box=box).convert("RGBA")
-            sharp = big.crop(tuple(view)).convert("RGBA")
+            # pygame 的範圍是 (x, y, 寬, 高),Pillow 裁切要 (左, 上, 右, 下)
+            sharp = big.crop((view.left, view.top, view.right, view.bottom)).convert("RGBA")
             if sharp.size != shown:
                 sharp = sharp.resize(shown, Image.Resampling.LANCZOS)
             if strength < 100:      # 強度:和原圖(一樣的放大方式)混合
@@ -1124,6 +1178,14 @@ class PhotoPage(Page):
             names = "、".join(f"{dep.name}（{dep.size_text}）" for dep in missing)
             draw_text(screen, widgets.clip_text(f"第一次使用要下載 {names}", 11, inner), (x, y), 11, theme.TEXT_FAINT)
             y += 16
+        if self.hd_model == "photo":
+            texture = int(self.hd_texture.value)
+            draw_text(screen, "質感", (x, y + 4), 13, theme.TEXT)
+            draw_text(screen, "銳利", (x + 40, y + 6), 11, theme.TEXT_FAINT)
+            draw_text(screen, "自然", (x + inner - 44, y + 13), 11, theme.TEXT_FAINT, right=True)
+            draw_text(screen, str(texture), (x + inner, y + 13), 13, accent, right=True)
+            self.hd_texture.draw(screen, pygame.Rect(x + 8, y + 30, inner - 16, 14), mouse_pos)
+            y += 50
         if self.hd_model != "plain":
             strength = int(self.hd_strength.value)
             draw_text(screen, "強度", (x, y + 4), 13, theme.TEXT)
@@ -1144,26 +1206,35 @@ class PhotoPage(Page):
             y += 36
             hint = "拖曳白色的線比較前後" + ("；拖曳畫面可以移動" if self.hd_view.value == "actual" else "")
             draw_text(screen, hint, (x, y), 11, theme.TEXT_FAINT)
+            y += 16
+        return y
 
     def _draw_scan(self, work, mouse_pos):
-        """掃描:左邊是「對準四角」(原圖+四個角)或「看結果」,右邊是找邊、濾鏡與輸出設定。"""
+        """掃描:左邊平常是結果(濾鏡、色彩等調整都看得到),按下方的「調整四個角」才換成原圖+四個角;
+        右邊是找邊、濾鏡與輸出設定。第一次打開某張圖時自動找邊,找不到就直接讓人對準四角。"""
         editor = self.editor
-        if self.scan_view.value == "result" or editor.base is None or editor.error:
-            self._commit_warp()
-            editor.warping = False
-            self._draw_preview(work, mouse_pos, self._draw_scan_side)
-            return
-        side = self._split_side(work)
-        self.gallery = []
-        if not editor.warping:
-            if self.current not in self.scan_checked and self.current.edit.warp is None:
-                self.detect(quiet=True)
-            editor._start_warp()
-        editor.canvas = self.canvas
-        editor._draw_canvas(self.screen, mouse_pos)
-        self._draw_scan_side(side, mouse_pos)
-        self.hover_preset = next(((changes, name) for rect, changes, name in self.gallery
-                                  if rect.collidepoint(mouse_pos)), None)
+        ready = editor.base is not None and not editor.error and editor.item is self.current
+        if ready and self.current not in self.scan_checked and self.current.edit.warp is None:
+            if not self.detect(quiet=True):
+                editor._start_warp()
+        if not (ready and editor.warping):
+            self._draw_preview(work, mouse_pos, self._draw_scan_side, SCAN_BAR)
+        else:
+            side = self._split_side(work)
+            rounded_panel(self.screen, self.canvas, theme.BG_DEEP, radius=10, alpha=220)
+            self.canvas.height -= SCAN_BAR
+            self.gallery = []
+            editor.canvas = self.canvas
+            editor._draw_warp(self.screen, mouse_pos)
+            self._scrolled_side(side, self._draw_scan_side, mouse_pos)
+            self.hover_preset = next(((changes, name) for rect, changes, name in self.gallery
+                                      if rect.collidepoint(mouse_pos)), None)
+        # 畫面下方的單獨按鈕:對準四角 ↔ 預覽結果
+        self.btn_corners.label = "預覽結果" if editor.warping else "調整四個角"
+        self.btn_corners.enabled = ready
+        button = pygame.Rect(0, 0, 150, 34)
+        button.midbottom = (self.canvas.centerx, self.canvas.bottom + SCAN_BAR - 10)
+        self.btn_corners.draw(self.screen, button, mouse_pos)
 
     def _draw_scan_side(self, side, mouse_pos):
         screen = self.screen
@@ -1173,8 +1244,6 @@ class PhotoPage(Page):
         draw_text(screen, "文件掃描", (x, y), 14, theme.TEXT, bold=True)
         draw_text(screen, "拍斜的講義、白板拉正變清楚", (x + inner, y + 9), 11, theme.TEXT_FAINT, right=True)
         y += 28
-        self.scan_view.draw(screen, pygame.Rect(x, y, inner, 30), mouse_pos)
-        y += 40
         self.btn_detect.enabled = self.editor.base is not None
         self.btn_detect.draw(screen, pygame.Rect(x, y, half, 30), mouse_pos)
         self.btn_whole.enabled = edit.warp is not None or self.editor.warping
@@ -1202,6 +1271,7 @@ class PhotoPage(Page):
         draw_text(screen, SCAN_PAGE_NOTES[self.scan_page.value], (x, y), 12, theme.TEXT_FAINT)
         y += 24
         draw_text(screen, "順序照左邊的清單，拖曳可以調整", (x, y), 12, theme.TEXT_FAINT)
+        return y + 18
 
     def _draw_effect_side(self, side, mouse_pos):
         screen = self.screen
@@ -1217,7 +1287,7 @@ class PhotoPage(Page):
         draw_text(screen, str(strength), (x + inner, y + 9), 13, self.tool.accent if edit.effect else theme.TEXT_DIM,
                   right=True)
         self.effect_strength.draw(screen, pygame.Rect(x + 8, y + 26, inner - 16, 14), mouse_pos)
-        self._draw_side_footer(side, mouse_pos, self.btn_effect_all, bool(edit.effect))
+        return self._draw_side_footer(side, mouse_pos, self.btn_effect_all, bool(edit.effect), y + 44)
 
     def _draw_rename(self, work, mouse_pos):
         screen = self.screen
@@ -1305,8 +1375,9 @@ class PhotoPage(Page):
             elif mode == "hd":
                 text, color = "選好模型，按「預覽這張」看效果；按「全部變清楚並儲存」處理清單裡全部的圖", theme.TEXT_DIM
             elif mode == "scan":
-                text, color = ("拖曳四個角對準文件的邊，滑鼠停在角上可用方向鍵微調；選好濾鏡後按「全部輸出」"
-                               if self.editor.warping else "依左邊清單的順序輸出；可以拖曳清單調整頁序"), theme.TEXT_DIM
+                text, color = ("拖曳四個角對準文件的邊，滑鼠停在角上可用方向鍵微調；對好後按「預覽結果」或 Enter，Esc 取消"
+                               if self.editor.warping else "邊沒對準時按畫面下方的「調整四個角」；依左邊清單的順序輸出"), \
+                    theme.TEXT_DIM
             else:
                 text, color = f"共 {len(self.items)} 個檔案", theme.TEXT_DIM
         right = rect.right - 18
@@ -1381,6 +1452,9 @@ class PhotoPage(Page):
             if event.key == pygame.K_y:
                 self.redo()
                 return
+        if self.mode.value in ("color", "effect", "scan", "hd") and self._side_view is not None \
+                and self.side_clip.collidepoint(mouse_pos) and self._side_view.handle_event(event, mouse_pos):
+            return
         if not self.running and self.order_drag.handle(event, mouse_pos):
             return
         if self.items and self.list_view.handle_event(event, mouse_pos):
@@ -1404,6 +1478,9 @@ class PhotoPage(Page):
                 return
         elif self.current is not None and mode == "hd" and self.hd_model != "plain" \
                 and self.hd_strength.handle(event, mouse_pos):
+            return
+        elif self.current is not None and mode == "hd" and self.hd_model == "photo" \
+                and self.hd_texture.handle(event, mouse_pos):
             return
         elif self.current is not None and mode == "hd" and self._hd_drag(event, mouse_pos):
             return
@@ -1543,9 +1620,11 @@ class PhotoPage(Page):
             self.export_scan()
         elif self.current is None:
             return
-        elif self.scan_view.clicked(pos, True):
-            self._commit_warp()
-            self.editor.warping = False
+        elif self.btn_corners.clicked(pos, True):
+            if self.editor.warping:
+                self._commit_warp()
+            else:
+                self.editor._start_warp()
         elif self.btn_detect.clicked(pos, True):
             self.detect()
         elif self.btn_whole.clicked(pos, True):
@@ -1557,6 +1636,7 @@ class PhotoPage(Page):
         else:
             hit = next((changes for rect, changes, _ in self.gallery if rect.collidepoint(pos)), None)
             if hit is not None:
+                self._commit_warp()
                 self.apply_preset(hit)
 
     def _click_rename(self, pos):
