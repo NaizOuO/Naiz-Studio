@@ -47,6 +47,11 @@ PDF_OUTPUT_NOTES = {"combine": "全部圖片合成一份 PDF，拖曳左側清�
 PDF_PAGES = [("fit", "依圖片大小"), ("min", "依最小圖片"), ("a4", "A4")]
 PDF_PAGE_NOTES = {"fit": "頁面和圖片一樣大，不留白邊",
                   "min": "以最小圖片的長邊為準，調整所有圖片的大小", "a4": "放進 A4 頁面，橫的圖自動用橫向"}
+GIF_OUTPUTS = [("each", "每張一個檔"), ("combine", "合成一個動畫")]
+GIF_OUTPUT_NOTES = {"each": "每張圖各自轉成 GIF；本身是動畫的會保留動畫",
+                    "combine": "依左側清單的順序，每張圖當成一格合成動畫，拖曳清單可以調整順序"}
+GIF_DELAYS = [("50", "0.05 秒"), ("100", "0.1 秒"), ("200", "0.2 秒"), ("500", "0.5 秒"), ("1000", "1 秒")]
+GIF_DELAY_NOTES = {key: "每一格顯示的時間；本身是動畫的圖保留原本的速度" for key, _ in GIF_DELAYS}
 SVG_COLORS = [("color", "彩色"), ("bw", "黑白")]
 SVG_NOTES = {"color": "保留顏色，描出每一塊色塊", "bw": "只分黑白，適合文字、線稿和簽名"}
 STATUS_COLORS = {"error": theme.DANGER, "cancelled": theme.TEXT_FAINT}
@@ -122,6 +127,8 @@ class ImagePage(Page):
         self.pdf_output = SegmentedControl(PDF_OUTPUTS, accent=accent)
         self.pdf_page = SegmentedControl(PDF_PAGES, accent=accent)
         self.svg_color = SegmentedControl(SVG_COLORS, accent=accent)
+        self.gif_output = SegmentedControl(GIF_OUTPUTS, accent=accent)
+        self.gif_delay = SegmentedControl(GIF_DELAYS, index=1, accent=accent)
         self.quality = Slider(10, 100, 80, accent=accent)
         self.reduce_colors = Toggle(False, accent=accent)
         self.limit = Toggle(False, accent=accent)
@@ -154,7 +161,8 @@ class ImagePage(Page):
 
     @property
     def ordering(self):
-        return self.fmt.value == "pdf" and self.pdf_output.value == "combine"
+        return ((self.fmt.value == "pdf" and self.pdf_output.value == "combine")
+                or (self.fmt.value == "gif" and self.gif_output.value == "combine"))
 
     def count(self, status):
         return sum(item.status == status for item in self.items)
@@ -165,7 +173,8 @@ class ImagePage(Page):
                             strip_meta=self.strip_meta.value, auto_rotate=self.auto_rotate.value,
                             svg_color=self.svg_color.value, pdf_combine=self.pdf_output.value == "combine",
                             pdf_page=self.pdf_page.value, compress=self.compress.value,
-                            split_frames=self.split_frames.value)
+                            split_frames=self.split_frames.value, gif_combine=self.gif_output.value == "combine",
+                            gif_delay=int(self.gif_delay.value))
 
     def add_files(self, raw_paths):
         candidates, skipped = [], 0
@@ -242,7 +251,7 @@ class ImagePage(Page):
 
     def _work(self, s, items, edits):
         folder = output_dir()
-        if s.fmt == "pdf" and s.pdf_combine:
+        if (s.fmt == "pdf" and s.pdf_combine) or (s.fmt == "gif" and s.gif_combine):
             self._work_combined(s, items, edits, folder)
         else:
             for item, edit in zip(items, edits):
@@ -264,7 +273,9 @@ class ImagePage(Page):
                 item.status = "cancelled"
 
     def _work_combined(self, s, items, edits, folder):
-        out = ops.free_path(folder, f"{items[0].path.stem}_merged", ".pdf")
+        """合成一個 PDF(每張一頁)或一個 GIF 動畫(每張一格)。"""
+        gif = s.fmt == "gif"
+        out = ops.free_path(folder, f"{items[0].path.stem}_merged", ".gif" if gif else ".pdf")
 
         def on_image(index):
             if index:
@@ -272,8 +283,11 @@ class ImagePage(Page):
             items[index].status = "running"
 
         try:
-            failed = ops.images_to_pdf([item.path for item in items], out, s, on_image, self.stop_event,
-                                        edits)
+            paths_now = [item.path for item in items]
+            if gif:
+                failed, _ = ops.images_to_gif(paths_now, out, s, on_image, self.stop_event, edits)
+            else:
+                failed = ops.images_to_pdf(paths_now, out, s, on_image, self.stop_event, edits)
         except ops.Cancelled:
             return
         except Exception as exc:
@@ -287,7 +301,9 @@ class ImagePage(Page):
                 item.status, item.message = "error", failed[index]
             else:
                 page += 1
-                item.status, item.message = "done", f"已放入 PDF 第 {page} 頁"
+                frames = f"，共 {item.frames} 格" if gif and item.frames > 1 else ""
+                item.status, item.message = "done", (f"已放入動畫第 {page} 張{frames}" if gif
+                                                     else f"已放入 PDF 第 {page} 頁")
         self.combined = (out, out.stat().st_size, page)
 
     def stop(self):
@@ -358,7 +374,7 @@ class ImagePage(Page):
         draw_text(screen, "把圖片拖曳到這個視窗", (cx, area.centery + 30), 16, theme.TEXT_DIM, center=True)
         draw_text(screen, "支援 JPG、PNG、WebP、AVIF、HEIC、GIF、SVG、ICO、BMP、TIFF",
                   (cx, area.centery + 54), 13, theme.TEXT_FAINT, center=True)
-        draw_text(screen, "可一次拖多張或整個資料夾；每張圖的「編輯」可以裁切、旋轉、四點校正",
+        draw_text(screen, "可一次拖多張或整個資料夾；每張圖的「編輯」可以簡單裁切、旋轉，更多編輯請用「圖片工具」",
                   (cx, area.centery + 74), 13, theme.TEXT_FAINT, center=True)
 
     def draw_list(self, rect, mouse_pos):
@@ -516,6 +532,11 @@ class ImagePage(Page):
             y = self._segment_row("頁面大小", self.pdf_page, PDF_PAGE_NOTES, x, y, inner, mouse_pos, title_color)
         if fmt == "svg":
             y = self._segment_row("描邊顏色", self.svg_color, SVG_NOTES, x, y, inner, mouse_pos, title_color)
+        if fmt == "gif":
+            y = self._segment_row("GIF 輸出", self.gif_output, GIF_OUTPUT_NOTES, x, y, inner, mouse_pos, title_color)
+            if self.gif_output.value == "combine":
+                y = self._segment_row("每格時間", self.gif_delay, GIF_DELAY_NOTES, x, y, inner, mouse_pos,
+                                      title_color)
 
         # 壓縮品質每個格式都在同一個位置,切換格式時面板不會跳動;無損格式用不到,顯示成灰色
         if fmt in QUALITY_FORMATS:
@@ -572,7 +593,8 @@ class ImagePage(Page):
             summary = f"處理中 {finished} / {len(self.items)}"
         elif self.combined:
             out, size, pages = self.combined
-            summary = f"已合成 {out.name}（{pages} 頁，{deps.human_size(size)}）"
+            unit = "張" if out.suffix == ".gif" else "頁"
+            summary = f"已合成 {out.name}（{pages} {unit}，{deps.human_size(size)}）"
             if self.count("error"):
                 summary += f" · {self.count('error')} 張讀取失敗"
         elif self.count("done") or self.count("error"):

@@ -95,9 +95,10 @@ def _shade(screen, area, box):
 
 
 class ImageEditor:
-    def __init__(self, get_screen, accent):
+    def __init__(self, get_screen, accent, embedded=False):
         self.get_screen = get_screen
         self.accent = accent
+        self.embedded = embedded   # 嵌在「圖片工具」頁面裡:沒有標題列、取消與完成,Esc 不會關掉
         self.is_open = False
         self.item = None
         self.edit = ops.Edit()
@@ -568,14 +569,18 @@ class ImageEditor:
         ready = self.base is not None
         if self.warping and self._handle_warp(event, pos):
             return
-        if event.type == pygame.KEYDOWN and not typing:
+        if event.type == pygame.KEYDOWN and not typing and not self.embedded:
             if event.key == pygame.K_ESCAPE:
                 self.close(keep=False)
                 return
             if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 self.close()
                 return
-            if ready and self.fine and event.key in NUDGE:
+        if event.type == pygame.KEYDOWN and not typing and self.fine:
+            if event.key == pygame.K_ESCAPE:
+                self.fine = False
+                return
+            if ready and event.key in NUDGE:
                 self._nudge(event, pos)
                 return
         if ready:
@@ -600,10 +605,10 @@ class ImageEditor:
         if self.warping and not (self.btn_warp.clicked(pos, True) or self.btn_clear_warp.clicked(pos, True)):
             self._finish_warp()     # 按其他設定(旋轉、裁切、完成…)時先結束校正
 
-        if self.btn_cancel.clicked(pos, True):
+        if not self.embedded and self.btn_cancel.clicked(pos, True):
             self.close(keep=False)
             return
-        if self.btn_done.clicked(pos, True):
+        if not self.embedded and self.btn_done.clicked(pos, True):
             self.close()
             return
         if not ready:
@@ -703,7 +708,7 @@ class ImageEditor:
     def _view_key(self, fine, warp=True):
         frame = self.frame_index if self.frames and not fine else 0
         return (fine, self.edit.angle, self.edit.quarter, self.edit.flip, self.edit.fill,
-                self.edit.warp if warp else None, frame)
+                self.edit.warp if warp else None, self.edit.adjust, frame)
 
     def _view(self, fine, warp=True):
         """旋轉、翻轉、校正後(還沒裁切)的預覽;warp 為 False 時是校正前。動畫播放時每一格都留著,編輯改變後才清掉。"""
@@ -713,14 +718,38 @@ class ImageEditor:
             if fine or not self.frames:
                 source = self.base if fine else self.small
             else:
-                source = self.frames[key[6]][0]
-            image = ops.apply_edit(source, ops.Edit(key[1], key[2], key[3], None, key[4], key[5])).convert("RGBA")
+                source = self.frames[key[7]][0]
+            image = ops.apply_edit(source, ops.Edit(key[1], key[2], key[3], None, key[4], key[5], key[6]))
+            image = image.convert("RGBA")
             surface = pygame.image.frombytes(image.tobytes(), image.size, "RGBA")
-            self._views = {k: v for k, v in self._views.items() if k[0] != fine or k[:6] == key[:6]}
+            self._views = {k: v for k, v in self._views.items() if k[0] != fine or k[:7] == key[:7]}
             if len(self._views) > 150:
                 self._views = {}
             self._views[key] = surface
         return surface
+
+    def hint(self):
+        """底下那一行的說明(嵌入時由頁面自己畫):(文字, 顏色)。"""
+        if self.message:
+            return self.message, self.accent
+        if self.base is None:
+            return "", theme.TEXT_DIM
+        out_w, out_h = ops.edited_size(self.full_size, self.edit)
+        hint = (WARP_HINT if self.warping else
+                "拖曳任意格做細微調整；滑鼠停在格子上可用方向鍵逐像素移動" if self.fine
+                else "拖曳框的角或邊調整範圍，在框外拖曳可重新框選；按鎖鏈可固定比例")
+        return f"編輯後 {out_w}×{out_h} px · {hint}", theme.TEXT_DIM
+
+    def draw_in(self, area, mouse_pos):
+        """嵌入頁面時畫在 area 裡:左邊畫面、右邊設定。"""
+        screen = self.get_screen()
+        # 設定區要有底板:頁面後面可能是使用者的背景圖,直接畫上去字會看不清楚
+        panel = pygame.Rect(area.right - SIDE_W - 28, area.y, SIDE_W + 28, area.height)
+        rounded_panel(screen, panel, theme.PANEL, radius=12, alpha=235, border=theme.PANEL_EDGE)
+        side = panel.inflate(-28, -28)
+        self.canvas = pygame.Rect(area.x, area.y, panel.x - 16 - area.x, area.height)
+        self._draw_canvas(screen, mouse_pos)
+        self._draw_side(screen, side, mouse_pos)
 
     def draw(self, mouse_pos):
         screen = self.get_screen()
@@ -743,16 +772,7 @@ class ImageEditor:
         self._draw_side(screen, side, mouse_pos)
 
         footer_y = panel.bottom - 56
-        if self.message:
-            text, color = self.message, self.accent
-        elif self.base is not None:
-            out_w, out_h = ops.edited_size(self.full_size, self.edit)
-            hint = (WARP_HINT if self.warping else
-                    "拖曳任意格做細微調整；滑鼠停在格子上可用方向鍵逐像素移動" if self.fine
-                    else "拖曳框的角或邊調整範圍，在框外拖曳可重新框選；按鎖鏈可固定比例")
-            text, color = f"編輯後 {out_w}×{out_h} px · {hint}", theme.TEXT_DIM
-        else:
-            text, color = "", theme.TEXT_DIM
+        text, color = self.hint()
         draw_text(screen, widgets.clip_text(text, 13, panel.width - 48 - 220), (panel.x + 24, footer_y + 18), 13,
                   color)
         self.btn_cancel.draw(screen, pygame.Rect(panel.right - 24 - 192, footer_y + 8, 90, 36), mouse_pos)

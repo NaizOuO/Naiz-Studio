@@ -7,10 +7,12 @@ import zlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
+from PIL import Image, ImageEnhance, ImageOps, ImageSequence, UnidentifiedImageError
 
 from core import large_files
 from core.files import free_path, write_bytes
+
+from . import looks, scan
 
 # Pillow 預設超過約 1.8 億像素就直接報錯、不讓處理。大圖改成處理前跳提醒,讓使用者自己決定要不要繼續
 Image.MAX_IMAGE_PIXELS = None
@@ -59,6 +61,8 @@ class Settings:
     pdf_page: str = "fit"
     compress: bool = False     # 關閉時保持原圖品質,quality 用不到
     split_frames: bool = False
+    gif_combine: bool = False  # 轉 GIF 時把全部圖片依順序合成一個動畫
+    gif_delay: int = 100       # 合成動畫時每一格顯示幾毫秒
 
     @property
     def side(self):
@@ -71,6 +75,8 @@ class Edit:
     warp 是四點校正的四個角(左上、右上、右下、左下),位置是占「旋轉、翻轉後畫面」的比例;
     這四點圍起來的範圍會拉正成長方形(拍斜的文件、消失點不在中間的照片)。
     crop 是 (左, 上, 右, 下) 占「校正後畫面」的比例,套用到尺寸不同的圖時會照比例裁。
+    adjust 是色彩調整 (亮度, 對比, 飽和度, 色溫, 銳利度),各 -100～100;之後是重新著色 recolor(looks.RECOLORS)
+    與美術效果 effect (種類, 強度),最後才套用。
     下面的操作都以使用者看到的畫面為準,會自動換算成上面的順序。"""
 
     angle: float = 0.0
@@ -79,9 +85,19 @@ class Edit:
     crop: tuple = None
     fill: str = "clear"     # 旋轉、擴展畫布多出來的地方補什麼:clear 透明、white 白色、black 黑色
     warp: tuple = None
+    adjust: tuple = None
+    recolor: str = None
+    effect: tuple = None
+    scan: str = None           # 文件掃描的濾鏡(scan.FILTERS),在裁切之後、色彩之前
 
     @property
     def active(self):
+        return bool(self.angle % 360 or self.quarter % 4 or self.flip or self.crop or self.warp
+                    or (self.adjust and any(self.adjust)) or self.recolor or self.effect or self.scan)
+
+    @property
+    def shape_active(self):
+        """有沒有改到形狀(旋轉、翻轉、校正、裁切);只調色彩時是 False。"""
         return bool(self.angle % 360 or self.quarter % 4 or self.flip or self.crop or self.warp)
 
     def copy(self):
@@ -90,6 +106,7 @@ class Edit:
     def reset(self):
         self.angle, self.quarter, self.flip, self.crop, self.fill = 0.0, 0, False, None, "clear"
         self.warp = None
+        self.adjust = self.recolor = self.effect = self.scan = None
 
     def _move_warp(self, change):
         if self.warp:
@@ -131,6 +148,34 @@ class Edit:
 
 
 FULL_CORNERS = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
+ADJUST_KEYS = ("brightness", "contrast", "saturation", "warmth", "sharpness")
+
+
+def _curve(factor):
+    return [max(0, min(255, round(v * factor))) for v in range(256)]
+
+
+def adjust_image(image, adjust):
+    """色彩調整;透明的地方保持透明。各項 0 是不變,-100～100。"""
+    brightness, contrast, saturation, warmth, sharpness = adjust
+    alpha = image.getchannel("A") if image.mode in ("RGBA", "LA", "PA") else None
+    rgb = image.convert("RGB")
+    if brightness:
+        rgb = ImageEnhance.Brightness(rgb).enhance(1 + brightness / 100)
+    if contrast:
+        rgb = ImageEnhance.Contrast(rgb).enhance(1 + contrast / 100)
+    if saturation:
+        rgb = ImageEnhance.Color(rgb).enhance(1 + saturation / 100)
+    if warmth:
+        # 暖色:紅加、藍減;冷色相反。最多各 ±20%
+        shift = warmth / 100 * 0.2
+        red, green, blue = rgb.split()
+        rgb = Image.merge("RGB", (red.point(_curve(1 + shift)), green, blue.point(_curve(1 - shift))))
+    if sharpness:
+        rgb = ImageEnhance.Sharpness(rgb).enhance(1 + sharpness / 50)
+    if alpha is not None:
+        rgb.putalpha(alpha)
+    return rgb
 
 
 def order_corners(points):
@@ -142,12 +187,60 @@ def order_corners(points):
     return tuple(tuple(ring[(start + i) % 4]) for i in range(4))
 
 
+def _cross(a, b):
+    return a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]
+
+
+def _dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+PHONE_FOCAL = 0.75          # 一般手機主鏡頭的焦距約是畫面長邊的這麼多倍(推不出焦距時用)
+
+
+def true_ratio(size, warp):
+    """四個角圍起來的東西「實際的」寬高比。斜拍時近大遠小,直接量四條邊會算錯(直式的紙變得接近正方形);
+    這裡從四個角的透視變形反推相機的焦距,再算出真正的比例(Zhang & He 的白板掃描方法)。
+    只往一個方向傾斜時(有一組邊平行)推不出焦距,改用一般手機的焦距;正對著拍時結果就等於量邊長。
+    算出來不合理時回傳 None。"""
+    width, height = size
+    cx, cy = width / 2, height / 2
+    tl, tr, br, bl = [(x * width - cx, y * height - cy, 1.0) for x, y in warp]
+    m1, m2, m3, m4 = tl, tr, bl, br
+    try:
+        k2 = _dot(_cross(m1, m4), m3) / _dot(_cross(m2, m4), m3)
+        k3 = _dot(_cross(m1, m4), m2) / _dot(_cross(m3, m4), m2)
+    except ZeroDivisionError:
+        return None
+    n2 = tuple(k2 * a - b for a, b in zip(m2, m1))
+    n3 = tuple(k3 * a - b for a, b in zip(m3, m1))
+    longest = max(size)
+    focal2 = None
+    if abs(n2[2] * n3[2]) > 1e-12:
+        focal2 = -(n2[0] * n3[0] + n2[1] * n3[1]) / (n2[2] * n3[2])
+    if focal2 is None or not (0.3 * longest) ** 2 <= focal2 <= (5 * longest) ** 2:
+        focal2 = (PHONE_FOCAL * longest) ** 2
+    top = (n2[0] ** 2 + n2[1] ** 2) / focal2 + n2[2] ** 2
+    bottom = (n3[0] ** 2 + n3[1] ** 2) / focal2 + n3[2] ** 2
+    if top <= 0 or bottom <= 0:
+        return None
+    ratio = math.sqrt(top / bottom)
+    return ratio if 0.05 <= ratio <= 20 else None
+
+
 def warp_size(size, warp):
-    """四點校正後的像素尺寸:上下兩邊取長的當寬、左右兩邊取長的當高,細節不會被壓縮掉。"""
+    """四點校正後的像素尺寸:寬高比用 true_ratio 算出的實際比例(算不出來時,上下兩邊取長的當寬、
+    左右兩邊取長的當高);大小以四條邊裡最長的為準,細節不會被壓縮掉。"""
     width, height = size
     tl, tr, br, bl = [(x * width, y * height) for x, y in warp]
     new_w = max(math.dist(tl, tr), math.dist(bl, br))
     new_h = max(math.dist(tl, bl), math.dist(tr, br))
+    ratio = true_ratio(size, warp)
+    if ratio is not None:
+        if ratio >= new_w / max(new_h, 1e-9):
+            new_h = new_w / ratio
+        else:
+            new_w = new_h * ratio
     return max(1, round(new_w)), max(1, round(new_h))
 
 
@@ -218,6 +311,14 @@ def apply_edit(image, edit):
             image = canvas
         else:
             image = image.crop(box)
+    if edit.scan:
+        image = scan.scan_filter(image, edit.scan)
+    if edit.adjust and any(edit.adjust):
+        image = adjust_image(image, edit.adjust)
+    if edit.recolor:
+        image = looks.recolor(image, edit.recolor)
+    if edit.effect:
+        image = looks.effect(image, *edit.effect)
     return image
 
 
@@ -638,6 +739,54 @@ def _pdf_image(pdf, image, s, tables):
     space = name.DeviceGray if image.mode == "L" else name.DeviceRGB
     return pikepdf.Stream(pdf, encode(image, "jpg", s, tables=tables), ColorSpace=space, Filter=name.DCTDecode,
                           **common)
+
+
+def _contain(frame, size):
+    """等比例縮放放進 size,置中,四周透明;尺寸本來就一樣時不動。"""
+    if frame.size == size:
+        return frame
+    scale = min(size[0] / frame.width, size[1] / frame.height)
+    fitted = frame.resize((max(1, round(frame.width * scale)), max(1, round(frame.height * scale))),
+                          Image.Resampling.LANCZOS)
+    canvas = Image.new("RGBA", size, (0, 0, 0, 0))
+    canvas.paste(fitted, ((size[0] - fitted.width) // 2, (size[1] - fitted.height) // 2))
+    return canvas
+
+
+def images_to_gif(paths, out: Path, s: Settings, on_image=None, cancel=None, edits=None):
+    """依順序把每張圖當成一格合成 GIF 動畫;本身是動畫的圖,裡面每一格都放進去(保留原本的速度)。
+    大小以第一張為準,其他圖等比例放進去、置中,四周透明。回傳 ({第幾張: 錯誤訊息}, 格數)。"""
+    edits = list(edits) if edits is not None else [None] * len(paths)
+    frames, durations, failed = [], [], {}
+    size = None
+    for index, path in enumerate(paths):
+        if cancel is not None and cancel.is_set():
+            raise Cancelled
+        if on_image is not None:
+            on_image(index)
+        try:
+            source = open_image(path, s.side)
+            count = getattr(source, "n_frames", 1)
+            for number, frame in enumerate(ImageSequence.Iterator(source)):
+                delay = frame.info.get("duration", source.info.get("duration", s.gif_delay)) if count > 1 \
+                    else s.gif_delay
+                if count > 1:
+                    image = _fit(apply_edit(frame.convert("RGBA"), edits[index]), s.side)
+                else:
+                    image, _ = _prepare(frame, s, edits[index])
+                image = image.convert("RGBA")
+                size = size or image.size
+                frames.append(_contain(image, size))
+                durations.append(max(20, int(delay or s.gif_delay)))
+        except Exception as exc:
+            failed[index] = describe_error(exc)
+    if not frames:
+        raise RuntimeError(failed.get(0, "沒有可以放入動畫的圖片") if len(paths) == 1 else "沒有可以放入動畫的圖片")
+    buf = io.BytesIO()
+    frames[0].save(buf, "GIF", save_all=True, append_images=frames[1:], duration=durations, loop=0, disposal=2)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    write_bytes(out, buf.getvalue())
+    return failed, len(frames)
 
 
 def images_to_pdf(paths, out: Path, s: Settings, on_image=None, cancel=None, edits=None):
