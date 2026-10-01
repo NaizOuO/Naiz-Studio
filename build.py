@@ -49,7 +49,40 @@ def ui_images():
     return [folder / "app_icon.png", folder / "app_icon.ico", *sorted(folder.glob("ui_*.png"))]
 
 
-def pyinstaller_args(script, name, windowed=True, workdir=None):
+VERSION_INFO = """VSVersionInfo(
+  ffi=FixedFileInfo(filevers={numbers}, prodvers={numbers}, mask=0x3f, flags=0x0, OS=0x40004,
+                    fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[
+    StringFileInfo([StringTable('040404b0', [
+      StringStruct('CompanyName', '{author}'),
+      StringStruct('FileDescription', '{name}'),
+      StringStruct('FileVersion', '{version}'),
+      StringStruct('InternalName', '{name}'),
+      StringStruct('LegalCopyright', 'Copyright (c) {year} {author}'),
+      StringStruct('OriginalFilename', '{name}.exe'),
+      StringStruct('ProductName', '{name}'),
+      StringStruct('ProductVersion', '{version}')])]),
+    VarFileInfo([VarStruct('Translation', [0x0404, 1200])])
+  ]
+)
+"""
+AUTHOR = "Naiz"
+
+
+def version_file(version):
+    """exe 的版本資訊(檔案內容 → 詳細資料、工作管理員會顯示作者與版本)。
+    註:安全性警告裡的「發行者」要數位簽章才會顯示,這裡寫的不會影響那一欄。"""
+    import time
+
+    parts = [int(p) for p in version.split(".")[:3]] + [0]
+    path = ROOT / "build" / "version_info.txt"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(VERSION_INFO.format(numbers=tuple(parts[:4]), name=NAME, version=version, author=AUTHOR,
+                                        year=time.strftime("%Y")), encoding="utf-8")
+    return path
+
+
+def pyinstaller_args(script, name, windowed=True, workdir=None, version=None):
     args = [str(script), "--noconfirm", "--onefile", "--name", name,
             "--icon", str(ROOT / "images" / "app_icon.ico"),
             "--paths", str(ROOT),
@@ -59,6 +92,8 @@ def pyinstaller_args(script, name, windowed=True, workdir=None):
         args += ["--exclude-module", module]
     if windowed:
         args.append("--windowed")
+    if version:
+        args += ["--version-file", str(version_file(version))]
     for module in plugin_modules() + EXTRA_IMPORTS + STDLIB_FOR_MODS:
         args += ["--hidden-import", module]
     for package in COLLECT:
@@ -165,7 +200,7 @@ def main():
         except PermissionError:
             sys.exit(f"{exe} 正在執行，請先關閉再打包")
 
-    PyInstaller.__main__.run(pyinstaller_args(ROOT / "naiz_studio.py", NAME))
+    PyInstaller.__main__.run(pyinstaller_args(ROOT / "naiz_studio.py", NAME, version=VERSION))
 
     (release / "images").mkdir(parents=True, exist_ok=True)
     os.replace(dist / f"{NAME}.exe", exe)

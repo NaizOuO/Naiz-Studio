@@ -5,6 +5,8 @@
 - 效果:美術效果(鉛筆素描、油畫、馬賽克等)縮圖點選,可調強度;滑鼠移到縮圖上,大預覽會先顯示套用後的樣子
 - 掃描:類似掃描 App,自動找出照片裡文件的四個角拉正,去陰影變白底(增強、灰階、黑白),多張依順序合成 PDF
 - 高清:用 AI(Real-ESRGAN,第一次使用時下載)讓模糊的圖變清楚,預設尺寸不變,也可以放大 2～4 倍;可以拖曳分隔線比較前後
+- 去背:用 AI(BiRefNet,第一次使用時下載)或單色背景找出主體,背景變透明、白色、其他顏色或模糊;
+  AI 沒抓好的地方用「保留」「移除」筆刷在預覽上修正。遮罩記在原圖上,之後再旋轉、裁切也會跟著走
 - 改檔名:依樣式批次改名,預設另外輸出一份,也可以直接改原檔(可以復原)
 每張圖的編輯各自記住,可以復原、重做;輸出一律另存到 output\\photo\\,不會覆蓋原圖。
 """
@@ -23,15 +25,20 @@ from core.drag_sort import DragSort, move_items
 from core.plugins import Page
 from core.scroll import BAR_SPACE, ScrollView
 from core.files import free_path
-from core.widgets import Button, Dropdown, SegmentedControl, Slider, TextInput, draw_text, rounded_panel
+from core.widgets import Button, Dropdown, SegmentedControl, Slider, TextInput, Toggle, draw_text, rounded_panel
 
-from ..images import looks, ops, scan, upscale
+from ..images import cutout, looks, ops, scan, upscale
 from ..images.editor import ImageEditor, _blit_checker
 from ..images.page import Item
 from . import rename
 
 MODES = [("adjust", "調整"), ("color", "色彩"), ("effect", "效果"), ("scan", "掃描"), ("hd", "高清"),
-         ("rename", "改檔名")]
+         ("cutout", "去背"), ("rename", "改檔名")]
+BRUSHES = [("off", "不修正"), ("keep", "保留"), ("remove", "移除")]
+CUT_BACKGROUNDS = [("clear", "透明"), ("white", "白色"), ("color", "顏色"), ("blur", "模糊")]
+CUT_BACKGROUND_NOTES = {"clear": "背景變透明；存成原格式時，JPG 會自動改存 PNG", "white": "背景換成白色",
+                        "color": "背景換成下面選的顏色", "blur": "保留原本的背景但變模糊，像手機的人像模式"}
+BRUSH_COLORS = {"keep": (70, 210, 120), "remove": (235, 70, 90)}
 HD_VIEWS = [("fit", "整張"), ("actual", "放大檢視")]
 SCAN_BAR = 52          # 掃描畫面下方放「調整四個角/預覽結果」按鈕的高度
 SCAN_OUTPUTS = [("pdf", "合成 PDF"), ("jpg", "每張 JPG"), ("png", "每張 PNG")]
@@ -136,6 +143,28 @@ class PhotoPage(Page):
         self.hd_format = SegmentedControl(SAVE_FORMATS[:4], accent=accent)
         self._hd_view = None
         self._compare_area = None
+        self.cut_method = "lite"
+        self.cut_methods = SegmentedControl([(key, name) for key, name, _ in cutout.METHODS], accent=accent)
+        self.btn_cut = Button("自動去背", accent=accent, filled=False, size=13)
+        self.btn_cut_remove = Button("移除去背", filled=False, size=13)
+        self.btn_cut_strokes = Button("清除筆刷", filled=False, size=13)
+        self.btn_cut_all = Button("全部去背", filled=False, size=13)
+        self.brush = SegmentedControl(BRUSHES, accent=accent)
+        self.brush_size = Slider(4, 80, 18, accent=accent)
+        self.cut_shrink = Slider(0, 10, 0, step=0.1, accent=accent)       # 可以調到小數一位;滑鼠滾輪每格 0.1
+        self.cut_feather = Slider(0, 10, 0, step=0.1, accent=accent)
+        self.cut_tolerance = Slider(5, 120, cutout.TOLERANCE, accent=accent)
+        self.cut_background = SegmentedControl(CUT_BACKGROUNDS, accent=accent)
+        self.cut_trim = Toggle(False, accent=accent)
+        self.swatches = []          # 這一幀畫出來的背景顏色:[(範圍, 顏色)]
+        self.stroke = None          # 正在畫的一筆:{keep, radius, points(畫面座標)}
+        self.hover_slider = None    # 滑鼠停在哪個去背滑桿上(按 ← → 細調的對象)
+        self._preview_rect = None   # 大預覽畫在哪裡(筆刷換算座標用)
+        self._mask_queue = queue.Queue()
+        self._mask_pending = set()  # 排隊中或計算中的 AI 遮罩
+        self._mask_failed = {}      # 算不出來的:{遮罩名字: 原因},按「自動去背」才重試
+        self.mask_busy = None       # 正在算哪一張
+        threading.Thread(target=self._mask_worker, daemon=True).start()
         self.canvas = pygame.Rect(0, 0, 0, 0)
         self._color_view = None     # (key, surface)
         self._fit_base = None       # (key, 縮到畫面大小的底圖)
@@ -226,6 +255,7 @@ class PhotoPage(Page):
             return
         self.editor.open(item, lambda: list(self.items), True, self._edited)
         self._sync_color()
+        self._sync_cut()
 
     def remove(self, item):
         with self._lock:
@@ -266,6 +296,7 @@ class PhotoPage(Page):
         item.thumb = None
         self._color_view = None
         self._sync_color()
+        self._sync_cut()
 
     def undo(self):
         item = self.current
@@ -337,6 +368,170 @@ class PhotoPage(Page):
         if item is not None and item.edit.effect:
             item.edit.effect = (item.edit.effect[0], int(self.effect_strength.value))
             self._edited(item)
+
+    # ------------------------------------------------------------ 去背
+
+    @staticmethod
+    def _animated(item):
+        return isinstance(item.info, dict) and item.info.get("frames", 1) > 1
+
+    def _sync_cut(self):
+        """換圖、復原後,設定區顯示這張圖的去背設定;沒有去背時保留上次的選擇(給下一次用)。"""
+        self.stroke = None
+        cut = self.current.edit.cutout if self.current is not None else None
+        if cut is None:
+            self.brush.index = 0
+            return
+        self.cut_method = cut.method
+        self.cut_shrink.value, self.cut_feather.value, self.cut_tolerance.value = cut.shrink, cut.feather, cut.tolerance
+        self.cut_background.index = [k for k, _ in CUT_BACKGROUNDS].index(cut.background)
+        self.cut_trim.value = cut.trim
+        for slider in (self.cut_shrink, self.cut_feather, self.cut_tolerance, self.brush_size):
+            slider.dragging = False
+
+    def _panel_cut(self, item, method):
+        """依設定區目前的選擇做出這張圖的去背設定(修正筆刷沿用這張圖原本的)。"""
+        old = item.edit.cutout
+        color = old.color if old is not None else cutout.SWATCHES[0]
+        return cutout.Cutout(method, cutout.mask_key(item.path, method) if method in cutout.AI_MODELS else None,
+                             old.strokes if old is not None else (), round(self.cut_shrink.value, 1),
+                             round(self.cut_feather.value, 1), self.cut_background.value, color, self.cut_trim.value,
+                             int(self.cut_tolerance.value))
+
+    def _with_cut_engine(self, method, action):
+        missing = cutout.required(method)
+        if missing:
+            self.app.consent.open("圖片去背", missing, on_done=action)
+        else:
+            action()
+
+    def cut_start(self, method=None):
+        """自動去背(或換一種方式重新去背)。"""
+        item = self.current
+        if item is None or not isinstance(item.info, dict):
+            return
+        method = method or self.cut_method
+        if method in cutout.AI_MODELS and self._animated(item):
+            self.notice = ("動畫只能用「單色背景」去背", theme.WARN)
+            return
+        self.cut_method = method
+
+        def go():
+            if item not in self.items:
+                return
+            new = self._panel_cut(item, method)
+            self._mask_failed.pop(new.key, None)
+            item.edit.cutout = new
+            self._edited(item)
+            self.notice = ("", theme.TEXT_DIM)
+
+        self._with_cut_engine(method, go)
+
+    def _set_cut(self, **changes):
+        item = self.current
+        if item is None or item.edit.cutout is None:
+            return
+        item.edit.cutout = item.edit.cutout._replace(**changes)
+        self._edited(item)
+
+    def cut_remove(self):
+        item = self.current
+        if item is not None and item.edit.cutout is not None:
+            item.edit.cutout = None
+            self.brush.index = 0
+            self._edited(item)
+
+    def cut_all(self):
+        """這張的去背設定套用到全部(修正筆刷不套用);AI 的遮罩在背景依序算。"""
+        source = self.current
+        if source is None:
+            return
+        method = source.edit.cutout.method if source.edit.cutout else self.cut_method
+
+        def go():
+            done, skipped = 0, 0
+            for item in list(self.items):
+                if not isinstance(item.info, dict):
+                    continue
+                if method in cutout.AI_MODELS and self._animated(item):
+                    skipped += 1
+                    continue
+                new = self._panel_cut(item, method)
+                if item is not source:
+                    new = new._replace(strokes=())
+                self._mask_failed.pop(new.key, None)
+                item.edit.cutout = new
+                self._edited(item)
+                done += 1
+            text = f"已把去背套用到 {done} 張圖片" + (f"；{skipped} 張動畫不能用 AI 去背" if skipped else "")
+            self.notice = (text, theme.WARN if skipped else self.tool.accent)
+
+        self._with_cut_engine(method, go)
+
+    def _need_masks(self):
+        """還沒算好的 AI 遮罩排進背景佇列(目前這張優先)。元件沒下載或算失敗的不排。"""
+        order = ([self.current] if self.current is not None else []) + list(self.items)
+        for item in order:
+            cut = item.edit.cutout
+            if cut is None or not cut.ai or cut.key in self._mask_pending or cut.key in self._mask_failed:
+                continue
+            if cutout.stored(cut.key) is None and not cutout.required(cut.method):
+                self._mask_pending.add(cut.key)
+                self._mask_queue.put((item, cut))
+
+    def _mask_worker(self):
+        while True:
+            item, cut = self._mask_queue.get()
+            self.mask_busy = item
+            try:
+                if cutout.stored(cut.key) is None:
+                    image, _ = ops.load_view(item.path, True, cutout.KEEP_SIDE)
+                    cutout.remember(cut.key, cutout.predict(image, cut.method))
+            except Exception as exc:
+                self._mask_failed[cut.key] = ops.describe_error(exc)
+                self.notice = (f"{item.path.name} 去背失敗：{ops.describe_error(exc)}", theme.DANGER)
+            finally:
+                self._mask_pending.discard(cut.key)
+                self.mask_busy = None
+                for other in list(self.items):
+                    if other.edit.cutout is not None and other.edit.cutout.key == cut.key:
+                        other.thumb = None
+                self._color_view = None
+
+    def _cut_state(self):
+        """目前這張的去背狀態文字(畫面左上角):算遮罩中、失敗、缺元件;沒事時是空字串。"""
+        cut = self.current.edit.cutout if self.current is not None else None
+        if cut is None or not cut.ai or cutout.stored(cut.key) is not None:
+            return ""
+        if cut.key in self._mask_failed:
+            return f"去背失敗：{self._mask_failed[cut.key]}"
+        if cutout.required(cut.method):
+            return "缺少去背元件，按「自動去背」下載"
+        where = cutout.device()
+        return "AI 去背中…" + (f"（用{where}）" if where else "")
+
+    def _commit_stroke(self):
+        """畫完一筆:把畫面上的位置換回原圖上的比例位置,加進修正筆刷(一筆是一步復原)。"""
+        stroke, self.stroke = self.stroke, None
+        rect, small, item = self._preview_rect, self.editor.small, self.current
+        if not stroke or rect is None or small is None or item is None or item.edit.cutout is None:
+            return
+        edit = item.edit
+        out_w, out_h = ops.edited_size(small.size, edit)
+
+        def source(point):
+            u = (point[0] - rect.x) / max(1, rect.width) * out_w
+            v = (point[1] - rect.y) / max(1, rect.height) * out_h
+            return ops.to_source((u, v), small.size, edit)
+
+        points = [source(point) for point in stroke["points"]]
+        # 半徑也換算:畫面上往右 radius 的點換回原圖量距離(旋轉、校正後的縮放都算進去)
+        start = stroke["points"][0]
+        edge = source((start[0] + stroke["radius"], start[1]))
+        radius = max(0.5, ((edge[0] - points[0][0]) ** 2 + (edge[1] - points[0][1]) ** 2) ** 0.5)
+        normalized = tuple((x / small.width, y / small.height) for x, y in points)
+        cut = edit.cutout
+        self._set_cut(strokes=cut.strokes + ((stroke["keep"], radius / max(small.size), normalized),))
 
     # ------------------------------------------------------------ 文件掃描
 
@@ -668,6 +863,8 @@ class PhotoPage(Page):
     # ------------------------------------------------------------ 每一幀
 
     def deactivate(self):
+        self.stroke = None
+        threading.Thread(target=cutout.release, daemon=True).start()     # 讓出顯示卡記憶體
         self.list_view.reset()
         self.rename_view.reset()
         self.order_drag.cancel()
@@ -687,6 +884,8 @@ class PhotoPage(Page):
             self._side_view.update(mouse)
         if self.current is not None:
             self.editor.update()
+        if self.items:
+            self._need_masks()
 
     def _typing(self):
         editor = self.editor
@@ -719,6 +918,8 @@ class PhotoPage(Page):
             self._draw_preview(work, mouse_pos, self._draw_effect_side)
         elif mode == "hd":
             self._draw_hd(work, mouse_pos)
+        elif mode == "cutout":
+            self._draw_cutout(work, mouse_pos)
         else:
             self._draw_scan(work, mouse_pos)
         self.draw_footer(pygame.Rect(rect.x + margin, rect.bottom - FOOTER_H - margin, rect.width - margin * 2,
@@ -856,17 +1057,22 @@ class PhotoPage(Page):
             return rect.clip(clip) if rect.colliderect(clip) else HIDDEN.copy()
 
         for button in (self.btn_color_reset, self.btn_color_all, self.btn_effect_all, self.btn_compare, self.btn_detect,
-                       self.btn_whole, self.btn_detect_all, self.btn_scan_all, self.btn_hd_preview):
+                       self.btn_whole, self.btn_detect_all, self.btn_scan_all, self.btn_hd_preview, self.btn_cut,
+                       self.btn_cut_remove, self.btn_cut_strokes, self.btn_cut_all):
             button.rect = cut(button.rect)
-        for control in (self.color_tab, self.scan_page, self.hd_scale, self.hd_view):
+        for control in (self.color_tab, self.scan_page, self.hd_scale, self.hd_view, self.brush, self.cut_background,
+                        self.cut_methods):
             control.rects = [cut(rect) for rect in control.rects]
-        for slider in (*self.color_sliders.values(), self.effect_strength, self.hd_strength, self.hd_texture):
+        for slider in (*self.color_sliders.values(), self.effect_strength, self.hd_strength, self.hd_texture,
+                       self.brush_size, self.cut_shrink, self.cut_feather, self.cut_tolerance):
             slider.rect = cut(slider.rect)      # 左右不會被切到,拖曳時換算的位置不變
+        self.cut_trim.rect = cut(self.cut_trim.rect)
+        self.swatches = [(cut(rect), color) for rect, color in self.swatches if rect.colliderect(clip)]
         self.gallery = [(cut(rect), changes, name) for rect, changes, name in self.gallery if rect.colliderect(clip)]
         self.hd_rows = [(cut(row), key) for row, key in self.hd_rows if row.colliderect(clip)]
 
-    def _draw_preview(self, work, mouse_pos, draw_side, bar=0):
-        """左邊是套用編輯後的大預覽;bar 是底部留給按鈕的高度(預覽不會被蓋住)。"""
+    def _draw_preview(self, work, mouse_pos, draw_side, bar=0, view=None):
+        """左邊是套用編輯後的大預覽;bar 是底部留給按鈕的高度(預覽不會被蓋住);view 是要顯示的編輯(預設是目前的)。"""
         screen = self.screen
         side = self._split_side(work)
         rounded_panel(screen, self.canvas, theme.BG_DEEP, radius=10, alpha=220)
@@ -883,13 +1089,14 @@ class PhotoPage(Page):
         hover = next(((changes, name) for rect, changes, name in self.gallery if rect.collidepoint(mouse_pos)), None)
         self.hover_preset = hover
         if self.comparing:
-            edit, tag = self._geometry(), "原本的色彩"
+            edit, tag = self._geometry(), "原圖" if self.mode.value == "cutout" else "原本的色彩"
         elif hover is not None:
             edit, tag = self._with(self.current.edit, hover[0]), f"預覽：{hover[1]}"
         else:
-            edit, tag = self.current.edit, ""
+            edit, tag = view or self.current.edit, ""
         surface = self._color_surface(edit)
         rect = surface.get_rect(center=self.canvas.center)
+        self._preview_rect = rect
         _blit_checker(screen, rect, self.canvas.topleft)
         screen.blit(surface, rect)
         if tag:
@@ -903,9 +1110,9 @@ class PhotoPage(Page):
         return id(self.current), str(self.current.path), self.editor.small.size
 
     def _geometry(self):
-        """只有形狀的編輯(旋轉、校正、裁切),不含色彩與效果。"""
+        """只有形狀的編輯(旋轉、校正、裁切),不含色彩、效果與去背。"""
         edit = self.current.edit.copy()
-        edit.adjust = edit.recolor = edit.effect = edit.scan = None
+        edit.adjust = edit.recolor = edit.effect = edit.scan = edit.cutout = None
         return edit
 
     def _color_surface(self, edit):
@@ -919,7 +1126,7 @@ class PhotoPage(Page):
             base.thumbnail((max(1, int(base.width * scale)), max(1, int(base.height * scale))))
             self._fit_base = (base_key, base)
         base = self._fit_base[1]
-        key = (base_key, repr(edit))
+        key = (base_key, repr(edit), cutout.generation())
         if self._color_view is None or self._color_view[0] != key:
             image = ops.apply_edit(base, edit).convert("RGBA")
             ratio = min(area.width / image.width, area.height / image.height)
@@ -931,6 +1138,21 @@ class PhotoPage(Page):
     def _thumb(self, size, changes):
         """縮圖:目前這張圖(含旋轉、裁切和其他已選的色彩)套用 changes 的樣子。"""
         edit = self._with(self.current.edit, changes)
+        if edit.cutout is not None:
+            # 有去背:遮罩在原圖上,要從縮小的原圖整個套用一次(背景色不受色彩影響,和存出來的一樣)
+            key = (self._source_key(), repr(edit), size, cutout.generation())
+            surface = self._thumbs.get(key)
+            if surface is None:
+                source_key = (self._source_key(), "source", size)
+                source = self._thumbs.get(source_key)
+                if source is None:
+                    source = self._thumbs[source_key] = _fit(self.editor.small, (size[0] * 2, size[1] * 2))
+                image = _fit(ops.apply_edit(source, edit).convert("RGBA"), size)
+                surface = pygame.image.frombytes(image.tobytes(), image.size, "RGBA")
+                if len(self._thumbs) > 400:
+                    self._thumbs = {source_key: source}
+                self._thumbs[key] = surface
+            return surface
         geometry = self._geometry()
         base_key = (self._source_key(), repr(geometry), size)
         key = (base_key, repr(edit))
@@ -1209,6 +1431,139 @@ class PhotoPage(Page):
             y += 16
         return y
 
+    def _draw_cutout(self, work, mouse_pos):
+        """去背:左邊是結果(修正筆刷時被去掉的地方淡淡顯示原圖),右邊是方式、修正、邊緣與背景。"""
+        cut = self.current.edit.cutout
+        brushing = cut is not None and self.brush.value != "off"
+        view = None
+        if brushing:
+            view = self.current.edit.copy()
+            view.cutout = cut._replace(background="ghost", trim=False)
+        self.swatches = []
+        self._draw_preview(work, mouse_pos, self._draw_cutout_side, view=view)
+        if self.editor.small is None or self.editor.error:
+            return
+        screen = self.screen
+        state = self._cut_state()
+        if state:
+            width = theme.font(12).size(state)[0] + 20
+            label = pygame.Rect(self.canvas.x + 12, self.canvas.bottom - 36, width, 24)
+            rounded_panel(screen, label, theme.PANEL, radius=6, alpha=235)
+            draw_text(screen, state, label.center, 12, theme.WARN if "失敗" in state or "缺少" in state else theme.TEXT,
+                      center=True)
+        rect = self._preview_rect
+        if not brushing or rect is None:
+            return
+        color = BRUSH_COLORS[self.brush.value]
+        radius = int(self.brush_size.value)
+        if self.stroke and len(self.stroke["points"]) > 0:
+            layer = pygame.Surface(self.canvas.size, pygame.SRCALPHA)
+            points = [(x - self.canvas.x, y - self.canvas.y) for x, y in self.stroke["points"]]
+            if len(points) > 1:
+                pygame.draw.lines(layer, color + (110,), False, points, radius * 2)
+            for point in points:
+                pygame.draw.circle(layer, color + (110,), point, radius)
+            screen.blit(layer, self.canvas.topleft)
+        if rect.collidepoint(mouse_pos):
+            pygame.draw.circle(screen, (20, 20, 20), mouse_pos, radius + 1, 1)
+            pygame.draw.circle(screen, color, mouse_pos, radius, 2)
+
+    def _draw_cutout_side(self, side, mouse_pos):
+        screen = self.screen
+        x, y, inner = side.x, side.y, side.width
+        accent = self.tool.accent
+        item = self.current
+        cut = item.edit.cutout
+        half = (inner - 12) // 2
+        animated = self._animated(item)
+        draw_text(screen, "去背", (x, y), 14, theme.TEXT, bold=True)
+        draw_text(screen, "找出主體，換掉背景", (x + inner, y + 9), 11, theme.TEXT_FAINT, right=True)
+        y += 26
+        method = cut.method if cut is not None else self.cut_method
+        self.cut_methods.index = [k for k, _, _ in cutout.METHODS].index(method)
+        self.cut_methods.draw(screen, pygame.Rect(x, y, inner, 30), mouse_pos)
+        y += 36
+        note = cutout.METHOD_NOTES[method]
+        if animated:
+            note = "動畫只能用「單色背景」（AI 去背不支援動畫）"
+        missing = cutout.required(method)
+        if missing:
+            note += "；第一次使用要下載 " + "、".join(f"{dep.name}（{dep.size_text}）" for dep in missing)
+        for line in widgets.wrap_text(note, 11, inner, max_lines=3):
+            draw_text(screen, line, (x, y), 11, theme.WARN if animated else theme.TEXT_FAINT)
+            y += 15
+        y += 6
+        # 同一個位置依狀態放不同按鈕:沒畫出來的移到畫面外,不會被點到(否則按「移除去背」會變成又去背一次)
+        self.btn_cut.rect = HIDDEN.copy()
+        self.btn_cut_remove.rect, self.btn_cut_strokes.rect = HIDDEN.copy(), HIDDEN.copy()
+        self.brush.rects, self.cut_background.rects, self.swatches = [], [], []
+        for slider in (self.brush_size, self.cut_shrink, self.cut_feather, self.cut_tolerance):
+            slider.rect = HIDDEN.copy()
+        self.cut_trim.rect = HIDDEN.copy()
+        if cut is None:
+            self.btn_cut.enabled = isinstance(item.info, dict) and not (animated and method in cutout.AI_MODELS)
+            self.btn_cut.draw(screen, pygame.Rect(x, y, inner, 32), mouse_pos)
+            y += 42
+        else:
+            self.btn_cut_remove.draw(screen, pygame.Rect(x, y, half, 32), mouse_pos)
+            self.btn_cut_strokes.enabled = bool(cut.strokes)
+            self.btn_cut_strokes.draw(screen, pygame.Rect(x + half + 12, y, half, 32), mouse_pos)
+            y += 42
+            draw_text(screen, "修正", (x, y + 6), 13, theme.TEXT)
+            self.brush.draw(screen, pygame.Rect(x + 56, y, inner - 56, 28), mouse_pos)
+            y += 36
+            rows = []
+            if self.brush.value != "off":
+                rows.append(("筆刷", self.brush_size, str(int(self.brush_size.value))))
+            rows += [("往內縮", self.cut_shrink, None), ("柔和", self.cut_feather, None)]
+            if cut.method == "color":
+                rows.append(("容許差異", self.cut_tolerance, None))
+            for label, slider, text in rows:
+                value = round(slider.value, 1)
+                if text is None:
+                    text = f"{value:.1f}" if slider.step < 1 else str(int(value))
+                    color = accent if value else theme.TEXT_DIM
+                else:
+                    color = theme.TEXT_DIM
+                draw_text(screen, label, (x, y + 3), 13, theme.TEXT)
+                draw_text(screen, text, (x + inner, y + 12), 13, color, right=True)
+                slider.draw(screen, pygame.Rect(x + 72, y + 9, inner - 110, 14), mouse_pos)
+                y += 30
+            if self.brush.value == "off":
+                draw_text(screen, "滑鼠停在滑桿上按 ← → 可以每次調 0.1", (x, y), 11, theme.TEXT_FAINT)
+            else:
+                draw_text(screen, "在預覽上畫：綠色補回，紅色擦掉", (x, y), 11, theme.TEXT_FAINT)
+            y += 22
+            draw_text(screen, "背景", (x, y + 6), 13, theme.TEXT)
+            self.cut_background.draw(screen, pygame.Rect(x + 56, y, inner - 56, 28), mouse_pos)
+            y += 34
+            for line in widgets.wrap_text(CUT_BACKGROUND_NOTES[cut.background], 11, inner, max_lines=2):
+                draw_text(screen, line, (x, y), 11, theme.TEXT_FAINT)
+                y += 15
+            if cut.background == "color":
+                y += 4
+                size = (inner - 9 * 6) // 10
+                for index, color in enumerate(cutout.SWATCHES):
+                    rect = pygame.Rect(x + index * (size + 6), y, size, size)
+                    pygame.draw.rect(screen, color, rect, border_radius=5)
+                    chosen = tuple(cut.color) == color
+                    if chosen or rect.collidepoint(mouse_pos):
+                        pygame.draw.rect(screen, accent if chosen else theme.TEXT, rect.inflate(4, 4), 2,
+                                         border_radius=6)
+                    self.swatches.append((rect, color))
+                y += size + 6
+            y += 6
+            draw_text(screen, "裁到主體", (x, y + 3), 13, theme.TEXT)
+            draw_text(screen, "裁掉四周多餘的空白", (x + 70, y + 5), 11, theme.TEXT_FAINT)
+            self.cut_trim.value = cut.trim
+            self.cut_trim.draw(screen, (x + inner - 42, y), mouse_pos)
+            y += 30
+        y = max(y + 6, side.bottom - 32)
+        self.btn_cut_all.enabled = len(self.items) > 1
+        self.btn_cut_all.draw(screen, pygame.Rect(x, y, half, 32), mouse_pos)
+        self.btn_compare.draw(screen, pygame.Rect(x + half + 12, y, half, 32), mouse_pos)
+        return y + 32
+
     def _draw_scan(self, work, mouse_pos):
         """掃描:左邊平常是結果(濾鏡、色彩等調整都看得到),按下方的「調整四個角」才換成原圖+四個角;
         右邊是找邊、濾鏡與輸出設定。第一次打開某張圖時自動找邊,找不到就直接讓人對準四角。"""
@@ -1374,6 +1729,12 @@ class PhotoPage(Page):
                 text, color = "點縮圖套用美術效果，拖曳「強度」調整程度；選「無」取消", theme.TEXT_DIM
             elif mode == "hd":
                 text, color = "選好模型，按「預覽這張」看效果；按「全部變清楚並儲存」處理清單裡全部的圖", theme.TEXT_DIM
+            elif mode == "cutout":
+                if self.current is not None and self.current.edit.cutout is not None and self.brush.value != "off":
+                    text = "在預覽上拖曳：綠色補回被去掉的地方，紅色擦掉多的；選「不修正」結束"
+                else:
+                    text = "選好方式按「自動去背」；背景透明時，原格式的 JPG 會自動存成 PNG"
+                color = theme.TEXT_DIM
             elif mode == "scan":
                 text, color = ("拖曳四個角對準文件的邊，滑鼠停在角上可用方向鍵微調；對好後按「預覽結果」或 Enter，Esc 取消"
                                if self.editor.warping else "邊沒對準時按畫面下方的「調整四個角」；依左邊清單的順序輸出"), \
@@ -1452,7 +1813,10 @@ class PhotoPage(Page):
             if event.key == pygame.K_y:
                 self.redo()
                 return
-        if self.mode.value in ("color", "effect", "scan", "hd") and self._side_view is not None \
+        if event.type == pygame.KEYDOWN and event.key in (pygame.K_LEFT, pygame.K_RIGHT) \
+                and self.mode.value == "cutout" and self.current is not None and self._cutout_event(event, mouse_pos):
+            return                  # 滑鼠停在去背的滑桿上按 ← →:細調數值(設定區的捲動不會先接走)
+        if self.mode.value in ("color", "effect", "scan", "hd", "cutout") and self._side_view is not None \
                 and self.side_clip.collidepoint(mouse_pos) and self._side_view.handle_event(event, mouse_pos):
             return
         if not self.running and self.order_drag.handle(event, mouse_pos):
@@ -1476,6 +1840,8 @@ class PhotoPage(Page):
             if self.effect_strength.handle(event, mouse_pos):
                 self._apply_strength()
                 return
+        elif self.current is not None and mode == "cutout" and self._cutout_event(event, mouse_pos):
+            return
         elif self.current is not None and mode == "hd" and self.hd_model != "plain" \
                 and self.hd_strength.handle(event, mouse_pos):
             return
@@ -1538,6 +1904,8 @@ class PhotoPage(Page):
             self.save([self.current])
         elif self.btn_save_all.clicked(pos, True):
             self.save(list(self.items))
+        elif mode == "cutout" and self.current is not None:
+            self._click_cutout(pos)
         elif mode in ("color", "effect") and self.current is not None:
             hit = next((changes for rect, changes, _ in self.gallery if rect.collidepoint(pos)), None)
             if hit is not None:
@@ -1555,6 +1923,84 @@ class PhotoPage(Page):
                 self._color_all(("effect",), "效果")
             elif self.btn_compare.clicked(pos, True):
                 self.comparing = True
+
+    def _cutout_event(self, event, pos):
+        """去背模式的滑桿與修正筆刷;用掉事件時回傳 True。"""
+        cut = self.current.edit.cutout
+        if cut is None:
+            return False
+        if self.brush.value != "off" and self.brush_size.handle(event, pos):
+            return True
+        pairs = ((self.cut_shrink, "shrink"), (self.cut_feather, "feather"), (self.cut_tolerance, "tolerance"))
+        if event.type == pygame.MOUSEMOTION:
+            self.hover_slider = next((slider for slider, _ in pairs if slider.rect.inflate(0, 16).collidepoint(pos)),
+                                     None)
+        for slider, field in pairs:
+            if field == "tolerance" and cut.method != "color":
+                continue
+            nudge = (event.type == pygame.KEYDOWN and event.key in (pygame.K_LEFT, pygame.K_RIGHT)
+                     and self.hover_slider is slider)
+            if nudge:
+                # 細調:滑鼠停在滑桿上按 ← →,每次加減一個單位(往內縮、柔和是 0.1);滾輪留給捲動設定區
+                step = slider.step if event.key == pygame.K_RIGHT else -slider.step
+                slider.value = min(slider.max, max(slider.min, slider.value + step))
+            if nudge or slider.handle(event, pos):
+                value = round(slider.value, 1) if slider.step < 1 else int(slider.value)
+                slider.value = value
+                if getattr(cut, field) != value:
+                    self._set_cut(**{field: value})
+                return True
+        if self.brush.value == "off" or self._preview_rect is None:
+            return False
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self.canvas.collidepoint(pos) \
+                and self._preview_rect.inflate(int(self.brush_size.value) * 2, int(self.brush_size.value) * 2) \
+                .collidepoint(pos):
+            self.stroke = {"keep": self.brush.value == "keep", "radius": int(self.brush_size.value), "points": [pos]}
+            return True
+        if self.stroke is not None:
+            if event.type == pygame.MOUSEMOTION:
+                last = self.stroke["points"][-1]
+                if abs(pos[0] - last[0]) + abs(pos[1] - last[1]) >= max(2, self.stroke["radius"] // 3):
+                    self.stroke["points"].append(pos)
+                return True
+            if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                self.stroke["points"].append(pos)
+                self._commit_stroke()
+                return True
+        return False
+
+    def _click_cutout(self, pos):
+        cut = self.current.edit.cutout
+        if self.cut_methods.clicked(pos, True):
+            chosen = self.cut_methods.value
+            if self._animated(self.current) and chosen in cutout.AI_MODELS:
+                self.notice = ("動畫只能用「單色背景」去背", theme.WARN)
+                return
+            self.cut_method = chosen
+            if cut is not None and chosen != cut.method:
+                self.cut_start(chosen)      # 已經去背:換一種方式重新做,修正筆刷和設定保留
+        elif cut is None and self.btn_cut.clicked(pos, True):
+            self.cut_start()
+        elif self.btn_cut_all.clicked(pos, True):
+            self.cut_all()
+        elif self.btn_compare.clicked(pos, True):
+            self.comparing = True
+        elif cut is None:
+            return
+        elif self.btn_cut_remove.clicked(pos, True):
+            self.cut_remove()
+        elif self.btn_cut_strokes.clicked(pos, True):
+            self._set_cut(strokes=())
+        elif self.brush.clicked(pos, True):
+            self.stroke = None
+        elif self.cut_background.clicked(pos, True):
+            self._set_cut(background=self.cut_background.value)
+        elif self.cut_trim.clicked(pos, True):
+            self._set_cut(trim=self.cut_trim.value)
+        else:
+            color = next((color for rect, color in self.swatches if rect.collidepoint(pos)), None)
+            if color is not None:
+                self._set_cut(color=color)
 
     def _hd_drag(self, event, pos):
         """比較畫面:拖曳分隔線,或在放大檢視時拖曳畫面移動;用掉事件時回傳 True。"""

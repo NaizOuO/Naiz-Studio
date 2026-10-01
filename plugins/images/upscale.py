@@ -235,7 +235,8 @@ def save(image, path, folder, fmt, scale):
 
     from . import ops
 
-    target = ops.target_format(path, fmt)
+    alpha = image.mode in ("RGBA", "LA") and image.getchannel("A").getextrema()[0] < 255
+    target = ops.output_format(path, fmt, alpha)        # 去背成透明的 JPG 改存 PNG
     if target not in SAVE_TARGETS:
         target = "png"
     folder.mkdir(parents=True, exist_ok=True)

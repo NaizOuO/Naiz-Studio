@@ -38,6 +38,7 @@ FORMAT_NOTES = {
     "pdf": "每張圖一頁，依左側清單的順序排列",
 }
 QUALITY_FORMATS = {"keep", "jpg", "webp", "avif", "heic", "pdf"}
+CLEAR_FORMATS = {"keep", "png", "webp", "gif", "tiff", "ico", "avif"}     # 可以存透明的格式(原格式的 JPG 會改存 PNG)
 QUALITY_NOTES = {
     "keep": "只影響 JPG、WebP、AVIF、HEIC；70~85 通常看不出差別",
     "pdf": "照片以 JPG 放入，70~85 通常看不出差別；有透明的圖以無損方式放入",
@@ -138,6 +139,8 @@ class ImagePage(Page):
         self.compress = Toggle(False, accent=accent)
         self._unused_toggle = Toggle(False, accent=accent)   # 無損格式用不到壓縮品質時,畫一個灰色的佔位
         self.split_frames = Toggle(False, accent=accent)
+        self.clear_bg = Toggle(False, accent=accent)
+        self.clear_tolerance = Slider(5, 120, ops.cutout.TOLERANCE, accent=accent)
         self.controls = []   # 這一幀畫出來、可以點的設定
         self.sliders = []
 
@@ -174,7 +177,9 @@ class ImagePage(Page):
                             svg_color=self.svg_color.value, pdf_combine=self.pdf_output.value == "combine",
                             pdf_page=self.pdf_page.value, compress=self.compress.value,
                             split_frames=self.split_frames.value, gif_combine=self.gif_output.value == "combine",
-                            gif_delay=int(self.gif_delay.value))
+                            gif_delay=int(self.gif_delay.value),
+                            clear_bg=self.clear_bg.value and self.fmt.value in CLEAR_FORMATS,
+                            clear_tolerance=int(self.clear_tolerance.value))
 
     def add_files(self, raw_paths):
         candidates, skipped = [], 0
@@ -260,7 +265,7 @@ class ImagePage(Page):
                 item.status = "running"
                 try:
                     out, item.message = ops.convert(item.path, folder, s, edit)
-                    item.target = ops.LABELS[ops.target_format(item.path, s.fmt)]
+                    item.target = ops.LABELS[ops.output_format(item.path, s.fmt, s.clear_bg)]
                     # 逐格拆開時輸出的是資料夾,大小算裡面所有圖片的合計
                     item.out_size = (sum(f.stat().st_size for f in out.iterdir()) if out.is_dir()
                                      else out.stat().st_size)
@@ -555,6 +560,13 @@ class ImagePage(Page):
             y = self._toggle_row("PNG 減少顏色", "最多保留 256 色，檔案通常小一半以上；漸層可能出現顆粒",
                                  self.reduce_colors, x, y, inner, right, mouse_pos, title_color)
 
+        if fmt in CLEAR_FORMATS:
+            y = self._toggle_row("背景變透明", "單一顏色的背景（白底插畫、證件照）變透明；原格式的 JPG 會改存 PNG",
+                                 self.clear_bg, x, y, inner, right, mouse_pos, title_color)
+            if self.clear_bg.value:
+                y = self._slider_row("容許差異", str(int(self.clear_tolerance.value)), self.clear_tolerance, x, y + 4,
+                                     inner, right, mouse_pos, title_color)
+                y = self._note("越大，越多相近的顏色算背景；只會去掉和圖片邊緣相連的背景", x, y, inner) + 10
         y = self._toggle_row("限制尺寸", "最長邊超過設定值時等比例縮小", self.limit, x, y, inner, right, mouse_pos,
                              title_color)
         if self.limit.value:

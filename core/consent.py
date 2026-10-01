@@ -44,6 +44,9 @@ class ConsentDialog:
                     continue
 
                 def progress(done, total, name=dep.name, i=index):
+                    if not done and not total:
+                        runner.report(0, 1, f"[{i}/{len(items)}] 連線中… {name}")
+                        return
                     size = f"{deps.human_size(done)} / {deps.human_size(total)}" if total else deps.human_size(done)
                     runner.report(done, max(1, total), f"[{i}/{len(items)}] 下載 {name}  {size}")
 

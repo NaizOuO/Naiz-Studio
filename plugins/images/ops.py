@@ -12,7 +12,7 @@ from PIL import Image, ImageEnhance, ImageOps, ImageSequence, UnidentifiedImageE
 from core import large_files
 from core.files import free_path, write_bytes
 
-from . import looks, scan
+from . import cutout, looks, scan
 
 # Pillow 預設超過約 1.8 億像素就直接報錯、不讓處理。大圖改成處理前跳提醒,讓使用者自己決定要不要繼續
 Image.MAX_IMAGE_PIXELS = None
@@ -63,6 +63,8 @@ class Settings:
     split_frames: bool = False
     gif_combine: bool = False  # 轉 GIF 時把全部圖片依順序合成一個動畫
     gif_delay: int = 100       # 合成動畫時每一格顯示幾毫秒
+    clear_bg: bool = False     # 單色背景變透明(白底插畫、證件照;不用 AI)
+    clear_tolerance: int = cutout.TOLERANCE
 
     @property
     def side(self):
@@ -89,11 +91,12 @@ class Edit:
     recolor: str = None
     effect: tuple = None
     scan: str = None           # 文件掃描的濾鏡(scan.FILTERS),在裁切之後、色彩之前
+    cutout: tuple = None       # 去背(cutout.Cutout):遮罩在原圖上算,跟著旋轉、裁切,最後才換背景
 
     @property
     def active(self):
         return bool(self.angle % 360 or self.quarter % 4 or self.flip or self.crop or self.warp
-                    or (self.adjust and any(self.adjust)) or self.recolor or self.effect or self.scan)
+                    or (self.adjust and any(self.adjust)) or self.recolor or self.effect or self.scan or self.cutout)
 
     @property
     def shape_active(self):
@@ -106,7 +109,7 @@ class Edit:
     def reset(self):
         self.angle, self.quarter, self.flip, self.crop, self.fill = 0.0, 0, False, None, "clear"
         self.warp = None
-        self.adjust = self.recolor = self.effect = self.scan = None
+        self.adjust = self.recolor = self.effect = self.scan = self.cutout = None
 
     def _move_warp(self, change):
         if self.warp:
@@ -260,10 +263,10 @@ def _solve(matrix, values):
     return [rows[i][n] / rows[i][i] for i in range(n)]
 
 
-def warp_image(image, warp):
-    """把四個角圍起來的範圍拉正成長方形。"""
-    width, height = image.size
-    out_w, out_h = warp_size(image.size, warp)
+def _warp_coefficients(size, warp):
+    """四點校正的透視轉換係數(輸出圖上的點 → 原圖上的點)與輸出尺寸。"""
+    width, height = size
+    out_w, out_h = warp_size(size, warp)
     matrix, values = [], []
     # 輸出圖上的每個點 (x, y) 對應到原圖的 (u, v):u = (ax+by+c)/(gx+hy+1)、v = (dx+ey+f)/(gx+hy+1)
     for (x, y), (u, v) in zip(((0, 0), (out_w, 0), (out_w, out_h), (0, out_h)),
@@ -272,10 +275,57 @@ def warp_image(image, warp):
         values.append(u)
         matrix.append([0, 0, 0, x, y, 1, -v * x, -v * y])
         values.append(v)
+    return _solve(matrix, values), (out_w, out_h)
+
+
+def warp_image(image, warp):
+    """把四個角圍起來的範圍拉正成長方形。"""
+    coefficients, size = _warp_coefficients(image.size, warp)
     if image.mode not in ("RGB", "RGBA", "L", "LA"):
         image = image.convert("RGBA")
-    return image.transform((out_w, out_h), Image.Transform.PERSPECTIVE, _solve(matrix, values),
-                           Image.Resampling.BICUBIC)
+    return image.transform(size, Image.Transform.PERSPECTIVE, coefficients, Image.Resampling.BICUBIC)
+
+
+def to_source(point, size, edit):
+    """編輯後(旋轉、翻轉、校正、裁切後)畫面上的一點,換回原圖上的位置(像素)。
+    去背的修正筆刷記在原圖上:之後再改旋轉、裁切,筆刷的位置也不會跑掉。size 是原圖尺寸。"""
+    width, height = size
+    sizes = [(width, height)]                     # 每一步之後的尺寸
+    if edit.angle % 360:
+        rad = math.radians(edit.angle)
+        cos, sin = abs(math.cos(rad)), abs(math.sin(rad))
+        sizes.append((width * cos + height * sin, width * sin + height * cos))
+    rotated = sizes[-1]
+    turned = (rotated[1], rotated[0]) if edit.quarter % 2 else rotated
+    x, y = point
+    if edit.crop:
+        base = warp_size(_round_size(turned), edit.warp) if edit.warp else _round_size(turned)
+        box = crop_box(base, edit.crop)
+        x, y = x + box[0], y + box[1]
+    if edit.warp:
+        (a, b, c, d, e, f, g, h), _ = _warp_coefficients(_round_size(turned), edit.warp)
+        w = g * x + h * y + 1
+        x, y = (a * x + b * y + c) / w, (d * x + e * y + f) / w
+    if edit.flip:
+        x = turned[0] - x
+    quarter = edit.quarter % 4
+    if quarter == 1:
+        x, y = y, rotated[1] - x
+    elif quarter == 2:
+        x, y = rotated[0] - x, rotated[1] - y
+    elif quarter == 3:
+        x, y = rotated[0] - y, x
+    if edit.angle % 360:
+        # 畫面上順時針轉 angle 度:反過來轉回去(以中心為準,畫布有放大)
+        rad = math.radians(edit.angle)
+        dx, dy = x - rotated[0] / 2, y - rotated[1] / 2
+        x = dx * math.cos(rad) + dy * math.sin(rad) + width / 2
+        y = -dx * math.sin(rad) + dy * math.cos(rad) + height / 2
+    return x, y
+
+
+def _round_size(size):
+    return max(1, round(size[0])), max(1, round(size[1]))
 
 
 QUARTER_TURNS = {1: Image.Transpose.ROTATE_270, 2: Image.Transpose.ROTATE_180, 3: Image.Transpose.ROTATE_90}
@@ -293,15 +343,27 @@ def apply_edit(image, edit):
     if edit is None or not edit.active:
         return image
     fill = FILLS.get(edit.fill, FILLS["clear"])
+    mask = None
+    if edit.cutout:
+        # 去背的遮罩在原圖上算,下面每一步形狀的改變都同樣套用到遮罩上
+        try:
+            image, mask = cutout.source_mask(image, edit.cutout)
+        except cutout.Missing:
+            mask = None         # AI 還在算:畫面先顯示原圖
     if edit.angle % 360:
         # 畫布放大保留整張圖,多出來的角補上選的顏色(透明存成 JPG 時會變白色)
         image = image.convert("RGBA").rotate(-edit.angle, Image.Resampling.BICUBIC, expand=True, fillcolor=fill)
+        if mask is not None:
+            mask = mask.rotate(-edit.angle, Image.Resampling.BICUBIC, expand=True, fillcolor=0)
     if edit.quarter % 4:
         image = image.transpose(QUARTER_TURNS[edit.quarter % 4])
+        mask = mask.transpose(QUARTER_TURNS[edit.quarter % 4]) if mask is not None else None
     if edit.flip:
         image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+        mask = mask.transpose(Image.Transpose.FLIP_LEFT_RIGHT) if mask is not None else None
     if edit.warp:
         image = warp_image(image, edit.warp)
+        mask = warp_image(mask, edit.warp) if mask is not None else None
     if edit.crop:
         box = crop_box(image.size, edit.crop)
         if box[0] < 0 or box[1] < 0 or box[2] > image.width or box[3] > image.height:
@@ -309,8 +371,13 @@ def apply_edit(image, edit):
             canvas = Image.new("RGBA", (box[2] - box[0], box[3] - box[1]), fill)
             canvas.paste(image.convert("RGBA"), (-box[0], -box[1]))
             image = canvas
+            if mask is not None:
+                grown = Image.new("L", canvas.size, 0)
+                grown.paste(mask, (-box[0], -box[1]))
+                mask = grown
         else:
             image = image.crop(box)
+            mask = mask.crop(box) if mask is not None else None
     if edit.scan:
         image = scan.scan_filter(image, edit.scan)
     if edit.adjust and any(edit.adjust):
@@ -319,6 +386,8 @@ def apply_edit(image, edit):
         image = looks.recolor(image, edit.recolor)
     if edit.effect:
         image = looks.effect(image, *edit.effect)
+    if mask is not None:
+        image = cutout.compose(image, mask, edit.cutout)
     return image
 
 
@@ -352,6 +421,21 @@ def describe_error(exc):
 
 def source_format(path):
     return EXT_FORMAT.get(Path(path).suffix.lower(), "")
+
+
+NO_ALPHA = {"jpg", "bmp"}
+
+
+def output_format(path, fmt, transparent=False):
+    """實際存成的格式:「原格式」遇到不支援透明的 JPG、BMP,但圖片去背成透明時改存 PNG,透明才不會變白。"""
+    target = target_format(path, fmt)
+    if fmt == "keep" and transparent and target in NO_ALPHA:
+        return "png"
+    return target
+
+
+def transparent_output(s, edit):
+    return bool(s.clear_bg or (edit is not None and edit.cutout and edit.cutout.transparent))
 
 
 def target_format(path, fmt):
@@ -547,6 +631,14 @@ def load_frames(path, side, budget=FRAME_BUDGET):
     return frames
 
 
+def _finish(image, edit, s):
+    """一張圖(或動畫的一格)的編輯、背景變透明、縮小。"""
+    image = apply_edit(image, edit)
+    if s.clear_bg:
+        image = cutout.clear_background(image, s.clear_tolerance)
+    return _fit(image, s.side)
+
+
 def _prepare(image, s, edit=None):
     """轉正、統一色彩模式、編輯、縮小;回傳 (圖片, 要保留的 EXIF 或 None)。"""
     icc = image.info.get("icc_profile")
@@ -556,7 +648,7 @@ def _prepare(image, s, edit=None):
     if not s.strip_meta:
         data = image.getexif()
         exif = data.tobytes() if len(data) else None
-    image = _fit(apply_edit(_normalize(image), edit), s.side)
+    image = _finish(_normalize(image), edit, s)
     # 清掉其他附帶資料(XMP、PNG 文字欄位等),只留色彩描述檔,避免移除拍攝資訊時還有漏網之魚
     image.info = {"icc_profile": icc} if icc else {}
     return image, exif
@@ -657,7 +749,7 @@ def _encode_animation(image, target, s, edit=None):
     frames, durations = [], []
     for frame in ImageSequence.Iterator(image):
         durations.append(frame.info.get("duration", image.info.get("duration", 100)))
-        frames.append(_fit(apply_edit(frame.convert("RGBA"), edit), s.side))
+        frames.append(_finish(frame.convert("RGBA"), edit, s))
     options = {"save_all": True, "append_images": frames[1:], "duration": durations}
     if "loop" in image.info:
         options["loop"] = image.info["loop"]
@@ -665,15 +757,27 @@ def _encode_animation(image, target, s, edit=None):
     if target == "gif":
         frames[0].save(buf, "GIF", disposal=2, **options)
     else:
+        frames = [_keep_alpha(frame) for frame in frames]
+        options["append_images"] = frames[1:]
         frames[0].save(buf, "WEBP", lossless=True, method=4, **options)
     return buf.getvalue()
+
+
+def _keep_alpha(frame):
+    """WebP 動畫:完全透明又剛好是黑色 (0,0,0,0) 的地方會被 libwebp 當成空白畫布省略,
+    整個檔案就被標成沒有透明,透明的地方變黑。換成看起來一樣的「透明的白色」就會保留。"""
+    alpha = frame.getchannel("A")
+    if alpha.getextrema()[0] > 0:
+        return frame
+    clear = Image.new("RGBA", frame.size, (255, 255, 255, 0))
+    return Image.composite(frame, clear, alpha.point(lambda value: 255 if value else 0))
 
 
 def convert(path, folder: Path, s: Settings, edit=None):
     """轉換一張圖;回傳 (輸出檔, 附註)。"""
     path = Path(path)
-    target = target_format(path, s.fmt)
-    edited = edit is not None and edit.active
+    target = output_format(path, s.fmt, transparent_output(s, edit))
+    edited = (edit is not None and edit.active) or s.clear_bg
     folder.mkdir(parents=True, exist_ok=True)
     out = free_path(folder, path.stem, SAVE_EXT[target])
     if target == "pdf":
@@ -714,7 +818,7 @@ def _split_frames(path, image, target, folder, s, edit):
     out.mkdir(parents=True)
     digits = max(3, len(str(image.n_frames)))
     for index, frame in enumerate(ImageSequence.Iterator(image), start=1):
-        picture = _fit(apply_edit(frame.convert("RGBA"), edit), s.side)
+        picture = _finish(frame.convert("RGBA"), edit, s)
         picture.info = {}
         name = f"{path.stem}_{index:0{digits}d}{SAVE_EXT[target]}"
         write_bytes(out / name, encode(picture, target, s))
@@ -790,7 +894,7 @@ def images_to_gif(paths, out: Path, s: Settings, on_image=None, cancel=None, edi
                 delay = frame.info.get("duration", source.info.get("duration", s.gif_delay)) if count > 1 \
                     else s.gif_delay
                 if count > 1:
-                    image = _fit(apply_edit(frame.convert("RGBA"), edits[index]), s.side)
+                    image = _finish(frame.convert("RGBA"), edits[index], s)
                 else:
                     image, _ = _prepare(frame, s, edits[index])
                 image = image.convert("RGBA")

@@ -47,7 +47,8 @@
 - **美術效果**：鉛筆素描、線條畫、模糊、柔光、馬賽克、海報、油畫、浮雕、卡通、底片顆粒、曝光過度、負片，可以調整強度
 - **復原與重做**：每張圖的編輯各自記住，可以一步一步復原；編輯可以套用到清單裡的全部圖片
 - **文件掃描**：像掃描 App 一樣，自動找出照片裡文件的四個角並拉正（依透視算出紙真正的長寬比，直式的講義不會變胖），可以再拖曳微調；濾鏡有原色、增強（去陰影、紙變白、保留顏色）、灰階、黑白；多張照片依清單順序合成一份 PDF（A4 或依圖片大小），或每張存成 JPG、PNG
-- **高清**：用 AI（Real-ESRGAN）讓模糊的圖變清楚，預設大小不變，也可以放大 2～4 倍；模型有照片（自然，保留紋理、比較不會有塑膠感）、照片（銳利）、插畫動漫、快速，以及不用下載的一般放大；「強度」可以調整 AI 處理的程度；可以先預覽，拖曳分隔線比較前後，在本地用顯示卡運算，不會上傳
+- **高清**：用 AI（Real-ESRGAN）讓模糊的圖變清楚，預設大小不變，也可以放大 2～4 倍；模型有照片（用「質感」在銳利和自然之間調整）、插畫動漫、快速，以及不用下載的一般放大；「強度」可以調整 AI 處理的程度；可以先預覽，拖曳分隔線比較前後，在本地用顯示卡運算，不會上傳
+- **去背**：用 AI（BiRefNet）找出照片裡的人物、動物、商品，背景換成透明、白色、其他顏色或模糊的原背景（像手機的人像模式）；方式有「一般」（快）、「精細」（頭髮、毛邊和顏色接近背景的主體更準），以及不用 AI、不用下載的「單色背景」（白底插畫、證件照，動畫也能用）。AI 沒抓好的地方用「保留」「移除」筆刷在預覽上補回或擦掉，也可以讓邊緣往內縮、變柔和，或裁到主體；去背後再旋轉、裁切也會跟著走，色彩與效果只套在主體上。背景透明時，原格式的 JPG 會自動存成 PNG。在本地運算，有顯示卡時用顯示卡加速（NVIDIA、AMD、Intel 都可以），不會上傳
 - **批次改檔名**：用 `{名稱}`、`{序號}`、`{日期}`（拍攝日期）組合出新檔名，改名前先預覽，重複或不能用的檔名會標出來；預設另外輸出一份，也可以直接改原檔（改錯可以復原）
 - **儲存**：另存到 `output\photo\`，不會覆蓋原圖；可以保留原格式或存成 JPG、PNG、WebP、GIF，動畫 GIF 每一格都會套用；也可以把清單裡的圖依順序合成一個 GIF 動畫（可選每格時間）
 
@@ -56,6 +57,7 @@
 - **壓縮**：預設保持原圖品質，也可自行調整品質、限制尺寸、PNG 減少顏色
 - **簡單編輯**：轉檔前可以順便裁切、旋轉、翻轉、四點校正；更多編輯用「圖片工具」
 - **動畫 GIF**：保留動畫、播放預覽，或逐格拆成多張圖片；也可以把清單裡的圖片依順序合成一個 GIF 動畫（拖曳調整順序、可選每格時間，本身是動畫的圖會保留每一格）
+- **背景變透明**：單一顏色的背景（白底插畫、證件照、繪圖軟體匯出的白底圖）變透明，只去掉和圖片邊緣相連的背景，主體裡同色的地方（例如眼睛的白色）會保留；動畫每一格都會處理，原格式的 JPG 會改存 PNG
 - **隱私**：可移除拍攝資訊（GPS 位置、拍攝時間等），並依拍攝方向自動轉正
 
 ### 影音轉檔
@@ -108,6 +110,7 @@ python naiz_studio.py
 - 目前只在 **Windows 11 64 位元** 上測試過
 - 螢幕至少能顯示 960 × 640 的視窗
 - **PDF 工具、PDF 編輯器、圖片工具、圖片轉檔**：一般電腦即可，不需要額外下載任何東西（PDF 編輯器的開源字型包可以自己選擇要不要下載）
+- **圖片工具的高清、AI 去背**：第一次使用時下載 AI 元件。去背實測 RTX 5060 Ti 一張約 0.2～0.4 秒；沒有顯示卡時用處理器，一張約 6～12 秒
 - **文件轉檔**：有裝 Office 就直接可用；沒有的話需要下載 LibreOffice。掃描檔文字辨識需要下載 Tesseract，一頁約 3 秒
 - **影音轉檔**：需要下載 FFmpeg。NVIDIA 顯示卡實測可以加速（RTX 5060 Ti 轉 30 秒 1080p 影片約 2 秒）；AMD、Intel 顯示卡程式會自動偵測，但還沒有實測
 - **錄音轉逐字稿**：需要下載語音辨識元件，速度取決於顯示卡
@@ -141,7 +144,10 @@ python naiz_studio.py
 | 說話者分離 | 區分說話者時使用 | 約 23 MB | 約 21 MB |
 | 聲音特徵模型 | 判斷是不是同一個人 | 約 28 MB | 約 28 MB |
 | Real-ESRGAN 圖片高清 | 圖片工具的 AI 放大（需要支援 Vulkan 的顯示卡） | 約 43 MB | 約 51 MB |
-| 照片高清模型（自然） | 高清的「照片（自然）」，保留紋理、比較不會有塑膠感 | 約 31 MB | 約 33 MB |
+| 照片高清模型（自然） | 高清的「照片」模型，「質感」往自然拉時用到，保留紋理 | 約 31 MB | 約 33 MB |
+| AI 去背執行元件（ONNX Runtime） | 在本地執行去背 AI，有顯示卡時用顯示卡加速 | 約 26 MB | 約 67 MB |
+| 去背模型（一般） | 去背的「一般」，速度快 | 約 109 MB | 約 109 MB |
+| 去背模型（精細） | 去背的「精細」，頭髮、毛邊更準 | 約 467 MB | 約 467 MB |
 
 辨識模型只需要下載用到的那一個。
 
@@ -285,6 +291,8 @@ TOOLS = [HelloTool]
 | [3D-Speaker CAM++](https://github.com/modelscope/3D-Speaker) | 聲音特徵模型 | Apache-2.0 |
 | [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)（[ncnn-vulkan](https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan) 版） | 圖片高清（AI 放大）與模型 | BSD-3-Clause / MIT |
 | [4xNomosWebPhoto_esrgan](https://github.com/Phhofm/models/releases/tag/4xNomosWebPhoto_esrgan)（Philip Hofmann） | 高清的「照片（自然）」模型（轉成 ncnn 格式，放在本專案的[下載元件](https://github.com/NaizOuO/Naiz-Studio/releases/tag/components) Release） | CC BY 4.0 |
+| [BiRefNet](https://github.com/ZhengPeng7/BiRefNet)（[ONNX 版](https://huggingface.co/onnx-community/BiRefNet-ONNX)） | 去背模型（一般、精細） | MIT |
+| [ONNX Runtime](https://github.com/microsoft/onnxruntime)（DirectML 版） | 執行去背 AI | MIT |
 | [Noto 字型](https://github.com/notofonts/noto-cjk)（[Google Fonts](https://github.com/google/fonts)） | 字型包：Noto Sans / Serif TC、SC，Noto Sans Mono | OFL-1.1 |
 | [霞鶩文楷 TC](https://github.com/lxgw/LxgwWenkaiTC) | 字型包：楷體 | OFL-1.1 |
 | [Carlito](https://github.com/googlefonts/carlito) | 字型包：英文（Calibri 字寬） | OFL-1.1 |

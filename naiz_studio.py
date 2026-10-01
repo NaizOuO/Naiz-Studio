@@ -759,7 +759,10 @@ class App:
         if self.relaunch:
             import subprocess
 
-            subprocess.Popen([sys.executable], cwd=str(paths.APP_DIR), close_fds=True)
+            # 打包後的 exe 由自己開新的 exe 時要重設 PyInstaller 的環境變數,
+            # 不然新程式會以為自己是舊程式解壓縮出來的子程式,跳出「parent process has different executable」
+            env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
+            subprocess.Popen([sys.executable], cwd=str(paths.APP_DIR), close_fds=True, env=env)
 
 
 def main():

@@ -8,8 +8,10 @@ import http.client
 import platform
 import re
 import shutil
+import socket
 import subprocess
 import tarfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -331,8 +333,63 @@ def _extract_files(dep: Dependency, download):
 
 
 RETRIES = 5                 # 連線被切斷、逾時時自動重試幾次
+TIMEOUT = 20                # 連線或下載中這麼久沒有收到資料就重試(從斷掉的地方接著下載)
 NETWORK_ERRORS = (ConnectionError, TimeoutError, urllib.error.URLError, http.client.IncompleteRead,
                   http.client.RemoteDisconnected)
+
+
+def _open(request, cancel):
+    """連線:放在另一個執行緒等,等待中按取消會馬上停(不用等到逾時)。取消後才連上的連線會自己關掉。"""
+    box, lock = {}, threading.Lock()
+
+    def connect():
+        try:
+            response = urllib.request.urlopen(request, timeout=TIMEOUT)
+        except BaseException as exc:
+            box["error"] = exc
+            return
+        with lock:
+            if box.get("abandoned"):
+                response.close()
+            else:
+                box["response"] = response
+
+    thread = threading.Thread(target=connect, daemon=True)
+    thread.start()
+    while thread.is_alive():
+        if cancel is not None and cancel.wait(0.1):
+            with lock:
+                box["abandoned"] = True
+                if "response" in box:
+                    box["response"].close()
+            raise Cancelled()
+        thread.join(0.05)
+    if "error" in box:
+        raise box["error"]
+    return box["response"]
+
+
+def _watch_cancel(response, cancel):
+    """下載中按取消:直接切斷連線,卡在等資料的讀取會馬上結束。回傳停止監看用的 Event。"""
+    stop = threading.Event()
+    if cancel is None:
+        return stop
+
+    def watch():
+        while not stop.is_set():
+            if cancel.wait(0.1):
+                # Windows 上 shutdown 不會中斷已經在等資料的讀取,要直接關掉連線:
+                # 先 detach 再關,原本的物件就不會再關一次同一個連線
+                try:
+                    handle = response.fp.raw._sock.detach()
+                    if handle != -1:
+                        socket.socket(fileno=handle).close()
+                except Exception:
+                    pass
+                return
+
+    threading.Thread(target=watch, daemon=True).start()
+    return stop
 
 
 def _download(dep, download, base, progress, cancel):
@@ -346,9 +403,14 @@ def _download(dep, download, base, progress, cancel):
         headers = {"User-Agent": "NaizStudio"}
         if done:
             headers["Range"] = f"bytes={done}-"
+        if progress and not done:
+            progress(0, 0)                  # 還在連線:畫面顯示「連線中」
+        stop = None
         try:
             request = urllib.request.Request(dep.url, headers=headers)
-            with urllib.request.urlopen(request, timeout=60) as response:
+            response = _open(request, cancel)
+            stop = _watch_cancel(response, cancel)
+            with response:
                 if done and response.status != 206:
                     # 伺服器不接受續傳:從頭來過
                     digest, done = hashlib.sha256(), 0
@@ -370,10 +432,16 @@ def _download(dep, download, base, progress, cancel):
                         done += len(chunk)
                         if progress:
                             progress(done, total)
+            if cancel is not None and cancel.is_set():
+                raise Cancelled()
             if total and done < total:
                 raise http.client.IncompleteRead(b"", total - done)
             return digest
-        except NETWORK_ERRORS as exc:
+        except (*NETWORK_ERRORS, OSError) as exc:
+            if cancel is not None and cancel.is_set():
+                raise Cancelled() from exc
+            if not isinstance(exc, NETWORK_ERRORS) and not isinstance(exc, socket.timeout):
+                raise
             if attempt == RETRIES:
                 raise ConnectionError(f"下載 {dep.name} 時網路連線一直被中斷，請確認網路後再按重試") from exc
             # 等一下再試(1、2、4…秒),等待中按取消也會馬上停
@@ -382,6 +450,9 @@ def _download(dep, download, base, progress, cancel):
                 raise Cancelled()
             if cancel is None:
                 time.sleep(wait)
+        finally:
+            if stop is not None:
+                stop.set()
     return digest
 
 
