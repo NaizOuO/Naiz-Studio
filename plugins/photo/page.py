@@ -4,6 +4,7 @@
 - 色彩:參考 Word,校正(銳利／柔化、亮度×對比)、色彩(飽和度、色調、重新著色)都是縮圖直接點選,微調用滑桿
 - 效果:美術效果(鉛筆素描、油畫、馬賽克等)縮圖點選,可調強度;滑鼠移到縮圖上,大預覽會先顯示套用後的樣子
 - 掃描:類似掃描 App,自動找出照片裡文件的四個角拉正,去陰影變白底(增強、灰階、黑白),多張依順序合成 PDF
+- 高清:用 AI(Real-ESRGAN,第一次使用時下載)讓模糊的圖變清楚,預設尺寸不變,也可以放大 2～4 倍;可以拖曳分隔線比較前後
 - 改檔名:依樣式批次改名,預設另外輸出一份,也可以直接改原檔(可以復原)
 每張圖的編輯各自記住,可以復原、重做;輸出一律另存到 output\\photo\\,不會覆蓋原圖。
 """
@@ -24,12 +25,14 @@ from core.scroll import BAR_SPACE, ScrollView
 from core.files import free_path
 from core.widgets import Button, Dropdown, SegmentedControl, Slider, TextInput, draw_text, rounded_panel
 
-from ..images import looks, ops, scan
+from ..images import looks, ops, scan, upscale
 from ..images.editor import ImageEditor, _blit_checker
 from ..images.page import Item
 from . import rename
 
-MODES = [("adjust", "調整"), ("color", "色彩"), ("effect", "效果"), ("scan", "掃描"), ("rename", "改檔名")]
+MODES = [("adjust", "調整"), ("color", "色彩"), ("effect", "效果"), ("scan", "掃描"), ("hd", "高清"),
+         ("rename", "改檔名")]
+HD_VIEWS = [("fit", "整張"), ("actual", "放大檢視")]
 SCAN_VIEWS = [("corners", "對準四角"), ("result", "看結果")]
 SCAN_OUTPUTS = [("pdf", "合成 PDF"), ("jpg", "每張 JPG"), ("png", "每張 PNG")]
 SCAN_PAGES = [("a4", "A4"), ("fit", "依圖片大小")]
@@ -112,6 +115,21 @@ class PhotoPage(Page):
         self.btn_scan_all = Button("濾鏡套用到全部", filled=False, size=13)
         self.btn_export = Button("全部輸出", accent=accent, size=14)
         self.scan_checked = set()   # 掃描模式下已經自動找過邊的圖,不重複找(手動調整過的不會被蓋掉)
+        self.hd_model = "natural"
+        self.hd_strength = Slider(0, 100, 100, step=5, accent=accent)
+        self.hd_scale = SegmentedControl(upscale.SCALES, accent=accent)
+        self.hd_view = SegmentedControl(HD_VIEWS, accent=accent)
+        self.hd_rows = []           # 這一幀畫出來的模型選項:[(範圍, 代號)]
+        self.btn_hd_preview = Button("預覽這張", accent=accent, filled=False, size=13)
+        self.btn_hd_save_all = Button("全部變清楚並儲存", accent=accent, size=14)
+        self.hd_job = None          # 正在預覽:{key, progress, cancel, error}
+        self.hd_result = None       # (key, 原圖套用編輯後, 放大後)
+        self.hd_split = 0.5         # 比較畫面的分隔線位置(0～1)
+        self.hd_center = None       # 放大檢視時畫面中心(處理後的座標)
+        self.hd_drag = None
+        self.hd_format = SegmentedControl(SAVE_FORMATS[:4], accent=accent)
+        self._hd_view = None
+        self._compare_area = None
         self.canvas = pygame.Rect(0, 0, 0, 0)
         self._color_view = None     # (key, surface)
         self._fit_base = None       # (key, 縮到畫面大小的底圖)
@@ -426,6 +444,97 @@ class PhotoPage(Page):
         self.worker = threading.Thread(target=work, daemon=True)
         self.worker.start()
 
+    # ------------------------------------------------------------ 高清
+
+    def _hd_key(self, item=None):
+        item = item or self.current
+        return id(item), str(item.path), repr(item.edit), self.hd_model, int(self.hd_scale.value)
+
+    def _with_engine(self, action):
+        """用 AI 模型前先確認元件下載好了;還沒下載時先詢問,下載完再做。"""
+        missing = upscale.required(self.hd_model)
+        if missing:
+            self.app.consent.open("圖片高清", missing, on_done=action)
+        else:
+            action()
+
+    def hd_preview(self):
+        if self.current is None or self.running or self.hd_job is not None:
+            return
+        self._with_engine(self._start_hd_preview)
+
+    def _start_hd_preview(self):
+        item = self.current
+        if item is None:
+            return
+        job = dict(key=self._hd_key(item), progress=0.0, cancel=threading.Event(), error="", stage="讀取原圖")
+        model, scale = self.hd_model, int(self.hd_scale.value)
+        edit, path = item.edit.copy(), item.path
+        self.hd_job = job
+
+        def work():
+            try:
+                source = upscale.load_edited(path, edit)
+                job["stage"] = "處理中"
+                result = upscale.upscale(source, model, scale, lambda v: job.update(progress=v), job["cancel"])
+            except upscale.Cancelled:
+                self.hd_job = None
+                return
+            except Exception as exc:
+                job["error"] = ops.describe_error(exc)
+                self.notice = (f"放大失敗：{job['error']}", theme.DANGER)
+                self.hd_job = None
+                return
+            self.hd_result = (job["key"], source, result)
+            self.hd_center = None
+            self._hd_view = None
+            self.hd_job = None
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def hd_cancel(self):
+        if self.hd_job is not None:
+            self.hd_job["cancel"].set()
+
+    def hd_save(self, items):
+        if self.running or self.hd_job is not None:
+            return
+        items = [item for item in items if isinstance(item.info, dict)]
+        if items:
+            self._with_engine(lambda: self._start_hd_save(items))
+
+    def _start_hd_save(self, items):
+        model, scale, fmt = self.hd_model, int(self.hd_scale.value), self.hd_format.value
+        strength = int(self.hd_strength.value)
+        jobs = [(item, item.edit.copy(), self._hd_key(item)) for item in items]
+        cached = self.hd_result
+        for item in items:
+            item.status = "running"
+        self.notice = (f"處理中 0 / {len(items)}", theme.TEXT_DIM)
+
+        def work():
+            done, failed = 0, 0
+            for number, (item, edit, key) in enumerate(jobs, 1):
+                try:
+                    if cached is not None and cached[0] == key:
+                        source, result = cached[1], cached[2]       # 剛剛預覽過的直接用,不用再算一次
+                    else:
+                        source = upscale.load_edited(item.path, edit)
+                        result = upscale.upscale(source, model, scale)
+                    result = upscale.blend(result, source, strength)
+                    upscale.save(result, item.path, output_dir(), fmt, scale)
+                    item.status = "done"
+                    done += 1
+                except Exception as exc:
+                    item.status, item.message = "error", ops.describe_error(exc)
+                    failed += 1
+                self.notice = (f"處理中 {number} / {len(jobs)}", theme.TEXT_DIM)
+            text = f"已處理 {done} 張存到 output\\photo\\" + (f"，{failed} 張失敗" if failed else "")
+            self.notice = (text, theme.WARN if failed else self.tool.accent)
+
+        self.worker = threading.Thread(target=work, daemon=True)
+        self.worker.start()
+
     # ------------------------------------------------------------ 改檔名
 
     def rename_preview(self):
@@ -599,6 +708,8 @@ class PhotoPage(Page):
             self._draw_preview(work, mouse_pos, self._draw_color_side)
         elif mode == "effect":
             self._draw_preview(work, mouse_pos, self._draw_effect_side)
+        elif mode == "hd":
+            self._draw_hd(work, mouse_pos)
         else:
             self._draw_scan(work, mouse_pos)
         self.draw_footer(pygame.Rect(rect.x + margin, rect.bottom - FOOTER_H - margin, rect.width - margin * 2,
@@ -608,7 +719,7 @@ class PhotoPage(Page):
 
     def _draw_header(self, rect, mouse_pos):
         screen = self.screen
-        self.mode.draw(screen, pygame.Rect(rect.x, rect.y, 440, rect.height), mouse_pos)
+        self.mode.draw(screen, pygame.Rect(rect.x, rect.y, 520, rect.height), mouse_pos)
         if self.mode.value != "rename":
             record = self.history.get(self.current)
             self.btn_redo.enabled = bool(record and record["redo"])
@@ -616,8 +727,8 @@ class PhotoPage(Page):
             self.btn_redo.draw(screen, pygame.Rect(rect.right - 76, rect.y, 76, rect.height), mouse_pos)
             self.btn_undo.draw(screen, pygame.Rect(rect.right - 160, rect.y, 76, rect.height), mouse_pos)
             if self.current is not None:
-                name = widgets.clip_text(self.current.path.name, 13, rect.width - 440 - 190)
-                draw_text(screen, name, (rect.x + 456, rect.centery - 9), 13, theme.TEXT_DIM)
+                name = widgets.clip_text(self.current.path.name, 13, rect.width - 520 - 190)
+                draw_text(screen, name, (rect.x + 536, rect.centery - 9), 13, theme.TEXT_DIM)
 
     def _draw_empty(self, area):
         screen = self.screen
@@ -885,6 +996,155 @@ class PhotoPage(Page):
         if name:
             draw_text(screen, name, (x + inner // 2, y - 16), 12, theme.TEXT, center=True)
 
+    def _draw_hd(self, work, mouse_pos):
+        """高清:左邊是比較畫面(分隔線左邊一般放大、右邊 AI 放大),右邊是模型與倍數。"""
+        screen = self.screen
+        side = self._split_side(work)
+        self.gallery = []
+        canvas = self.canvas
+        rounded_panel(screen, canvas, theme.BG_DEEP, radius=10, alpha=220)
+        result = self.hd_result if self.hd_result and self.hd_result[0] == self._hd_key() else None
+        if result is not None:
+            self._draw_compare(result, mouse_pos)
+        elif self.editor.small is not None:
+            surface = self._color_surface(self.current.edit)
+            rect = surface.get_rect(center=canvas.center)
+            _blit_checker(screen, rect, canvas.topleft)
+            screen.blit(surface, rect)
+            shade = pygame.Surface(canvas.size, pygame.SRCALPHA)
+            shade.fill((8, 10, 14, 120))
+            screen.blit(shade, canvas.topleft)
+            job = self.hd_job
+            if job is not None and job["key"] == self._hd_key():
+                bar = pygame.Rect(0, 0, min(360, canvas.width - 80), 10)
+                bar.center = (canvas.centerx, canvas.centery + 14)
+                pygame.draw.rect(screen, theme.PANEL_LIGHT, bar, border_radius=5)
+                pygame.draw.rect(screen, self.tool.accent, (bar.x, bar.y, int(bar.width * job["progress"]), bar.height),
+                                 border_radius=5)
+                draw_text(screen, f"{job['stage']}… {int(job['progress'] * 100)}%", (canvas.centerx, bar.y - 18), 14,
+                          theme.TEXT, center=True)
+            else:
+                draw_text(screen, "按「預覽這張」看變清楚的效果", canvas.center, 15, theme.TEXT, center=True)
+        else:
+            draw_text(screen, "讀取中...", canvas.center, 14, theme.TEXT_DIM, center=True)
+        self._draw_hd_side(side, mouse_pos, result is not None)
+
+    def _compare_rect(self, size):
+        """比較畫面要顯示放大後圖片的哪一塊(放大後的座標)和畫在畫面上的大小。"""
+        area = self.canvas.inflate(-24, -24)
+        width, height = size
+        if self.hd_view.value == "fit":
+            scale = min(area.width / width, area.height / height)
+            return pygame.Rect(0, 0, width, height), (max(1, int(width * scale)), max(1, int(height * scale)))
+        view_w, view_h = min(width, area.width), min(height, area.height)
+        cx, cy = self.hd_center or (width / 2, height / 2)
+        cx = min(max(cx, view_w / 2), width - view_w / 2)
+        cy = min(max(cy, view_h / 2), height - view_h / 2)
+        self.hd_center = (cx, cy)
+        return pygame.Rect(int(cx - view_w / 2), int(cy - view_h / 2), view_w, view_h), (view_w, view_h)
+
+    def _draw_compare(self, result, mouse_pos):
+        screen = self.screen
+        _, source, big = result
+        view, shown = self._compare_rect(big.size)
+        strength = int(self.hd_strength.value)
+        key = (id(big), tuple(view), shown, strength)
+        if self._hd_view is None or self._hd_view[0] != key:
+            factor = big.width / source.width
+            box = (view.x / factor, view.y / factor, view.right / factor, view.bottom / factor)
+            # 左邊用一般的放大方式(和一般看圖軟體放大時一樣),才看得出 AI 補了多少細節
+            plain = source.resize(shown, Image.Resampling.BICUBIC, box=box).convert("RGBA")
+            sharp = big.crop(tuple(view)).convert("RGBA")
+            if sharp.size != shown:
+                sharp = sharp.resize(shown, Image.Resampling.LANCZOS)
+            if strength < 100:      # 強度:和原圖(一樣的放大方式)混合
+                sharp = Image.blend(source.resize(shown, Image.Resampling.LANCZOS, box=box).convert("RGBA"), sharp,
+                                    strength / 100)
+            self._hd_view = (key, pygame.image.frombytes(plain.tobytes(), plain.size, "RGBA"),
+                             pygame.image.frombytes(sharp.tobytes(), sharp.size, "RGBA"))
+        _, left, right = self._hd_view
+        rect = left.get_rect(center=self.canvas.center)
+        _blit_checker(screen, rect, self.canvas.topleft)
+        cut = int(rect.width * self.hd_split)
+        screen.blit(left, rect.topleft, pygame.Rect(0, 0, cut, rect.height))
+        screen.blit(right, (rect.x + cut, rect.y), pygame.Rect(cut, 0, rect.width - cut, rect.height))
+        line_x = rect.x + cut
+        pygame.draw.line(screen, (255, 255, 255), (line_x, rect.top), (line_x, rect.bottom), 2)
+        knob = pygame.Rect(0, 0, 22, 34)
+        knob.center = (line_x, rect.centery)
+        pygame.draw.rect(screen, (255, 255, 255), knob, border_radius=8)
+        for dx in (-4, 4):
+            pygame.draw.line(screen, (60, 60, 60), (line_x + dx, knob.y + 10), (line_x + dx, knob.bottom - 10), 2)
+        self._compare_area = rect
+        before = "原圖" if int(self.hd_scale.value) == 1 else "一般放大"
+        for text, x, right_align in ((before, rect.x + 10, False),
+                                     (f"AI：{upscale.MODEL_NAMES[self.hd_model]}", rect.right - 10, True)):
+            width = theme.font(12).size(text)[0] + 16
+            tag = pygame.Rect(x - (width if right_align else 0), rect.y + 10, width, 22)
+            rounded_panel(screen, tag, theme.PANEL, radius=6, alpha=230)
+            draw_text(screen, text, tag.center, 12, theme.TEXT, center=True)
+
+    def _draw_hd_side(self, side, mouse_pos, has_result):
+        screen = self.screen
+        x, y, inner = side.x, side.y, side.width
+        accent = self.tool.accent
+        draw_text(screen, "高清", (x, y), 14, theme.TEXT, bold=True)
+        draw_text(screen, "用 AI 讓模糊的圖變清楚", (x + inner, y + 9), 11, theme.TEXT_FAINT, right=True)
+        y += 28
+        self.hd_rows = []
+        for key, name, network, note in upscale.MODELS:
+            row = pygame.Rect(x, y, inner, 42)
+            chosen = key == self.hd_model
+            hover = row.collidepoint(mouse_pos)
+            rounded_panel(screen, row, tuple(int(c * 0.25) for c in accent) if chosen else
+                          (theme.PANEL_LIGHT if hover else theme.BG_DEEP), radius=8, alpha=220,
+                          border=accent if chosen else None)
+            draw_text(screen, name, (row.x + 10, row.y + 5), 13, accent if chosen else theme.TEXT, bold=True)
+            draw_text(screen, widgets.clip_text(note, 11, inner - 20), (row.x + 10, row.y + 24), 11, theme.TEXT_FAINT)
+            self.hd_rows.append((row, key))
+            y += 46
+        y += 4
+        draw_text(screen, "尺寸", (x, y + 6), 13, theme.TEXT)
+        self.hd_scale.draw(screen, pygame.Rect(x + 50, y, inner - 50, 28), mouse_pos)
+        y += 36
+        item = self.current
+        if isinstance(item.info, dict):
+            width, height = ops.edited_size(item.info["size"], item.edit)
+            scale = int(self.hd_scale.value)
+            big_w, big_h = upscale.output_size((width, height), scale)
+            warn = max(big_w, big_h) > upscale.BIG_SIDE
+            size_text = f"{width}×{height} px，大小不變" if scale == 1 else f"{width}×{height} → {big_w}×{big_h} px"
+            draw_text(screen, size_text, (x, y), 12, theme.WARN if warn else theme.TEXT_DIM)
+            y += 18
+            if warn:
+                draw_text(screen, "放大後很大，處理會比較久、檔案也很大", (x, y), 11, theme.WARN)
+                y += 16
+        missing = upscale.required(self.hd_model)
+        if missing:
+            names = "、".join(f"{dep.name}（{dep.size_text}）" for dep in missing)
+            draw_text(screen, widgets.clip_text(f"第一次使用要下載 {names}", 11, inner), (x, y), 11, theme.TEXT_FAINT)
+            y += 16
+        if self.hd_model != "plain":
+            strength = int(self.hd_strength.value)
+            draw_text(screen, "強度", (x, y + 4), 13, theme.TEXT)
+            draw_text(screen, f"{strength}%", (x + inner, y + 13), 13, accent if strength < 100 else theme.TEXT_DIM,
+                      right=True)
+            draw_text(screen, "處理過頭就往左拉，越左越接近原圖", (x + 40, y + 6), 11, theme.TEXT_FAINT)
+            self.hd_strength.draw(screen, pygame.Rect(x + 8, y + 30, inner - 16, 14), mouse_pos)
+            y += 50
+        y += 8
+        running = self.hd_job is not None
+        self.btn_hd_preview.label = "取消" if running else "預覽這張"
+        self.btn_hd_preview.enabled = not self.running
+        self.btn_hd_preview.draw(screen, pygame.Rect(x, y, inner, 32), mouse_pos)
+        y += 44
+        if has_result:
+            draw_text(screen, "顯示", (x, y + 6), 13, theme.TEXT)
+            self.hd_view.draw(screen, pygame.Rect(x + 50, y, inner - 50, 28), mouse_pos)
+            y += 36
+            hint = "拖曳白色的線比較前後" + ("；拖曳畫面可以移動" if self.hd_view.value == "actual" else "")
+            draw_text(screen, hint, (x, y), 11, theme.TEXT_FAINT)
+
     def _draw_scan(self, work, mouse_pos):
         """掃描:左邊是「對準四角」(原圖+四個角)或「看結果」,右邊是找邊、濾鏡與輸出設定。"""
         editor = self.editor
@@ -1042,13 +1302,24 @@ class PhotoPage(Page):
                 text, color = "點縮圖套用，滑鼠移到縮圖上可以先看效果；「微調」可以用滑桿細調", theme.TEXT_DIM
             elif mode == "effect":
                 text, color = "點縮圖套用美術效果，拖曳「強度」調整程度；選「無」取消", theme.TEXT_DIM
+            elif mode == "hd":
+                text, color = "選好模型，按「預覽這張」看效果；按「全部變清楚並儲存」處理清單裡全部的圖", theme.TEXT_DIM
             elif mode == "scan":
                 text, color = ("拖曳四個角對準文件的邊，滑鼠停在角上可用方向鍵微調；選好濾鏡後按「全部輸出」"
                                if self.editor.warping else "依左邊清單的順序輸出；可以拖曳清單調整頁序"), theme.TEXT_DIM
             else:
                 text, color = f"共 {len(self.items)} 個檔案", theme.TEXT_DIM
         right = rect.right - 18
-        if mode == "scan":
+        if mode == "hd":
+            busy = self.running or self.hd_job is not None
+            self.btn_hd_save_all.enabled = bool(self.items) and not busy
+            self.btn_hd_save_all.draw(screen, pygame.Rect(right - 150, rect.y + 18, 150, 38), mouse_pos)
+            self.btn_save_one.enabled = self.current is not None and not busy
+            self.btn_save_one.draw(screen, pygame.Rect(right - 260, rect.y + 18, 100, 38), mouse_pos)
+            right -= 272
+            self.hd_format.draw(screen, pygame.Rect(right - 250, rect.y + 20, 250, 34), mouse_pos)
+            right -= 262
+        elif mode == "scan":
             self.btn_export.enabled = bool(self.items) and not self.running
             self.btn_export.draw(screen, pygame.Rect(right - 104, rect.y + 18, 104, 38), mouse_pos)
             right -= 116
@@ -1131,6 +1402,11 @@ class PhotoPage(Page):
             if self.effect_strength.handle(event, mouse_pos):
                 self._apply_strength()
                 return
+        elif self.current is not None and mode == "hd" and self.hd_model != "plain" \
+                and self.hd_strength.handle(event, mouse_pos):
+            return
+        elif self.current is not None and mode == "hd" and self._hd_drag(event, mouse_pos):
+            return
         elif self.current is not None and mode == "scan" and self.editor.warping:
             editor = self.editor
             near = event.type != pygame.MOUSEBUTTONDOWN or self.canvas.collidepoint(mouse_pos)
@@ -1172,6 +1448,9 @@ class PhotoPage(Page):
         if mode == "scan":
             self._click_scan(pos)
             return
+        if mode == "hd":
+            self._click_hd(pos)
+            return
         if self.btn_undo.clicked(pos, True):
             self.undo()
         elif self.btn_redo.clicked(pos, True):
@@ -1199,6 +1478,59 @@ class PhotoPage(Page):
                 self._color_all(("effect",), "效果")
             elif self.btn_compare.clicked(pos, True):
                 self.comparing = True
+
+    def _hd_drag(self, event, pos):
+        """比較畫面:拖曳分隔線,或在放大檢視時拖曳畫面移動;用掉事件時回傳 True。"""
+        area = self._compare_area
+        result = self.hd_result if self.hd_result and self.hd_result[0] == self._hd_key() else None
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and result and area \
+                and self.canvas.collidepoint(pos):
+            line_x = area.x + int(area.width * self.hd_split)
+            if abs(pos[0] - line_x) <= 16 or self.hd_view.value == "fit":
+                self.hd_drag = ("split", None)
+                self.hd_split = min(1.0, max(0.0, (pos[0] - area.x) / max(1, area.width)))
+            else:
+                self.hd_drag = ("pan", (pos, self.hd_center))
+            return True
+        if self.hd_drag is not None:
+            if event.type == pygame.MOUSEMOTION and area:
+                kind, start = self.hd_drag
+                if kind == "split":
+                    self.hd_split = min(1.0, max(0.0, (pos[0] - area.x) / max(1, area.width)))
+                else:
+                    (sx, sy), (cx, cy) = start
+                    self.hd_center = (cx - (pos[0] - sx), cy - (pos[1] - sy))
+                return True
+            if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                self.hd_drag = None
+                return True
+        return False
+
+    def _click_hd(self, pos):
+        if self.btn_undo.clicked(pos, True):
+            self.undo()
+        elif self.btn_redo.clicked(pos, True):
+            self.redo()
+        elif self.hd_format.clicked(pos, True):
+            pass
+        elif self.btn_hd_save_all.clicked(pos, True):
+            self.hd_save(list(self.items))
+        elif self.btn_save_one.clicked(pos, True):
+            self.hd_save([self.current])
+        elif self.current is None:
+            return
+        elif self.btn_hd_preview.clicked(pos, True):
+            if self.hd_job is not None:
+                self.hd_cancel()
+            else:
+                self.hd_preview()
+        elif self.hd_scale.clicked(pos, True) or self.hd_view.clicked(pos, True):
+            self.hd_center = None
+        else:
+            for row, key in self.hd_rows:
+                if row.collidepoint(pos):
+                    self.hd_model = key
+                    return
 
     def _click_scan(self, pos):
         if self.btn_undo.clicked(pos, True):

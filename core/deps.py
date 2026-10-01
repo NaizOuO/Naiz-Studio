@@ -4,11 +4,14 @@
 """
 
 import hashlib
+import http.client
 import platform
 import re
 import shutil
 import subprocess
 import tarfile
+import time
+import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
@@ -327,6 +330,61 @@ def _extract_files(dep: Dependency, download):
             archive.close()
 
 
+RETRIES = 5                 # 連線被切斷、逾時時自動重試幾次
+NETWORK_ERRORS = (ConnectionError, TimeoutError, urllib.error.URLError, http.client.IncompleteRead,
+                  http.client.RemoteDisconnected)
+
+
+def _download(dep, download, base, progress, cancel):
+    """下載到 download,回傳 SHA-256 的計算物件。連線被對方切斷(例如 WinError 10054)或逾時時,
+    等一下自動重試,並請伺服器從已下載的位置接著傳(不支援續傳時從頭再下載一次)。"""
+    digest = hashlib.sha256()
+    done, total = 0, 0
+    with open(download, "wb"):
+        pass
+    for attempt in range(RETRIES + 1):
+        headers = {"User-Agent": "NaizStudio"}
+        if done:
+            headers["Range"] = f"bytes={done}-"
+        try:
+            request = urllib.request.Request(dep.url, headers=headers)
+            with urllib.request.urlopen(request, timeout=60) as response:
+                if done and response.status != 206:
+                    # 伺服器不接受續傳:從頭來過
+                    digest, done = hashlib.sha256(), 0
+                    with open(download, "wb"):
+                        pass
+                length = int(response.headers.get("Content-Length") or 0)
+                if not done:
+                    total = length
+                    _check_space(dep, base, total)
+                with open(download, "ab") as fp:
+                    while True:
+                        if cancel is not None and cancel.is_set():
+                            raise Cancelled()
+                        chunk = response.read(256 * 1024)
+                        if not chunk:
+                            break
+                        fp.write(chunk)
+                        digest.update(chunk)
+                        done += len(chunk)
+                        if progress:
+                            progress(done, total)
+            if total and done < total:
+                raise http.client.IncompleteRead(b"", total - done)
+            return digest
+        except NETWORK_ERRORS as exc:
+            if attempt == RETRIES:
+                raise ConnectionError(f"下載 {dep.name} 時網路連線一直被中斷，請確認網路後再按重試") from exc
+            # 等一下再試(1、2、4…秒),等待中按取消也會馬上停
+            wait = min(2 ** attempt, 15)
+            if cancel is not None and cancel.wait(wait):
+                raise Cancelled()
+            if cancel is None:
+                time.sleep(wait)
+    return digest
+
+
 def install(dep: Dependency, progress=None, cancel=None):
     base = dep.base_dir
     base.mkdir(parents=True, exist_ok=True)
@@ -334,25 +392,7 @@ def install(dep: Dependency, progress=None, cancel=None):
     expected = dep.sha256.lower() or (fetch_expected_sha256(dep) if dep.sha256_url else None)
     download = base / f".{dep.id}.download"
     try:
-        request = urllib.request.Request(dep.url, headers={"User-Agent": "NaizStudio"})
-        digest = hashlib.sha256()
-        with urllib.request.urlopen(request, timeout=60) as response:
-            total = int(response.headers.get("Content-Length") or 0)
-            _check_space(dep, base, total)
-            with open(download, "wb") as fp:
-                done = 0
-                while True:
-                    if cancel is not None and cancel.is_set():
-                        raise Cancelled()
-                    chunk = response.read(256 * 1024)
-                    if not chunk:
-                        break
-                    fp.write(chunk)
-                    digest.update(chunk)
-                    done += len(chunk)
-                    if progress:
-                        progress(done, total)
-
+        digest = _download(dep, download, base, progress, cancel)
         if expected is not None and digest.hexdigest() != expected:
             raise ChecksumError(f"下載的 {dep.name} 驗證失敗(SHA-256 不符)，已刪除，請重試")
 

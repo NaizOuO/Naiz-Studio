@@ -47,6 +47,7 @@
 - **美術效果**：鉛筆素描、線條畫、模糊、柔光、馬賽克、海報、油畫、浮雕、卡通、底片顆粒、曝光過度、負片，可以調整強度
 - **復原與重做**：每張圖的編輯各自記住，可以一步一步復原；編輯可以套用到清單裡的全部圖片
 - **文件掃描**：像掃描 App 一樣，自動找出照片裡文件的四個角並拉正（依透視算出紙真正的長寬比，直式的講義不會變胖），可以再拖曳微調；濾鏡有原色、增強（去陰影、紙變白、保留顏色）、灰階、黑白；多張照片依清單順序合成一份 PDF（A4 或依圖片大小），或每張存成 JPG、PNG
+- **高清**：用 AI（Real-ESRGAN）讓模糊的圖變清楚，預設大小不變，也可以放大 2～4 倍；模型有照片（自然，保留紋理、比較不會有塑膠感）、照片（銳利）、插畫動漫、快速，以及不用下載的一般放大；「強度」可以調整 AI 處理的程度；可以先預覽，拖曳分隔線比較前後，在本地用顯示卡運算，不會上傳
 - **批次改檔名**：用 `{名稱}`、`{序號}`、`{日期}`（拍攝日期）組合出新檔名，改名前先預覽，重複或不能用的檔名會標出來；預設另外輸出一份，也可以直接改原檔（改錯可以復原）
 - **儲存**：另存到 `output\photo\`，不會覆蓋原圖；可以保留原格式或存成 JPG、PNG、WebP、GIF，動畫 GIF 每一格都會套用；也可以把清單裡的圖依順序合成一個 GIF 動畫（可選每格時間）
 
@@ -139,6 +140,8 @@ python naiz_studio.py
 | 辨識模型「最準確」 | 錯字最少，速度較慢 | 約 2.9 GB | 約 2.9 GB |
 | 說話者分離 | 區分說話者時使用 | 約 23 MB | 約 21 MB |
 | 聲音特徵模型 | 判斷是不是同一個人 | 約 28 MB | 約 28 MB |
+| Real-ESRGAN 圖片高清 | 圖片工具的 AI 放大（需要支援 Vulkan 的顯示卡） | 約 43 MB | 約 51 MB |
+| 照片高清模型（自然） | 高清的「照片（自然）」，保留紋理、比較不會有塑膠感 | 約 31 MB | 約 33 MB |
 
 辨識模型只需要下載用到的那一個。
 
@@ -280,6 +283,8 @@ TOOLS = [HelloTool]
 | [Silero VAD](https://github.com/snakers4/silero-vad) | 人聲偵測模型 | MIT |
 | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | 說話者分離 | Apache-2.0 |
 | [3D-Speaker CAM++](https://github.com/modelscope/3D-Speaker) | 聲音特徵模型 | Apache-2.0 |
+| [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)（[ncnn-vulkan](https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan) 版） | 圖片高清（AI 放大）與模型 | BSD-3-Clause / MIT |
+| [4xNomosWebPhoto_esrgan](https://github.com/Phhofm/models/releases/tag/4xNomosWebPhoto_esrgan)（Philip Hofmann） | 高清的「照片（自然）」模型（轉成 ncnn 格式，放在本專案的[下載元件](https://github.com/NaizOuO/Naiz-Studio/releases/tag/components) Release） | CC BY 4.0 |
 | [Noto 字型](https://github.com/notofonts/noto-cjk)（[Google Fonts](https://github.com/google/fonts)） | 字型包：Noto Sans / Serif TC、SC，Noto Sans Mono | OFL-1.1 |
 | [霞鶩文楷 TC](https://github.com/lxgw/LxgwWenkaiTC) | 字型包：楷體 | OFL-1.1 |
 | [Carlito](https://github.com/googlefonts/carlito) | 字型包：英文（Calibri 字寬） | OFL-1.1 |
