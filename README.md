@@ -74,6 +74,16 @@
 - 可區分說話者，自動判斷人數或指定人數
 - 修正錯字：自訂「辨識錯的字 → 正確的字」，之後的逐字稿會自動套用
 
+### 即時字幕
+- 把電腦正在播放的聲音（YouTube、B站、遊戲、Discord）、單一程式或麥克風，即時轉成字幕並翻譯
+- 字幕浮在所有視窗最上層、半透明，滑鼠點得到後面的東西，也不會把遊戲切到背景；位置、字的大小、底色深淺都可以調
+- 邊講邊出字，講完再換成完整的翻譯；說完到翻譯出來約 0.4～1 秒（RTX 5060 Ti 實測）
+- 可以只顯示翻譯、原文和翻譯一起，或只顯示原文；原文語言可以自動判斷或直接指定
+- 專有名詞表：人名、招式名等固定的翻法，可以存好幾個設定檔（例如一部動畫一個），字幕進行中也能切換
+- 辨識模型四種（快速、輕量、推薦、最準確），翻譯用本地的 [Ollama](https://ollama.com)，畫面上可以直接下載建議的翻譯模型；程式會依電腦配備先選好建議的組合，所有選項都可以自己換
+- 全部在本地運算，聲音不會上傳；字幕只能從 Naiz Studio 停止，關掉 Naiz Studio 字幕也會一起關
+- 「獨佔全螢幕」的遊戲蓋不上任何視窗，請在遊戲設定改成「無邊框視窗」
+
 ### 擴充模組
 - **安裝**：把下載的模組 zip 拖進首頁，確認來源與作者後就會安裝並啟用；再拖一次新版就是更新
 - **自己放**：也可以把模組資料夾放進 exe 旁邊的 `mods` 資料夾（例如 `mods\circuit`），回到程式時首頁就會出現這個模組，點一下確認後才會啟用
@@ -114,6 +124,15 @@ python naiz_studio.py
 - **文件轉檔**：有裝 Office 就直接可用；沒有的話需要下載 LibreOffice。掃描檔文字辨識需要下載 Tesseract，一頁約 3 秒
 - **影音轉檔**：需要下載 FFmpeg。NVIDIA 顯示卡實測可以加速（RTX 5060 Ti 轉 30 秒 1080p 影片約 2 秒）；AMD、Intel 顯示卡程式會自動偵測，但還沒有實測
 - **錄音轉逐字稿**：需要下載語音辨識元件，速度取決於顯示卡
+- **即時字幕**：需要下載語音辨識元件；翻譯需要另外安裝免費的 Ollama。依電腦配備的建議：
+
+| 電腦 | 辨識模型 | 翻譯模型 | 實測 |
+|---|---|---|---|
+| 沒有獨立顯示卡 | 輕量 | translategemma:4b | 辨識每次約 1 秒、翻譯每句約 2～3 秒（只翻講完的句子） |
+| NVIDIA 顯示卡 6～8 GB | 推薦 | translategemma:4b | 辨識每次約 0.1 秒、翻譯每句約 0.3 秒 |
+| NVIDIA 顯示卡 12 GB 以上 | 推薦 | qwen3:8b（預設） | 辨識每次約 0.1 秒、翻譯每句約 0.2～0.4 秒 |
+
+玩遊戲時字幕會和遊戲搶顯示卡，卡頓的話換小一點的模型。
 
 | 硬體 | 使用的版本 | 實測速度（11 分鐘中文錄音，「推薦」模型） |
 |---|---|---|
@@ -144,6 +163,8 @@ python naiz_studio.py
 | 說話者分離 | 區分說話者時使用 | 約 23 MB | 約 21 MB |
 | 聲音特徵模型 | 判斷是不是同一個人 | 約 28 MB | 約 28 MB |
 | Real-ESRGAN 圖片高清 | 圖片工具的 AI 放大（需要支援 Vulkan 的顯示卡） | 約 43 MB | 約 51 MB |
+| 辨識模型「輕量」 | 即時字幕：沒有獨立顯示卡也能即時辨識 | 約 252 MB | 約 252 MB |
+| 人聲偵測模型（字幕） | 即時字幕：判斷有沒有人在說話，避免冒出不存在的字幕（和 AI 去背共用執行元件） | 約 2 MB | 約 2 MB |
 | 照片高清模型（自然） | 高清的「照片」模型，「質感」往自然拉時用到，保留紋理 | 約 31 MB | 約 33 MB |
 | AI 去背執行元件（ONNX Runtime） | 在本地執行去背 AI，有顯示卡時用顯示卡加速 | 約 26 MB | 約 67 MB |
 | 去背模型（一般） | 去背的「一般」，速度快 | 約 109 MB | 約 109 MB |
@@ -293,6 +314,9 @@ TOOLS = [HelloTool]
 | [4xNomosWebPhoto_esrgan](https://github.com/Phhofm/models/releases/tag/4xNomosWebPhoto_esrgan)（Philip Hofmann） | 高清的「照片（自然）」模型（轉成 ncnn 格式，放在本專案的[下載元件](https://github.com/NaizOuO/Naiz-Studio/releases/tag/components) Release） | CC BY 4.0 |
 | [BiRefNet](https://github.com/ZhengPeng7/BiRefNet)（[ONNX 版](https://huggingface.co/onnx-community/BiRefNet-ONNX)） | 去背模型（一般、精細） | MIT |
 | [ONNX Runtime](https://github.com/microsoft/onnxruntime)（DirectML 版） | 執行去背 AI | MIT |
+| [Silero VAD](https://github.com/snakers4/silero-vad) | 即時字幕的人聲偵測 | MIT |
+| [comtypes](https://github.com/enthought/comtypes) | 即時字幕擷取電腦播放的聲音 | MIT |
+| [Ollama](https://github.com/ollama/ollama)（使用者自行安裝） | 即時字幕的本地翻譯；翻譯模型由 Ollama 下載，各自依原本的授權（Qwen3 為 Apache-2.0，TranslateGemma 為 Gemma 使用條款） | MIT |
 | [Noto 字型](https://github.com/notofonts/noto-cjk)（[Google Fonts](https://github.com/google/fonts)） | 字型包：Noto Sans / Serif TC、SC，Noto Sans Mono | OFL-1.1 |
 | [霞鶩文楷 TC](https://github.com/lxgw/LxgwWenkaiTC) | 字型包：楷體 | OFL-1.1 |
 | [Carlito](https://github.com/googlefonts/carlito) | 字型包：英文（Calibri 字寬） | OFL-1.1 |

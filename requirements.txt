@@ -1,10 +1,12 @@
+comtypes
 fonttools
+numpy
 opencc-python-reimplemented
 pikepdf
-python-docx
 Pillow
 pillow-heif
 pygame-ce
 pypdfium2
+python-docx
 resvg-py
 vtracer

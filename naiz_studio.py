@@ -203,7 +203,12 @@ class App:
                 log.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {tool.name}({tool.id})\n{detail}")
         except OSError:
             pass
-        self.pages.pop(tool.id, None)           # 出錯的畫面狀態可能壞了,下次打開重新建立
+        page = self.pages.pop(tool.id, None)    # 出錯的畫面狀態可能壞了,下次打開重新建立
+        if page is not None:
+            try:
+                page.shutdown()                 # 先結束它在背景跑的工作,不留下沒人管的程式
+            except Exception:
+                pass
         if self.current is tool or (self.current and self.current.id == tool.id):
             self.current = None
         self.tool_error = (tool.name, time.monotonic())
@@ -239,7 +244,9 @@ class App:
         accent = self.current.accent if self.current else theme.ACCENT
         pygame.draw.rect(self.screen, accent, (22, 22, 5, 22), border_radius=3)
         self.title_rect = draw_text(self.screen, "Naiz Studio", (38, 20), 21, theme.TEXT, bold=True)
-        crumb_right = self.title_rect.right
+        # 標題旁的小字版本號(和標題底部對齊);更新通知、工具名稱排在它後面
+        crumb_right = draw_text(self.screen, f"v{version.VERSION}", (self.title_rect.right + 8, 27), 12,
+                                theme.TEXT_FAINT).right
         self.update_badge = pygame.Rect(0, 0, 0, 0)
         badge = self.badge_text() if not self.current else None
         if badge:
@@ -520,12 +527,14 @@ class App:
                          [("no", "不用", False), ("ok", "建立", True)], choice)
 
     def poll_update(self):
-        """背景檢查完成後:有新版本就記下來,第一次看到時跳通知(使用者選過「不再顯示」就只在標題旁顯示)。"""
+        """背景檢查完成後:有新版本就記下來,第一次看到時跳通知。
+        使用者對某一版選過「不再顯示」,那一版就只在標題旁顯示;之後出的更新版還是會通知。"""
         check = self.update_check
         if check is not None and check.done:
             self.update_check = None
             self.update_info = check.result
-        if self.update_info and not self.update_prompted and self.config.get("update_notice", True) \
+        if self.update_info and not self.update_prompted \
+                and self.config.get("update_skip") != self.update_info.get("tag") \
                 and not self.dialog.is_open and not self.consent.is_open and not self.settings.is_open \
                 and not self.large_files.is_open:
             self.update_prompted = True
@@ -562,8 +571,8 @@ class App:
         def choice(key, _):
             if key == "ok":
                 self.start_update()
-            elif key == "never":        # 不再跳通知;標題旁的「新版本」還在,想更新時再點
-                self.save_setting("update_notice", False)
+            elif key == "never":        # 這一版不再跳通知(更新的版本出來還是會);標題旁的「新版本」還在,想更新時再點
+                self.save_setting("update_skip", info.get("tag"))
         self.dialog.open("有新版本", lines, buttons, choice)
 
     def start_update(self):
@@ -611,6 +620,13 @@ class App:
 
     def go_home(self):
         self.current = None
+
+    def run_background(self):
+        """不在前景的工具:讓背景的工作繼續(例如回首頁或開別的工具時,即時字幕照常顯示)。"""
+        for tool in self.tools:
+            page = self.pages.get(tool.id)
+            if page is not None and tool is not self.current:
+                self.guard(tool, page.background)
 
     def handle_event(self, event, mouse_pos):
         if event.type == pygame.QUIT:
@@ -750,6 +766,7 @@ class App:
             self.poll_update()
             if self.current:
                 self.guard(self.current, self.pages[self.current.id].update)
+            self.run_background()
             rate = self.frame_rate(time.monotonic() - last_input)
             if rate:
                 self.draw_frame(mouse_pos)
@@ -771,6 +788,12 @@ def main():
         from core.cli import main as cli_main
 
         sys.exit(cli_main(sys.argv[2:]))
+    # 即時字幕的字幕視窗:另一個程式,只開字幕,不載入整個 Naiz Studio
+    if len(sys.argv) > 3 and sys.argv[1] == "--subtitle-overlay":
+        from plugins.subtitle.overlay import run as run_overlay
+
+        run_overlay(int(sys.argv[2]), sys.argv[3])
+        return
 
     # 用 pythonw 啟動時沒有主控台,錯誤訊息會直接消失,所以改寫進 log 並跳視窗告知
     try:

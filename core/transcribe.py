@@ -315,12 +315,20 @@ def cues_to_srt(cues) -> str:
     return "\n\n".join(blocks) + "\n" if blocks else ""
 
 
+@cache
+def _opencc(config):
+    from opencc import OpenCC
+    return OpenCC(config)
+
+
 def convert_script(text: str, script: str) -> str:
     config = _OPENCC_CONFIG.get(script)
     if not config:
         return text
-    from opencc import OpenCC
-    return OpenCC(config).convert(text)
+    # 已經是繁體就不再轉:台灣用語轉換不能重複套用(「演算法」會變成「演演算法」)
+    if script == "tw" and _opencc("s2t").convert(text) == text:
+        return text
+    return _opencc(config).convert(text)
 
 
 def _ascii_temp_dir() -> Path:

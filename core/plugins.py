@@ -74,6 +74,14 @@ class Page:
         """離開這個畫面或被浮動視窗蓋住時呼叫,用來結束進行中的拖曳、自動捲動與文字輸入。"""
         pass
 
+    def background(self):
+        """使用者在別的畫面(首頁或其他工具)時,每一幀呼叫:需要在背景繼續的工作(例如即時字幕)在這裡推進。"""
+        pass
+
+    def shutdown(self):
+        """畫面出錯、要被丟掉重建之前呼叫:結束還在背景跑的工作(例如外部程式、另開的視窗)。"""
+        pass
+
     def draw_toolbar(self, rect, mouse_pos):
         pass
 

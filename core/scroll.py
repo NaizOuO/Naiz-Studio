@@ -10,6 +10,7 @@ import pygame
 from . import paths, theme
 
 BAR_SPACE = 18
+INDICATOR_HIT = 10          # 細線捲動條:右邊緣這麼寬的範圍可以抓住拖曳
 DRAG_THRESHOLD = 6
 DEAD_ZONE = 12
 EDGE_ZONE = 28
@@ -38,7 +39,7 @@ class ScrollView:
         self.accent = accent
         self.wheel_step = wheel_step
         self.marquee = marquee
-        # 細線模式:捲動條只是提示下面還有內容,不能拖曳,也不佔內容寬度,出現或消失時版面不會移動
+        # 細線模式:捲動條畫成細線、不佔內容寬度,出現或消失時版面不會移動;滑鼠移到右邊緣時變粗,一樣可以拖曳
         self.indicator = indicator
         self.rect = pygame.Rect(0, 0, 0, 0)
         self.content_h = 0
@@ -67,12 +68,13 @@ class ScrollView:
     def set_scroll(self, value):
         self.scroll = int(max(0, min(value, self.max_scroll)))
 
-    def bar_geometry(self):
-        """回傳 (軌道, 拖曳塊);內容沒超出範圍時兩者都是 None。"""
+    def bar_geometry(self, hot=False):
+        """回傳 (軌道, 拖曳塊);內容沒超出範圍時兩者都是 None。hot:細線模式滑鼠移上去時畫粗一點。"""
         if not self.max_scroll:
             return None, None
         if self.indicator:
-            track = pygame.Rect(self.rect.right - 5, self.rect.y + 4, 3, self.rect.height - 8)
+            width = 7 if hot else 3
+            track = pygame.Rect(self.rect.right - 2 - width, self.rect.y + 4, width, self.rect.height - 8)
         else:
             track = pygame.Rect(self.rect.right - 9, self.rect.y, 7, self.rect.height)
         bar_h = min(track.height, max(36, int(track.height * self.rect.height / max(1, self.content_h))))
@@ -80,9 +82,13 @@ class ScrollView:
         return track, pygame.Rect(track.x, top, track.width, bar_h)
 
     def _bar_hit(self):
-        if self.indicator:
-            return pygame.Rect(0, 0, 0, 0)
-        return pygame.Rect(self.rect.right - BAR_SPACE, self.rect.y, BAR_SPACE, self.rect.height)
+        width = INDICATOR_HIT if self.indicator else BAR_SPACE
+        return pygame.Rect(self.rect.right - width, self.rect.y, width, self.rect.height)
+
+    def grabbing(self, pos):
+        """滑鼠在捲動條上、或正在拖曳捲動條/中鍵自動捲動:這時事件要交給捲動區(即使滑鼠在內容範圍外)。"""
+        return self.bar_drag is not None or self.auto is not None or \
+            (bool(self.max_scroll) and self._bar_hit().collidepoint(pos))
 
     def _drag_bar_to(self, screen_y):
         track, thumb = self.bar_geometry()
@@ -203,9 +209,9 @@ class ScrollView:
                 surface.blit(layer, band.topleft)
                 pygame.draw.rect(surface, self.accent, band, 1)
 
-        track, thumb = self.bar_geometry()
+        hot = self.max_scroll and (self.bar_drag is not None or self._bar_hit().collidepoint(mouse_pos))
+        track, thumb = self.bar_geometry(hot)
         if track is not None:
-            hot = self.bar_drag is not None or self._bar_hit().collidepoint(mouse_pos)
             pygame.draw.rect(surface, theme.PANEL_LIGHT, track, border_radius=3)
             color = tuple(min(255, c + 35) for c in self.accent) if hot else self.accent
             pygame.draw.rect(surface, color, thumb, border_radius=3)

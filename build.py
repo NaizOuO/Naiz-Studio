@@ -22,14 +22,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 NAME = "Naiz Studio"
 # 插件是執行時才從資料夾讀入,PyInstaller 看不到它們用了哪些套件,要自己列出來
-EXTRA_IMPORTS = ["pypdfium2", "resvg_py", "pikepdf", "opencc", "pillow_heif", "vtracer", "queue", "compression.zstd"]
+EXTRA_IMPORTS = ["pypdfium2", "resvg_py", "pikepdf", "opencc", "pillow_heif", "vtracer", "queue", "compression.zstd",
+                 "comtypes"]
 # 主程式沒用到、但擴充模組可能會用的內建模組;不列出來的話 exe 裡沒有,模組 import 會失敗
 STDLIB_FOR_MODS = ["sqlite3", "configparser", "tomllib", "shelve", "dbm", "wave", "sched", "csv",
                    "http.server", "xml.dom.minidom", "statistics", "fractions", "difflib", "calendar"]
 # 已經不用的套件,以及 fontTools 的繪圖、比對工具才需要的重量級相依(我們只用子集與字重固定,用不到)
 EXCLUDE = ["tkinter", "pymupdf", "fitz", "scipy", "matplotlib", "mpl_toolkits", "reportlab", "sympy"]
 # fontTools 讀字型表格時是依名稱動態匯入模組,要整包收進去
-COLLECT = ["core", "PIL", "fontTools"]
+COLLECT = ["core", "PIL", "fontTools", "comtypes"]     # comtypes:即時字幕擷取聲音
 # python-docx 會讀自己附的範本檔,資料檔要一起收進去
 COLLECT_DATA = ["docx"]
 

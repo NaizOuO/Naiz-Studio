@@ -379,6 +379,7 @@ class Dropdown:
         self.scroll = 0
         self.rect = pygame.Rect(0, 0, 0, 0)
         self._menu = pygame.Rect(0, 0, 0, 0)
+        self._bar_drag = False              # 正在拖曳清單右邊的捲動條
 
     @property
     def value(self):
@@ -395,7 +396,7 @@ class Dropdown:
         keys = [option[0] for option in self.options]
         wanted = keep if keep in keys else value
         self.index = keys.index(wanted) if wanted in keys else 0
-        self.is_open = False
+        self.close()
 
     def set_value(self, value):
         keys = [option[0] for option in self.options]
@@ -404,6 +405,18 @@ class Dropdown:
 
     def close(self):
         self.is_open = False
+        self._bar_drag = False
+
+    def _bar_hit(self):
+        """清單右邊可以抓住拖曳的捲動條範圍(選項放得下時沒有)。"""
+        if not self._max_scroll():
+            return pygame.Rect(0, 0, 0, 0)
+        return pygame.Rect(self._menu.right - 10, self._menu.y, 10, self._menu.height)
+
+    def _drag_to(self, y):
+        track_y, track_h = self._menu.y + 6, max(1, self._menu.height - 12)
+        ratio = (y - track_y) / track_h
+        self.scroll = max(0, min(round(ratio * self._max_scroll()), self._max_scroll()))
 
     def _visible_rows(self):
         return min(len(self.options), self.MAX_ROWS)
@@ -426,14 +439,24 @@ class Dropdown:
             self.scroll = max(0, min(self.scroll - event.y, self._max_scroll()))
             return True
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-            self.is_open = False
+            self.close()
+            return True
+        if event.type == pygame.MOUSEMOTION and self._bar_drag:
+            self._drag_to(pos[1])
+            return True
+        if event.type == pygame.MOUSEBUTTONUP and self._bar_drag:
+            self._bar_drag = False
             return True
         if event.type == pygame.MOUSEBUTTONDOWN:
+            if event.button == 1 and self._bar_hit().collidepoint(pos):
+                self._bar_drag = True
+                self._drag_to(pos[1])
+                return True
             if event.button == 1 and self._menu.collidepoint(pos):
                 row = (pos[1] - self._menu.y - 4) // self.ROW_H
                 if 0 <= row < self._visible_rows():
                     self.index = row + self.scroll
-            self.is_open = False    # 點在清單外面只是收起來,不會點到底下的東西
+            self.close()            # 點在清單外面只是收起來,不會點到底下的東西
             return True
         return event.type in (pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION)
 
@@ -481,11 +504,13 @@ class Dropdown:
             draw_text(surface, text, (item.x + 10, item.centery - theme.font(self.size).get_height() // 2),
                       self.size, self.accent if active else theme.TEXT)
         if self._max_scroll():
-            track = pygame.Rect(menu.right - 5, menu.y + 6, 3, menu.height - 12)
+            hot = self._bar_drag or self._bar_hit().collidepoint(mouse_pos)
+            width = 7 if hot else 3             # 滑鼠移到右邊緣時變粗,可以拖曳
+            track = pygame.Rect(menu.right - 2 - width, menu.y + 6, width, menu.height - 12)
             bar_h = max(20, track.height * rows // len(self.options))
             top = track.y + (track.height - bar_h) * self.scroll // self._max_scroll()
-            pygame.draw.rect(surface, theme.PANEL_EDGE, track, border_radius=2)
-            pygame.draw.rect(surface, self.accent, (track.x, top, 3, bar_h), border_radius=2)
+            pygame.draw.rect(surface, theme.PANEL_EDGE, track, border_radius=3)
+            pygame.draw.rect(surface, self.accent, (track.x, top, width, bar_h), border_radius=3)
 
 
 def _clipboard_text() -> str:

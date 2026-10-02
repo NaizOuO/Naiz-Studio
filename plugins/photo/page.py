@@ -1816,8 +1816,11 @@ class PhotoPage(Page):
         if event.type == pygame.KEYDOWN and event.key in (pygame.K_LEFT, pygame.K_RIGHT) \
                 and self.mode.value == "cutout" and self.current is not None and self._cutout_event(event, mouse_pos):
             return                  # 滑鼠停在去背的滑桿上按 ← →:細調數值(設定區的捲動不會先接走)
-        if self.mode.value in ("color", "effect", "scan", "hd", "cutout") and self._side_view is not None \
-                and self.side_clip.collidepoint(mouse_pos) and self._side_view.handle_event(event, mouse_pos):
+        side_view = self._side_view
+        # 捲動條在設定區右邊緣外一點;拖曳捲動條、中鍵自動捲動時滑鼠移出範圍也要繼續交給它
+        if self.mode.value in ("color", "effect", "scan", "hd", "cutout") and side_view is not None \
+                and (self.side_clip.collidepoint(mouse_pos) or side_view.grabbing(mouse_pos)) \
+                and side_view.handle_event(event, mouse_pos):
             return
         if not self.running and self.order_drag.handle(event, mouse_pos):
             return
