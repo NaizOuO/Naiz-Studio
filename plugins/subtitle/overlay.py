@@ -22,7 +22,8 @@ STYLE = {"size": 34, "opacity": 60, "mode": "both", "x": None, "y": None, "color
          "bg": [12, 14, 18], "outline": 2, "outline_color": [0, 0, 0], "align": "center",
          "font": "", "font_name": "微軟正黑體", "font_path": "", "font_index": 0,
          "fallback_path": "", "fallback_index": 0,      # 缺字時補字的字型(和 PDF 編輯器一樣)
-         "count": 2, "fade": 8, "size_original": 20}     # 畫面上最多幾句;講完幾秒沒人說話就淡出(0 是一直顯示)
+         "count": 2, "fade": 8, "size_original": 20,
+         "furigana": False}                             # 日文原文的漢字上方標讀音     # 畫面上最多幾句;講完幾秒沒人說話就淡出(0 是一直顯示)
 FADE_TIME = 0.8             # 淡出花的秒數
 MODES = [("translation", "只顯示翻譯"), ("both", "原文和翻譯"), ("original", "只顯示原文")]
 ALIGNS = [("left", "靠左"), ("center", "置中"), ("right", "靠右")]
@@ -124,8 +125,16 @@ class Overlay:
         self.send({"type": "style", **style})
 
     def lines(self, items):
-        """items:[(原文, 翻譯, 是否定稿, 講完幾秒了)];還在講的那句最後一項是 None。"""
-        self.send({"type": "lines", "lines": [{"o": o, "t": t, "f": f, "i": i} for o, t, f, i in items]})
+        """items:[(原文, 翻譯, 是否定稿, 講完幾秒了[, 原文的振假名])];還在講的那句「講完幾秒了」是 None。
+        振假名是 [(原文片段, 讀音)],沒有就不傳。"""
+        lines = []
+        for item in items:
+            o, t, f, i = item[:4]
+            line = {"o": o, "t": t, "f": f, "i": i}
+            if len(item) > 4 and item[4]:
+                line["r"] = [list(segment) for segment in item[4]]
+            lines.append(line)
+        self.send({"type": "lines", "lines": lines})
 
     def adjust(self, on):
         self.send({"type": "adjust", "on": bool(on)})
@@ -264,6 +273,101 @@ class Painter:
             rows.append(current)
         return rows[-2:]
 
+    @staticmethod
+    def _ruby_size(size):
+        return max(8, int(size * 0.5))
+
+    def _segment_width(self, base, ruby, style, size, left=True, right=True):
+        """一段佔的寬度。讀音比漢字寬時,可以伸到旁邊沒讀音的字上方(每邊最多半個讀音字,
+        left/right:那一邊可以伸),伸不下的部分才把漢字左右撐開。"""
+        width = self._width(self._runs(base, style, size))
+        if ruby:
+            ruby_size = self._ruby_size(size)
+            extra = self._width(self._runs(ruby, style, ruby_size)) - width
+            allow = ruby_size * 0.5 * (int(left) + int(right))
+            width += max(0.0, extra - allow)
+        return width
+
+    def _slots(self, segments, style, size):
+        """一行裡每一段實際佔的寬度:旁邊也有讀音的那一邊不能伸過去(兩組讀音才不會疊在一起)。"""
+        slots = []
+        for index, (base, ruby) in enumerate(segments):
+            left = index == 0 or not segments[index - 1][1]
+            right = index == len(segments) - 1 or not segments[index + 1][1]
+            slots.append(self._segment_width(base, ruby, style, size, left, right))
+        return slots
+
+    def _wrap_ruby(self, segments, style, size, width):
+        """有振假名的原文換行:有讀音的一段不拆開,沒讀音的照字切;每段最多兩行。回傳 [[(原文, 讀音)]]。"""
+        pieces = []
+        for base, ruby in segments:
+            pieces += [(base, ruby)] if ruby else [(ch, "") for ch in base]
+        rows, current, used = [], [], 0.0
+        for base, ruby in pieces:
+            piece_w = self._segment_width(base, ruby, style, size)
+            if current and used + piece_w > width:
+                if not ruby and base in "，。、！？；：）」』,.!?;:)" and len(current) > 1:
+                    moved = current.pop()               # 標點不放在行首:帶著前一個字一起換行
+                    rows.append(current)
+                    current = [moved]
+                    used = self._segment_width(moved[0], moved[1], style, size)
+                else:
+                    rows.append(current)
+                    current, used = [], 0.0
+                    if not ruby and base.isspace():
+                        continue
+            current.append((base, ruby))
+            used += piece_w
+        if current:
+            rows.append(current)
+        # 相鄰沒讀音的字接回同一段,畫的時候少切幾段
+        merged_rows = []
+        for row in rows[-2:]:
+            merged = []
+            for base, ruby in row:
+                if merged and not ruby and not merged[-1][1]:
+                    merged[-1] = (merged[-1][0] + base, "")
+                else:
+                    merged.append((base, ruby))
+            merged_rows.append(merged)
+        return merged_rows
+
+    def _row_width(self, content, style, size):
+        if isinstance(content, str):
+            return self._width(self._runs(content, style, size))
+        return sum(self._slots(content, style, size))
+
+    def _row_height(self, content, size):
+        ruby = not isinstance(content, str) and any(ruby for _, ruby in content)
+        return int(size * 1.35) + (self._ruby_size(size) + 2 if ruby else 0)
+
+    def _draw_runs(self, pen, text, style, size, x, y, fill, outline, edge):
+        for font, part in self._runs(text, style, size):
+            pen.text((x, y), part, font=font, fill=fill + (255,), stroke_width=outline, stroke_fill=edge + (255,))
+            x += font.getlength(part)
+        return x
+
+    def _draw_ruby_row(self, pen, segments, style, size, x, top, fill, outline, edge):
+        """一行有振假名的原文:讀音用小字畫在漢字正上方,漢字往下讓出讀音的高度。"""
+        ruby_size = self._ruby_size(size)
+        base_y = top + ruby_size + 2 + outline
+        ruby_outline = max(1, outline // 2) if outline else 0
+        for (base, ruby), slot in zip(segments, self._slots(segments, style, size)):
+            base_w = self._width(self._runs(base, style, size))
+            self._draw_runs(pen, base, style, size, x + (slot - base_w) / 2, base_y, fill, outline, edge)
+            if ruby:
+                ruby_w = self._width(self._runs(ruby, style, ruby_size))
+                self._draw_runs(pen, ruby, style, ruby_size, x + (slot - ruby_w) / 2, top + outline, fill,
+                                ruby_outline, edge)
+            x += slot
+
+    def _original_rows(self, item, style, size, inner):
+        """原文的每一行:有振假名(r)而且設定要標時,每行是 [(原文, 讀音)];否則是一般文字。"""
+        segments = item.get("r") if style.get("furigana") else None
+        if segments and "".join(base for base, _ in segments) == item["o"]:
+            return self._wrap_ruby([tuple(segment) for segment in segments], style, size, inner)
+        return self._wrap(item["o"], style, size, inner)
+
     def paint(self, lines, style, band_width, adjusting):
         from PIL import Image, ImageDraw
 
@@ -286,20 +390,21 @@ class Painter:
             t_style = dict(style, script=_script(item.get("t") or ""))
             if mode == "original" and item.get("o"):
                 rows += [(row, big, color if final else dim, o_style)
-                         for row in self._wrap(item["o"], o_style, big, inner)]
+                         for row in self._original_rows(item, o_style, big, inner)]
             if mode == "both" and item.get("o"):
-                rows += [(row, small, dim, o_style) for row in self._wrap(item["o"], o_style, small, inner)]
+                rows += [(row, small, dim, o_style) for row in self._original_rows(item, o_style, small, inner)]
             if mode in ("both", "translation") and item.get("t"):
                 rows += [(row, big, color if final else dim, t_style)
                          for row in self._wrap(item["t"], t_style, big, inner)]
             if mode == "translation" and not item.get("t") and item.get("o"):
-                rows += [(row, small, dim, o_style) for row in self._wrap(item["o"], o_style, small, inner)]
+                rows += [(row, small, dim, o_style) for row in self._original_rows(item, o_style, small, inner)]
             if rows:
                 blocks.append((rows, float(item.get("a", 1.0))))
         if not blocks and not adjusting:
             return None
         gap, pad_x, pad_y = 10, 20, 10
-        heights = [sum(int(size * 1.35) for _, size, _, _ in rows) + pad_y * 2 for rows, _ in blocks]
+        heights = [sum(self._row_height(content, size) for content, size, _, _ in rows) + pad_y * 2
+                   for rows, _ in blocks]
         height = max(sum(heights) + gap * max(0, len(blocks) - 1), big * 2)
         image = Image.new("RGBA", (band_width, height + 4), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
@@ -307,8 +412,7 @@ class Painter:
         align = style.get("align", "center")
         y = 0
         for (rows, alpha), block_h in zip(blocks, heights):
-            widths = [self._width(self._runs(text, row_style, size)) + outline * 2
-                      for text, size, _, row_style in rows]
+            widths = [self._row_width(content, row_style, size) + outline * 2 for content, size, _, row_style in rows]
             block_w = int(max(widths)) + pad_x * 2
             left = {"left": 0, "right": band_width - block_w}.get(align, (band_width - block_w) // 2)
             # 每一句畫在自己的一層,淡出時整層一起變透明(底色、字、外框一起淡)
@@ -317,14 +421,14 @@ class Painter:
             if bg[3]:
                 pen.rounded_rectangle((0, 0, block_w - 1, block_h - 1), radius=12, fill=bg)
             row_y = pad_y
-            for (text, size, fill, row_style), row_w in zip(rows, widths):
+            for (content, size, fill, row_style), row_w in zip(rows, widths):
                 x = {"left": pad_x, "right": block_w - pad_x - row_w}.get(align, (block_w - row_w) / 2)
                 x += outline
-                for font, part in self._runs(text, row_style, size):
-                    pen.text((x, row_y + outline), part, font=font, fill=fill + (255,),
-                             stroke_width=outline, stroke_fill=edge + (255,))
-                    x += font.getlength(part)
-                row_y += int(size * 1.35)
+                if isinstance(content, str):
+                    self._draw_runs(pen, content, row_style, size, x, row_y + outline, fill, outline, edge)
+                else:
+                    self._draw_ruby_row(pen, content, row_style, size, x, row_y, fill, outline, edge)
+                row_y += self._row_height(content, size)
             if alpha < 1:
                 layer.putalpha(layer.getchannel("A").point(lambda v, a=alpha: int(v * a)))
             image.alpha_composite(layer, (int(left), y))

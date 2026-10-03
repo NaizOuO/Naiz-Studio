@@ -16,7 +16,8 @@ from core.widgets import Button, Dropdown, SegmentedControl, Slider, Toggle, dra
 from ..editor import fonts
 from ..editor.font_picker import FontPicker
 from ..editor.palette import ColorPalette
-from . import asr, glossary, hardware
+from . import asr, furigana, glossary, hardware
+from .translator_dialog import TranslatorDialog
 from . import translate as ollama
 from .engine import Engine, Settings
 from .glossary_dialog import GlossaryDialog
@@ -103,11 +104,12 @@ class SubtitlePage(Page):
         self.names_dialog = GlossaryDialog(lambda: self.screen, accent, self._names_changed)
         self.model_rows = []                # 這一幀畫出來的辨識模型:[(範圍, 代號)]
         self.translate_on = Toggle(self.prefs["translate"], accent=accent)
+        self.furigana_on = Toggle(self.prefs["furigana"], accent=accent)
         self.target = Dropdown([(k, n) for k, n, _, _ in ollama.TARGETS], accent=accent, size=13)
         self.target.set_value(self.prefs["target"])
-        self.translator = Dropdown([("", "（讀取中）")], accent=accent, size=13)
+        self.btn_translator = Button("選擇翻譯模型", filled=False, size=13)     # 打開翻譯模型的管理視窗
+        self.translator_dialog = TranslatorDialog(self)
         self.btn_ollama = Button("前往下載 Ollama", accent=accent, filled=False, size=13)
-        self.pull_buttons = []              # [(按鈕, 模型名稱)]
         self.mode = SegmentedControl(MODES, accent=accent)
         self.mode.index = [k for k, _ in MODES].index(self.prefs["mode"])
         self.size = Slider(20, 60, self.prefs["size"], step=2, accent=accent)
@@ -305,18 +307,11 @@ class SubtitlePage(Page):
         if self.ollama_state != "running":
             self.notice = ("翻譯需要 Ollama：請先安裝並打開 Ollama", theme.WARN)
         elif self.prefs["translator"] not in [name for name, _ in self.ollama_models]:
-            self.notice = ("請先下載翻譯模型（設定區下方可以直接下載）", theme.WARN)
+            self.notice = ("請先選好翻譯模型（按設定區的「翻譯模型」選擇或下載）", theme.WARN)
         else:
             return True
         self._notice_until = time.monotonic() + 4
         return False
-
-    def _translator_options(self):
-        """已經在本地的模型標「本地」(實測很差的標「不建議」);還沒下載的建議模型標「建議安裝」,選了就開始下載。"""
-        installed = [name for name, _ in self.ollama_models]
-        options = [(name, name, "本地・不建議" if ollama.not_recommended(name) else "本地") for name in installed]
-        options += [(name, name, f"建議安裝 {size}") for name, size, _, _ in ollama.SUGGESTED if name not in installed]
-        return options
 
     # ------------------------------------------------------------ 開始、停止
 
@@ -336,7 +331,7 @@ class SubtitlePage(Page):
                 self.notice = ("翻譯需要 Ollama：請先安裝並打開 Ollama，或把「翻譯」關掉只顯示原文", theme.WARN)
                 return
             if prefs["translator"] not in [name for name, _ in self.ollama_models]:
-                self.notice = ("請先下載翻譯模型（設定區下方可以直接下載）", theme.WARN)
+                self.notice = ("請先選好翻譯模型（按設定區的「翻譯模型」選擇或下載）", theme.WARN)
                 return
         settings = Settings(source=prefs["source"], pid=int(self.program_pick.value or 0) or None,
                             model=prefs["model"], language=prefs["language"], translate=prefs["translate"],
@@ -437,7 +432,7 @@ class SubtitlePage(Page):
     # ------------------------------------------------------------ 每一幀
 
     def deactivate(self):
-        for dropdown in (self.program_pick, self.language, self.names_pick, self.target, self.translator):
+        for dropdown in (self.program_pick, self.language, self.names_pick, self.target):
             dropdown.close()
         self.settings_view.reset()
         self.lines_view.reset()
@@ -461,8 +456,11 @@ class SubtitlePage(Page):
             items = []
             for line, idle in engine.recent(int(self.prefs["count"])):
                 age = idle if line.final else None
-                items.append(("", line.translation or line.original, line.final, age) if line.same
-                             else (line.original, line.translation, line.final, age))
+                if line.same:
+                    items.append(("", line.translation or line.original, line.final, age))
+                else:
+                    ruby = furigana.annotate(line.original) if self.prefs["furigana"] else ()
+                    items.append((line.original, line.translation, line.final, age, ruby))
             self.overlay.lines(items)
         if engine is not None and self.session is not None and time.monotonic() - self._saved_at > 1:
             self._saved_at = time.monotonic()
@@ -483,15 +481,14 @@ class SubtitlePage(Page):
                          mouse_pos)
         self._draw_footer(pygame.Rect(rect.x + margin, rect.bottom - footer_h - margin, rect.width - margin * 2,
                                       footer_h), mouse_pos)
-        for dropdown in (self.program_pick, self.language, self.names_pick, self.target, self.translator):
+        for dropdown in (self.program_pick, self.language, self.names_pick, self.target):
             dropdown.draw_menu(self.screen, mouse_pos)
         self.palette.draw(self.screen, mouse_pos)
 
     def _controls(self):
-        buttons = [self.btn_refresh, self.btn_ollama, self.btn_font, self.btn_names] + \
-            [button for button, _ in self.pull_buttons]
+        buttons = [self.btn_refresh, self.btn_ollama, self.btn_font, self.btn_names, self.btn_translator]
         return buttons, [self.source, self.gain, self.mode, self.align, self.count, self.fade, self.output], \
-            [self.program_pick, self.language, self.names_pick, self.target, self.translator], \
+            [self.program_pick, self.language, self.names_pick, self.target], \
             [self.size, self.size_original, self.outline, self.opacity]
 
     def _draw_settings(self, rect, mouse_pos):
@@ -503,11 +500,11 @@ class SubtitlePage(Page):
         # 先把所有設定移到畫面外;這一幀真的畫出來的才會回到原位
         # (否則切換來源、關掉翻譯後,看不見的選單還留在原位,點別的地方會打開它)
         buttons, segments, dropdowns, sliders = self._controls()
-        for control in buttons + dropdowns + sliders + [self.translate_on]:
+        for control in buttons + dropdowns + sliders + [self.translate_on, self.furigana_on]:
             control.rect = HIDDEN.copy()
         for control in segments:
             control.rects = []
-        self.model_rows, self.swatches, self.pull_buttons = [], [], []
+        self.model_rows, self.swatches = [], []
         screen.set_clip(area)
         bottom = self._setting_rows(area.x, area.y - view.scroll, area.width, mouse_pos)
         screen.set_clip(None)
@@ -521,7 +518,7 @@ class SubtitlePage(Page):
             return rect.clip(area) if rect.colliderect(area) else HIDDEN.copy()
 
         buttons, segments, dropdowns, sliders = self._controls()
-        for control in buttons + sliders + [self.translate_on]:
+        for control in buttons + sliders + [self.translate_on, self.furigana_on]:
             control.rect = cut(control.rect)
         for control in segments:
             control.rects = [cut(rect) for rect in control.rects]
@@ -531,7 +528,6 @@ class SubtitlePage(Page):
                 dropdown.close()
         self.model_rows = [(cut(rect), key) for rect, key in self.model_rows if rect.colliderect(area)]
         self.swatches = [(cut(rect), key) for rect, key in self.swatches if rect.colliderect(area)]
-        self.pull_buttons = [(button, name) for button, name in self.pull_buttons if button.rect.width]
 
     @staticmethod
     def _set_options(dropdown, options, value=None):
@@ -649,6 +645,18 @@ class SubtitlePage(Page):
         y = self._heading("字幕樣式", x, y)
         self.mode.draw(screen, pygame.Rect(x, y, inner, 30), mouse_pos)
         y += 38
+        draw_text(screen, "日文標讀音（振假名）", (x, y + 3), 13, theme.TEXT)
+        self.furigana_on.value = prefs["furigana"]
+        self.furigana_on.draw(screen, (x + inner - 42, y + 2), mouse_pos)
+        y += 26
+        if not prefs["furigana"]:
+            note, color = "原文是日文時，在漢字上方用小字標出讀音", theme.TEXT_FAINT
+        elif prefs["mode"] == "translation":
+            note, color = "目前只顯示翻譯，看不到原文的讀音；改成「原文和翻譯」或「只顯示原文」", theme.WARN
+        else:
+            note, color = "讀音由字典判斷，少數要看上下文的詞可能標錯（例如「辛い」）", theme.TEXT_FAINT
+        draw_text(screen, widgets.clip_text(note, 12, inner), (x, y), 12, color)
+        y += 26
         draw_text(screen, "對齊", (x, y + 6), 13, theme.TEXT)
         self.align.draw(screen, pygame.Rect(x + 80, y, inner - 80, 28), mouse_pos)
         y += 36
@@ -662,7 +670,9 @@ class SubtitlePage(Page):
             draw_text(screen, label, (x, y + 3), 13, theme.TEXT)
             draw_text(screen, text, (x + inner - 40, y + 12), 13, theme.TEXT_DIM, right=True)
             slider.draw(screen, pygame.Rect(x + 80, y + 9, inner - 170, 14), mouse_pos)
-            swatch = pygame.Rect(x + inner - 30, y + 1, 30, 24)
+            # 原文和翻譯一起顯示時,原文共用文字的顏色(稍微淡一點):色塊拉長到「原文大小」那一列,看得出是一起的
+            tall = slider is self.size and prefs["mode"] == "both"
+            swatch = pygame.Rect(x + inner - 30, y + 1, 30, 24 + (32 if tall else 0))
             pygame.draw.rect(screen, tuple(self.prefs[color_key]), swatch, border_radius=5)
             pygame.draw.rect(screen, self.tool.accent if swatch.collidepoint(mouse_pos) else theme.PANEL_EDGE, swatch, 2,
                              border_radius=5)
@@ -675,7 +685,8 @@ class SubtitlePage(Page):
                           right=True)
                 self.size_original.draw(screen, pygame.Rect(x + 80, y + 9, inner - 170, 14), mouse_pos)
                 y += 32
-        draw_text(screen, "右邊的色塊依序是：文字、外框、底色的顏色", (x, y), 11, theme.TEXT_FAINT)
+        draw_text(screen, "右邊的色塊依序是：文字（原文和翻譯共用）、外框、底色的顏色" if prefs["mode"] == "both"
+                  else "右邊的色塊依序是：文字、外框、底色的顏色", (x, y), 11, theme.TEXT_FAINT)
         y += 24
         draw_text(screen, "畫面上", (x, y + 6), 13, theme.TEXT)
         self.count.draw(screen, pygame.Rect(x + 80, y, inner - 80, 28), mouse_pos)
@@ -714,32 +725,31 @@ class SubtitlePage(Page):
             self.btn_ollama.draw(screen, pygame.Rect(x + inner - 130, y, 130, 30), mouse_pos)
             return y + 40
         draw_text(screen, "翻譯模型", (x, y + 6), 13, theme.TEXT)
-        self._set_options(self.translator, self._translator_options(), self.prefs["translator"])
-        if not self.translator.is_open:
-            self.translator.set_value(self.prefs["translator"])
-        self.translator.draw(screen, pygame.Rect(x + 80, y, inner - 80, 30), mouse_pos)
-        y += 38
         installed = {name for name, _ in self.ollama_models}
-        rows = [item for item in ollama.SUGGESTED if item[0] not in installed]
-        if rows:
-            draw_text(screen, "建議下載", (x, y), 12, theme.TEXT_DIM)
-            y += 20
-        for name, size, vram, note in rows:
-            pulling = self.pull is not None and self.pull["name"] == name
-            tag = "  建議" if name == self.recommended[1] else ""
-            draw_text(screen, f"{name}（{size}）{tag}", (x, y), 12, accent if tag else theme.TEXT, bold=bool(tag))
-            draw_text(screen, widgets.clip_text(note, 11, inner - 90), (x, y + 18), 11, theme.TEXT_FAINT)
-            if pulling:
-                done, total = self.pull["done"], self.pull["total"]
-                text = self.pull["error"] or (f"{done / total:.0%}" if total else "準備中")
-                draw_text(screen, text, (x + inner, y + 9), 12, theme.WARN if self.pull["error"] else accent,
-                          right=True)
-            else:
-                button = Button("下載", filled=False, size=12)
-                button.enabled = self.pull is None
-                button.draw(screen, pygame.Rect(x + inner - 64, y + 2, 64, 28), mouse_pos)
-                self.pull_buttons.append((button, name))
-            y += 40
+        current = self.prefs["translator"]
+        # 外觀像下拉選單(左邊是目前的模型,右邊「更換 ›」),按下去打開管理視窗
+        box = pygame.Rect(x + 80, y, inner - 80, 30)
+        self.btn_translator.rect = box
+        hover = box.collidepoint(mouse_pos)
+        rounded_panel(screen, box, theme.BG_DEEP, radius=8, alpha=220, border=accent if hover else theme.PANEL_EDGE)
+        name = current if current in installed else "選擇翻譯模型"
+        draw_text(screen, widgets.clip_text(name, 13, box.width - 80), (box.x + 12, box.centery - theme.font(13).get_height() // 2),
+                  13, theme.TEXT if current in installed else theme.WARN)
+        draw_text(screen, "更換 ›", (box.right - 12, box.centery), 12,
+                  accent if hover else theme.TEXT_DIM, right=True)
+        y += 36
+        if self.pull is not None:
+            done, total = self.pull["done"], self.pull["total"]
+            text = self.pull["error"] or f"下載 {self.pull['name']} 中 " + (f"{done / total:.0%}" if total else "…")
+            color = theme.WARN if self.pull["error"] else accent
+        elif current not in installed:
+            text, color = "還沒有選好翻譯模型：按上面的按鈕選擇或下載", theme.WARN
+        else:
+            reason = ollama.not_recommended(current)
+            note = next((note for name, _, _, note in ollama.SUGGESTED if name == current), "")
+            text, color = (f"不建議：{reason}", theme.WARN) if reason else (note or "自己另外下載的模型", theme.TEXT_FAINT)
+        draw_text(screen, widgets.clip_text(text, 12, inner), (x, y), 12, color)
+        y += 24
         return y
 
     def _draw_lines(self, rect, mouse_pos):
@@ -861,17 +871,21 @@ class SubtitlePage(Page):
             self.overlay.style(self._style())
 
     def modal_open(self):
-        return self.font_picker.is_open or self.names_dialog.is_open
+        return self.font_picker.is_open or self.names_dialog.is_open or self.translator_dialog.is_open
 
     def draw_modal(self, mouse_pos):
-        if self.names_dialog.is_open:
+        if self.translator_dialog.is_open:
+            self.translator_dialog.draw(mouse_pos)
+        elif self.names_dialog.is_open:
             self.names_dialog.update()
             self.names_dialog.draw(mouse_pos)
         else:
             self.font_picker.draw(mouse_pos)
 
     def handle_modal_event(self, event, mouse_pos):
-        if self.names_dialog.is_open:
+        if self.translator_dialog.is_open:
+            self.translator_dialog.handle_event(event, mouse_pos)
+        elif self.names_dialog.is_open:
             self.names_dialog.handle_event(event, mouse_pos)
         else:
             self.font_picker.handle_event(event, mouse_pos)
@@ -880,7 +894,7 @@ class SubtitlePage(Page):
         if self.palette.handle_event(event, mouse_pos):
             return
         pairs = ((self.program_pick, None), (self.language, "language"), (self.names_pick, "names"),
-                 (self.target, "target"), (self.translator, "translator"))
+                 (self.target, "target"))
         opened = [pair for pair in pairs if pair[0].is_open]
         # 有選單開著時只交給它(點在外面就只是收起來),不會同時打開另一個
         for dropdown, key in opened or pairs:
@@ -893,16 +907,7 @@ class SubtitlePage(Page):
                 if key is None and dropdown.value != before:
                     self._change_program(int(dropdown.value or 0) or None)     # 單一程式:換程式
                 elif key and dropdown.value != before and dropdown.value:
-                    if key == "translator" and dropdown.value not in [name for name, _ in self.ollama_models]:
-                        self._pull(dropdown.value)          # 還沒下載的建議模型:開始下載,下載完自動選用
-                        dropdown.set_value(self.prefs["translator"])
-                    else:
-                        self._change(key, dropdown.value)
-                        reason = ollama.not_recommended(dropdown.value) if key == "translator" else ""
-                        if reason:
-                            self.notice = (f"這個模型實測翻譯很差（{reason}），建議用 qwen3:8b 或 translategemma",
-                                           theme.WARN)
-                            self._notice_until = time.monotonic() + 6
+                    self._change(key, dropdown.value)
                 return
         # 捲動條在設定區右邊緣外一點;拖曳捲動條、中鍵自動捲動時滑鼠移出範圍也要繼續交給它(才收得到放開)
         settings, lines = self.settings_view, self.lines_view
@@ -989,10 +994,9 @@ class SubtitlePage(Page):
             if rect.collidepoint(pos):
                 self.palette.open(rect, tuple(prefs[key]), lambda color, key=key: self._set_style(key, list(color)))
                 return
-        for button, name in self.pull_buttons:
-            if button.clicked(pos, True):
-                self._pull(name)
-                return
+        if self.btn_translator.clicked(pos, True):
+            self.translator_dialog.open()
+            return
         if self.btn_ollama.clicked(pos, True):
             if self.ollama_state == "missing":
                 os.startfile(ollama.DOWNLOAD_PAGE)
@@ -1006,6 +1010,9 @@ class SubtitlePage(Page):
             self._change("source", self.source.value)
         elif self.btn_refresh.clicked(pos, True):
             self._refresh_programs()
+        elif self.furigana_on.clicked(pos, True):
+            self.furigana_on.value = prefs["furigana"]
+            self._set_furigana(not prefs["furigana"])
         elif self.translate_on.clicked(pos, True):
             self._change("translate", self.translate_on.value)
             self.translate_on.value = prefs["translate"]
@@ -1018,12 +1025,23 @@ class SubtitlePage(Page):
                 else:
                     self._change("model", row)
 
+    def _set_furigana(self, on):
+        """打開時字典還沒下載:先詢問,下載好才打開。"""
+        if on and not furigana.available():
+            self.app.consent.open("日文標讀音", [furigana.DICTIONARY], on_done=lambda: self._set_furigana(True))
+            return
+        self.prefs["furigana"] = on
+        if self.overlay.alive:
+            self.overlay.style(self._style())
+        self._dirty = True                  # 字幕視窗上的字馬上重畫
+        self._save()
+
     def _pull(self, name):
         if self.pull is not None:
             self.notice = (f"正在下載 {self.pull['name']}，下載完才能再下載其他模型", theme.WARN)
             self._notice_until = time.monotonic() + 3
             return
-        self.notice = (f"開始下載 {name}，下載完會自動選用（進度在設定區下方）", self.tool.accent)
+        self.notice = (f"開始下載 {name}，下載完會自動選用（進度顯示在翻譯模型下面）", self.tool.accent)
         self._notice_until = time.monotonic() + 4
         job = {"name": name, "done": 0, "total": 0, "error": "", "cancel": threading.Event()}
         self.pull = job

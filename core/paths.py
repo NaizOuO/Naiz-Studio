@@ -18,13 +18,30 @@ SETTING_NAME = "setting"
 # 使用者的設定都集中在 setting 資料夾:config.json、簽名、字型、圖片,和各功能的設定檔(專有名詞、修正錯字…)
 IMAGES_DIR = APP_DIR / SETTING_NAME / "images"
 FONTS_DIR = APP_DIR / SETTING_NAME / "fonts"
-OUTPUT_DIR = APP_DIR / "output"
+# 輸出位置:預設是程式旁邊的 output;設定裡打開「輸出到文件」時換成 documents_output()(由主程式切換)
+DEFAULT_OUTPUT_DIR = APP_DIR / "output"
+OUTPUT_DIR = DEFAULT_OUTPUT_DIR
 PLUGINS_DIR = BUNDLE_DIR / "plugins"
 DEV_DIR = APP_DIR / "dev"
 # 擴充模組:別人寫的或另外下載的工具,放進 exe 旁邊的 mods 資料夾就會出現在首頁
 MODS_DIR = APP_DIR / "mods"
 BIN_DIR = APP_DIR / "bin"
 MODELS_DIR = APP_DIR / "models"
+
+
+def documents_output():
+    """「文件」資料夾裡的 Naiz Studio(文件被 OneDrive 接管時也找得到);找不到回傳 None。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(260)
+        if ctypes.windll.shell32.SHGetFolderPathW(None, 0x05, None, 0, buffer) != 0:     # CSIDL_PERSONAL
+            return None
+        return Path(buffer.value) / "Naiz Studio"
+    except (OSError, AttributeError):
+        return None
 
 
 def __getattr__(name):

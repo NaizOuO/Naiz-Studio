@@ -381,29 +381,11 @@ def _description(path):
     return name
 
 
-def _window_pids():
-    """有開著(看得到、有標題)視窗的程式。"""
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
-    pids = set()
-    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-    def visit(hwnd, _):
-        if user32.IsWindowVisible(hwnd) and user32.GetWindowTextLengthW(hwnd) > 0 \
-                and not user32.GetWindow(hwnd, 4):                               # 不算附屬在別的視窗下的
-            pid = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, byref(pid))
-            pids.add(pid.value)
-        return True
-
-    user32.EnumWindows(callback_type(visit), 0)
-    return pids
-
-
 def audio_programs():
     """可以單獨抓聲音的程式:[(pid, 名稱)],正在播放的排前面、名稱後面標「播放中」。
-    除了正在播放的,也列出出過聲音(現在安靜)的程式和開著視窗的程式:選了之後它一出聲就抓得到
-    (沒有聲音的程式本來就抓不到東西,不會出錯)。pid 是同一個程式最上層的那個(瀏覽器會開很多子程式,一起抓)。
-    要在背景執行緒呼叫。"""
+    除了正在播放的,也列出出過聲音、現在安靜的程式(例如影片暫停中的瀏覽器),選了之後它一出聲就抓得到;
+    只開著視窗、從沒出過聲音的程式不列(記事本、相片這類,列出來只會讓清單太長)。
+    pid 是同一個程式最上層的那個(瀏覽器會開很多子程式,一起抓)。要在背景執行緒呼叫。"""
     _init_thread()
     enumerator = comtypes.CoCreateInstance(CLSID_ENUMERATOR, IMMDeviceEnumerator, CLSCTX_ALL)
     device = enumerator.GetDefaultAudioEndpoint(0, E_CONSOLE)                  # 預設的播放裝置
@@ -419,11 +401,6 @@ def audio_programs():
         state = control.GetState()
         if pid and state != SESSION_EXPIRED:
             candidates[pid] = candidates.get(pid, False) or state == SESSION_ACTIVE
-    try:
-        for pid in _window_pids():
-            candidates.setdefault(pid, False)
-    except OSError:
-        pass
     found = {}
     for pid, playing in candidates.items():
         if pid == own or pid not in processes:

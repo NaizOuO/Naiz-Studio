@@ -68,6 +68,7 @@ class App:
         self.clock = pygame.time.Clock()
 
         self.config = theme.load_config(str(paths.SETTING_DIR))
+        self.apply_output_location()
         self.background = None
         self.rebuild_background()
         self.dev_mode = bool(self.config.get("dev_mode", False))
@@ -112,9 +113,10 @@ class App:
         self.home_view = ScrollView(indicator=True)     # 工具變多、視窗矮時首頁可以捲動
         self.reload_tools()
         tempclean.start()   # 插件載入後才開始,插件登記的暫存資料夾才算得進去
-        # 檢查更新:只有 exe 版會檢查(從原始碼執行的人用 git 更新);在背景進行,不會拖慢開啟
+        # 檢查更新:只有 exe 版會自動檢查(從原始碼執行的人用 git 更新),設定裡可以關掉;在背景進行,不會拖慢開啟
         updater.cleanup()
-        self.update_check = updater.Checker().start() if updater.can_self_update() else None
+        auto_check = updater.can_self_update() and self.config.get("update_check", True)
+        self.update_check = updater.Checker().start() if auto_check else None
         self.update_info = None         # 有新版本時的資訊(版本、說明、下載位置)
         self.update_job = None          # 正在下載或已換好的更新
         self.update_prompted = False    # 這次開啟已經跳過通知
@@ -418,6 +420,15 @@ class App:
         note = f"需要主程式 v{tool.min_app.lstrip('vV')} 以上才能使用，目前是 v{version.VERSION}"
         for row, line in enumerate(widgets.wrap_text(note, 13, card.width - 36, max_lines=3)):
             draw_text(self.screen, line, (card.x + 18, card.y + 54 + row * 19), 13, theme.WARN)
+
+    def apply_output_location(self):
+        """依設定把輸出位置換成「文件\\Naiz Studio」或程式旁邊的 output。
+        測試等程式自己改過輸出位置時不動它。"""
+        documents = paths.documents_output()
+        if paths.OUTPUT_DIR not in (paths.DEFAULT_OUTPUT_DIR, documents):
+            return
+        use_documents = bool(self.config.get("output_documents")) and documents is not None
+        paths.OUTPUT_DIR = documents if use_documents else paths.DEFAULT_OUTPUT_DIR
 
     def open_output_folder(self):
         try:

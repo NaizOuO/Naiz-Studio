@@ -97,6 +97,7 @@ class Checker:
 
     def __init__(self, fetch=None, fetch_all=None):
         self.result = None
+        self.error = False              # 連不上 GitHub
         self.done = False
         self._fetch = fetch or (lambda: _get_json(LATEST_URL))
         self._fetch_all = fetch_all or (lambda: _get_json(RELEASES_URL))
@@ -110,6 +111,7 @@ class Checker:
             self.result = parse_release(self._fetch())
         except Exception:
             self.result = None      # 沒網路、GitHub 暫時連不上:安靜略過,下次開啟再檢查
+            self.error = True
         if self.result and can_self_update():
             try:
                 self.result["patches"] = plan_patches(self._fetch_all(), version.VERSION, self.result["tag"],

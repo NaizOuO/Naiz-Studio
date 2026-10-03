@@ -427,6 +427,9 @@ class Dropdown:
     # ------------------------------------------------------------ 事件
 
     def handle(self, event, pos) -> bool:
+        # 滾一下滾輪,pygame 除了 MOUSEWHEEL 還會送按下第 4/5 鍵的舊式事件:不是點擊,不能把清單收起來
+        if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP) and event.button in (4, 5):
+            return self.is_open and self._menu.collidepoint(pos)
         if not self.is_open:
             if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self.enabled
                     and self.rect.collidepoint(pos)):
@@ -436,8 +439,11 @@ class Dropdown:
                 return True
             return False
         if event.type == pygame.MOUSEWHEEL:
-            self.scroll = max(0, min(self.scroll - event.y, self._max_scroll()))
-            return True
+            if self._menu.collidepoint(pos):
+                self.scroll = max(0, min(self.scroll - event.y, self._max_scroll()))
+                return True
+            self.close()            # 在清單外面滾:收起清單,讓滑鼠底下的東西照常捲動
+            return False
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
             self.close()
             return True
@@ -589,6 +595,9 @@ class TextInput:
 
     def blur(self):
         self._dragging = False
+        if self.composition and self.focused:
+            # 輸入法還在選字時就點了別的地方(例如直接按「新增」):畫面上看到的字先送進去,不要丟掉
+            self._insert(self.composition)
         self.composition = ""
         if self.focused:
             self.focused = False

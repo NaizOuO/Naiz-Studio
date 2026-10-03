@@ -1,5 +1,6 @@
 comtypes
 fonttools
+fugashi
 numpy
 opencc-python-reimplemented
 pikepdf

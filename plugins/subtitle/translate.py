@@ -28,8 +28,9 @@ TARGETS = [("zh-TW", "台灣繁體中文", "Traditional Chinese (Taiwan)", "zh-T
 TARGET_NAMES = {key: name for key, name, _, _ in TARGETS}
 SOURCE_NAMES = {"en": "English", "ja": "Japanese", "ko": "Korean", "zh": "Chinese", "es": "Spanish", "fr": "French",
                 "de": "German", "ru": "Russian", "th": "Thai", "vi": "Vietnamese"}
-# 實測翻譯很差的模型(名稱含這些字):選單上標「不建議」,選了會提醒
-NOT_RECOMMENDED = {"llama3-taide": "翻出來常和原文無關", "llama-3-taiwan": "日文常翻錯"}
+# 實測翻譯很差的模型(名稱含這些字):模型清單上標「不建議」並寫出原因,選了會提醒
+NOT_RECOMMENDED = {"llama3-taide": "作者實測拉爆了，完全不行拿來翻譯（為台灣的中文模型，不擅長翻譯）",
+                   "llama-3-taiwan": "實測日文常翻錯，意思和原文不同"}
 
 
 def not_recommended(name):
@@ -37,13 +38,18 @@ def not_recommended(name):
     return next((reason for key, reason in NOT_RECOMMENDED.items() if key in name), "")
 
 
-# 建議下載的模型:(名稱, 大小, 大約需要的顯示卡記憶體 GB, 說明);依電腦配備標出建議
+# 建議下載的模型:(名稱, 大小, 大約需要的顯示卡記憶體 GB, 說明);依電腦配備標出建議。
+# 需要的記憶體 = 模型檔案加上翻譯時的暫存;不夠時 Ollama 會把一部分放到一般記憶體,可以用但會慢很多
 SUGGESTED = [
-    ("translategemma:4b", "3.3 GB", 4, "Google 的翻譯專用模型；沒有獨立顯示卡也能用(每句約 2～3 秒)"),
-    ("qwen3:8b", "5.2 GB", 7, "預設；速度和品質平衡，需要約 7 GB 顯示卡記憶體"),
-    ("qwen3:14b", "9.3 GB", 11, "品質最好；需要約 11 GB 顯示卡記憶體"),
-    ("translategemma:12b", "8.1 GB", 10, "翻譯專用的大型版本；需要約 10 GB 顯示卡記憶體"),
+    ("translategemma:4b", "3.3 GB", 4, "Google 的翻譯專用模型；沒有獨立顯示卡也能用，只用處理器每句約 2～3 秒"),
+    ("qwen3:8b", "5.2 GB", 7, "速度和品質平衡，有顯示卡的電腦大多選這個；每句約 0.2～0.4 秒"),
+    ("translategemma:12b", "8.1 GB", 10, "翻譯專用的中型版本，比 4b 自然"),
+    ("qwen3:14b", "9.3 GB", 11, "實測品質最好，速度還跟得上字幕；每句約 0.4～0.8 秒"),
+    ("translategemma:27b", "17 GB", 20, "翻譯專用的最大版本，用字最講究"),
+    ("qwen3:30b", "19 GB", 22, "「混合專家」架構，每次只動用一小部分，所以同大小裡最快"),
+    ("qwen3:32b", "20 GB", 24, "最大最準確，但也最慢；講話快的時候字幕可能跟不上"),
 ]
+HIGH_END = 16       # 需要這麼多顯示卡記憶體以上的模型標「需要高階電腦」
 _THINK = re.compile(r"<think>.*?(</think>|$)", re.S)
 # 模型多給的「其他翻法」從這裡開始整段不要(translategemma:12b 常在後面加「或者：」)
 _ALTERNATIVE = re.compile(r"\n\s*(?:或者|或是|也可以|另一種|又或|(?:Or|Alternatively|Another option)\s*[:：,，]).*",
@@ -128,6 +134,14 @@ def pull(name, progress=None, cancel=None):
 def preload(name):
     """先把模型載入顯示卡(第一次 3～45 秒),開始字幕後才不會卡一下。"""
     with _post("/api/generate", {"model": name, "keep_alive": "30m", "prompt": ""}, timeout=300) as response:
+        response.read()
+
+
+def delete(name):
+    """刪掉 Ollama 裡的模型(空出硬碟空間)。"""
+    request = urllib.request.Request(host() + "/api/delete", data=json.dumps({"model": name}).encode(),
+                                     headers={"Content-Type": "application/json"}, method="DELETE")
+    with urllib.request.urlopen(request, timeout=30) as response:
         response.read()
 
 

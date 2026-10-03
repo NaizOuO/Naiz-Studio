@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parent
 NAME = "Naiz Studio"
 # 插件是執行時才從資料夾讀入,PyInstaller 看不到它們用了哪些套件,要自己列出來
 EXTRA_IMPORTS = ["pypdfium2", "resvg_py", "pikepdf", "opencc", "pillow_heif", "vtracer", "queue", "compression.zstd",
-                 "comtypes"]
+                 "comtypes", "fugashi", "shlex"]        # shlex:fugashi 的編譯模組裡用到,PyInstaller 看不到
 # 主程式沒用到、但擴充模組可能會用的內建模組;不列出來的話 exe 裡沒有,模組 import 會失敗
 STDLIB_FOR_MODS = ["sqlite3", "configparser", "tomllib", "shelve", "dbm", "wave", "sched", "csv",
                    "http.server", "xml.dom.minidom", "statistics", "fractions", "difflib", "calendar"]
@@ -33,6 +33,23 @@ EXCLUDE = ["tkinter", "pymupdf", "fitz", "scipy", "matplotlib", "mpl_toolkits", 
 COLLECT = ["core", "PIL", "fontTools", "comtypes"]     # comtypes:即時字幕擷取聲音
 # python-docx 會讀自己附的範本檔,資料檔要一起收進去
 COLLECT_DATA = ["docx"]
+# 用 delvewheel 打包的套件:DLL 放在套件旁邊的「套件名.libs」,啟動時從那裡載入(fugashi:即時字幕的振假名)
+DELVEWHEEL = ["fugashi"]
+
+
+def delvewheel_binaries():
+    """[(DLL 的路徑樣式, exe 裡的資料夾)]"""
+    import importlib.util
+
+    result = []
+    for package in DELVEWHEEL:
+        spec = importlib.util.find_spec(package)
+        if spec is None or not spec.submodule_search_locations:
+            sys.exit(f"找不到 {package},請先 pip install {package}")
+        libs = Path(next(iter(spec.submodule_search_locations))).parent / f"{package}.libs"
+        if libs.is_dir():
+            result.append((str(libs / "*.dll"), f"{package}.libs"))
+    return result
 
 
 def plugin_modules():
@@ -101,6 +118,8 @@ def pyinstaller_args(script, name, windowed=True, workdir=None, version=None):
         args += ["--collect-submodules", package]
     for package in COLLECT_DATA:
         args += ["--collect-data", package]
+    for pattern, folder in delvewheel_binaries():
+        args += ["--add-binary", f"{pattern};{folder}"]
     if workdir is not None:
         workdir = Path(workdir)
         args += ["--distpath", str(workdir / "dist"), "--workpath", str(workdir / "build"),
