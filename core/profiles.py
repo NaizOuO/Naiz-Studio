@@ -9,7 +9,7 @@ import json
 import re
 from pathlib import Path
 
-from . import paths
+from . import files, paths
 
 _BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -54,15 +54,25 @@ class ProfileStore:
         (不會刪其他檔案:程式開著時才放進資料夾、還沒讀進來的設定檔不能被當成刪掉)"""
         folder = self.ensure_folder()
         for name, items in profiles.items():
-            path = folder / (self._files.get(name) or f"{self.file_stem(name)}.json")
+            path = folder / self._files[name] if name in self._files else self._free_path(folder, name)
             self._files[name] = path.name
             data = {"名稱": name, "說明": self.note, "內容": items}
-            path.write_text(json.dumps(data, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+            # 先寫暫存檔再換掉:寫到一半程式被關掉,原本的設定檔也不會壞掉
+            files.write_bytes(path, (json.dumps(data, ensure_ascii=False, indent=1) + "\n").encode("utf-8"))
         for name in removed:
             if name in profiles:
                 continue
-            filename = self._files.pop(name, None) or f"{self.file_stem(name)}.json"
-            (folder / filename).unlink(missing_ok=True)
+            filename = self._files.pop(name, None)      # 只刪讀進來或寫過的那個檔,不用猜的檔名
+            if filename:
+                (folder / filename).unlink(missing_ok=True)
+
+    def _free_path(self, folder, name):
+        """新設定檔的檔名;已經有同名的檔案(例如內容讀不懂、沒載入的)就加編號,不會蓋掉它。"""
+        stem = self.file_stem(name)
+        path, number = folder / f"{stem}.json", 2
+        while path.exists():
+            path, number = folder / f"{stem} ({number}).json", number + 1
+        return path
 
     @staticmethod
     def file_stem(name):

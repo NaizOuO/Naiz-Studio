@@ -43,7 +43,11 @@ def load():
             known = {rule["wrong"].lower() for rule in target}
             target += [rule for rule in old if rule["wrong"].lower() not in known]
             data["active"] = DEFAULT_NAME
-        save(data)          # config.json 裡的舊規則拿掉,刪掉「預設」後才不會又搬回來
+        # 設定檔寫好後才把 config.json 裡的舊規則拿掉(刪掉「預設」後才不會又搬回來);寫不進去就保留舊規則,下次再搬
+        try:
+            save(data)
+        except OSError:
+            pass
     if data["active"] not in profiles:
         data["active"] = next(iter(profiles), "")
     return data

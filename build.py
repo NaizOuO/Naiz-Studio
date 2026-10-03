@@ -119,12 +119,12 @@ def release_files():
 PATCH_MAX_RATIO = 0.5       # 補丁超過完整版的一半就不做,直接下載完整版比較單純
 
 
-def previous_release(current):
-    """dist 裡比 current 舊、版本最新的發布 zip;(版本, 路徑) 或 None。"""
+def previous_release(current, folder=None):
+    """folder(預設 dist)裡比 current 舊、版本最新的發布 zip;(版本, 路徑) 或 None。"""
     from core.version import parse
 
     found = []
-    for archive in (ROOT / "dist").glob(f"{NAME} v*.zip"):
+    for archive in (folder or ROOT / "dist").glob(f"{NAME} v*.zip"):
         tag = archive.stem[len(NAME) + 1:]
         if parse(tag) != (0,) and parse(tag) < parse(current):
             found.append((parse(tag), tag, archive))
@@ -132,7 +132,8 @@ def previous_release(current):
 
 
 def make_patch(current, archive):
-    """做出從上一版升級到 current 的補丁:新舊 exe 的差異,加上有改過的隨附檔案。"""
+    """做出從上一版升級到 current 的補丁:新舊 exe 的差異,加上有改過的隨附檔案。
+    上一版的 zip 在 archive 同一個資料夾找,補丁也放在那裡(平常是 dist)。"""
     import hashlib
     import json
     import subprocess
@@ -140,9 +141,9 @@ def make_patch(current, archive):
 
     from core.updater import patch_name
 
-    previous = previous_release(current)
+    previous = previous_release(current, Path(archive).parent)
     if previous is None:
-        print("dist 裡沒有上一版的 zip,不做補丁")
+        print(f"{Path(archive).parent} 裡沒有上一版的 zip,不做補丁")
         return None
     old_tag, old_archive = previous
     zstd = shutil.which("zstd")
@@ -164,7 +165,7 @@ def make_patch(current, archive):
         subprocess.run([zstd, "-q", "-f", "-19", "--long=27", f"--patch-from={temp / 'old.exe'}",
                         str(temp / "new.exe"), "-o", str(temp / "exe.zst")], check=True)
         diff = (temp / "exe.zst").read_bytes()
-    patch = ROOT / "dist" / patch_name(old_tag, current)
+    patch = Path(archive).parent / patch_name(old_tag, current)
     manifest = dict(from_tag=old_tag, to_tag=current, from_sha256=hashlib.sha256(old_exe).hexdigest(),
                     to_sha256=hashlib.sha256(new_exe).hexdigest())
     with zipfile.ZipFile(patch, "w", zipfile.ZIP_DEFLATED) as zf:

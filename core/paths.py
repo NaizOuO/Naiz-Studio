@@ -1,5 +1,6 @@
 """程式用到的資料夾位置。"""
 
+import json
 import os
 import shutil
 import sys
@@ -35,24 +36,65 @@ def __getattr__(name):
     raise AttributeError(name)
 
 
-# v1.18.0 以前放在程式資料夾裡的東西,搬進 setting 資料夾
-LEGACY_FOLDERS = ("images", "fonts", "signatures")
-UI_ASSET = ("app_icon.", "ui_")
+# v1.18.0 以前放在程式資料夾裡的東西,搬進 setting 資料夾。
+# 只搬確定是 Naiz Studio 留下的(exe 可能被放在桌面、下載這類資料夾,旁邊剛好有使用者自己的 images、fonts…):
+# config.json 要有 Naiz Studio 的設定鍵;images 裡要有程式附的圖示;fonts 只搬程式建立的那幾項;signatures 只搬「簽名_*.png」
+SHIPPED_IMAGES = ("app_icon.png", "app_icon.ico", "ui_autoscroll.png", "ui_gear.png", "ui_link_on.png", "ui_link_off.png")
+LEGACY_FONTS = ("downloads", "custom", "pdf", "recent.json", "system_fonts.json")
+CONFIG_KEYS = ("bg_mode", "bg_image")
 
 
 def migrate_legacy():
-    """舊版的 config.json、images、fonts、signatures 搬進 setting;已經有同名檔案的不覆蓋。
-    搬不動(例如檔案正被開著)就留在原處,下次啟動再搬。"""
+    """舊版的設定、圖片、字型、簽名搬進 setting。不刪也不覆蓋使用者的檔案:
+    同名時新的留在 setting、舊的留在原處;搬不動(例如檔案正被開著)也留在原處,下次啟動再搬。"""
     setting = APP_DIR / SETTING_NAME
-    for path in [APP_DIR / "config.json", *APP_DIR.glob("config.bak*.json")]:
-        target = setting / path.name
-        # 兩邊都有時留比較新的(例如更新後舊版還開著,關掉時又把設定寫回舊位置)
-        if path.is_file() and (not target.exists() or path.stat().st_mtime > target.stat().st_mtime):
+    config = APP_DIR / "config.json"
+    ours = _is_our_config(config)
+    if ours:
+        target = setting / "config.json"
+        # 兩邊都有時用比較新的(例如更新後舊版還開著,關掉時又把設定寫回舊位置);被換掉的那份另存備份
+        if not target.exists():
+            _move(config, target)
+        elif config.stat().st_mtime > target.stat().st_mtime:
+            _move(target, _free(setting, "config.bak", ".json"))
+            _move(config, target)
+    images = APP_DIR / "images"
+    shipped = images.is_dir() and any((images / name).is_file() for name in SHIPPED_IMAGES)
+    if ours or shipped:
+        for bak in APP_DIR.glob("config.bak*.json"):        # 設定壞掉時程式留的備份
+            _move(bak, _free(setting, bak.stem, ".json"))
+    if shipped:
+        _merge(images, setting / "images", drop=SHIPPED_IMAGES)
+    fonts = APP_DIR / "fonts"
+    for name in LEGACY_FONTS if fonts.is_dir() else ():
+        source, target = fonts / name, setting / "fonts" / name
+        if source.is_dir():
+            _merge(source, target)
+        elif source.is_file() and not target.exists():
+            _move(source, target)
+    _remove_empty(fonts)
+    signatures = APP_DIR / "signatures"
+    for path in signatures.glob("簽名_*.png") if signatures.is_dir() else ():
+        target = setting / "signatures" / path.name
+        if not target.exists():
             _move(path, target)
-    for name in LEGACY_FOLDERS:
-        old = APP_DIR / name
-        if old.is_dir():
-            _merge(old, setting / name, drop_assets=(name == "images"))
+    _remove_empty(signatures)
+
+
+def _is_our_config(path):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and any(key in data for key in CONFIG_KEYS)
+
+
+def _free(folder, stem, suffix):
+    """folder 裡沒被用過的檔名:stem.json、stem (2).json…"""
+    path, number = folder / f"{stem}{suffix}", 2
+    while path.exists():
+        path, number = folder / f"{stem} ({number}){suffix}", number + 1
+    return path
 
 
 def _move(source, target):
@@ -63,9 +105,9 @@ def _move(source, target):
         pass
 
 
-def _merge(old, new, drop_assets=False):
-    """old 資料夾的內容搬進 new;new 已經有的檔案保留新的。
-    drop_assets:舊的介面圖片(更新時已經放進新位置了)直接刪掉。"""
+def _merge(old, new, drop=()):
+    """old 資料夾的內容搬進 new;new 已經有同名檔案時兩邊都保留(舊的留在原處)。
+    drop:程式附的檔案,新位置已經有新版的,舊的直接刪掉(只限這幾個檔名)。"""
     if not new.exists():
         try:
             new.parent.mkdir(parents=True, exist_ok=True)
@@ -78,7 +120,7 @@ def _merge(old, new, drop_assets=False):
         if path.is_file():
             if not target.exists():
                 _move(path, target)
-            elif drop_assets and path.parent == old and path.name.lower().startswith(UI_ASSET):
+            elif path.parent == old and path.name in drop:
                 try:
                     path.unlink()
                 except OSError:
