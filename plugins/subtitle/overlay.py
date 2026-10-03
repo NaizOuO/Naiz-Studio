@@ -21,7 +21,9 @@ import threading
 STYLE = {"size": 34, "opacity": 60, "mode": "both", "x": None, "y": None, "color": [255, 255, 255],
          "bg": [12, 14, 18], "outline": 2, "outline_color": [0, 0, 0], "align": "center",
          "font": "", "font_name": "微軟正黑體", "font_path": "", "font_index": 0,
-         "fallback_path": "", "fallback_index": 0}      # 缺字時補字的字型(和 PDF 編輯器一樣)
+         "fallback_path": "", "fallback_index": 0,      # 缺字時補字的字型(和 PDF 編輯器一樣)
+         "count": 2, "fade": 8, "size_original": 20}     # 畫面上最多幾句;講完幾秒沒人說話就淡出(0 是一直顯示)
+FADE_TIME = 0.8             # 淡出花的秒數
 MODES = [("translation", "只顯示翻譯"), ("both", "原文和翻譯"), ("original", "只顯示原文")]
 ALIGNS = [("left", "靠左"), ("center", "置中"), ("right", "靠右")]
 FONTS_DIR = os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts")
@@ -122,8 +124,8 @@ class Overlay:
         self.send({"type": "style", **style})
 
     def lines(self, items):
-        """items:[(原文, 翻譯, 是否定稿)]"""
-        self.send({"type": "lines", "lines": [{"o": o, "t": t, "f": f} for o, t, f in items]})
+        """items:[(原文, 翻譯, 是否定稿, 講完幾秒了)];還在講的那句最後一項是 None。"""
+        self.send({"type": "lines", "lines": [{"o": o, "t": t, "f": f, "i": i} for o, t, f, i in items]})
 
     def adjust(self, on):
         self.send({"type": "adjust", "on": bool(on)})
@@ -266,7 +268,8 @@ class Painter:
         from PIL import Image, ImageDraw
 
         big = max(10, int(style.get("size", 34)))
-        small = max(10, int(big * 0.6))
+        # 原文和翻譯一起顯示時原文用自己的大小;只顯示原文時原文就是主要的字,用大字
+        small = max(10, int(style.get("size_original") or big * 0.6))
         outline = max(0, int(style.get("outline", 2)))
         color = tuple(style.get("color") or (255, 255, 255))
         dim = tuple(int(c * 0.82) for c in color)
@@ -275,13 +278,16 @@ class Painter:
         inner = band_width - 48 - outline * 2
         blocks = []
         shown = lines or ([{"o": "字幕會顯示在這裡", "t": "拖曳這個框移動位置", "f": True}] if adjusting else [])
-        for item in shown[-2:]:
+        for item in shown[-max(1, int(style.get("count", 2))):]:
             rows = []
             final = item.get("f", True)
             # 整句先判斷是哪種文字,換行後每一行都用同一套字型(只有一行有假名時字型才不會不一致)
             o_style = dict(style, script=_script(item.get("o") or ""))
             t_style = dict(style, script=_script(item.get("t") or ""))
-            if mode in ("both", "original") and item.get("o"):
+            if mode == "original" and item.get("o"):
+                rows += [(row, big, color if final else dim, o_style)
+                         for row in self._wrap(item["o"], o_style, big, inner)]
+            if mode == "both" and item.get("o"):
                 rows += [(row, small, dim, o_style) for row in self._wrap(item["o"], o_style, small, inner)]
             if mode in ("both", "translation") and item.get("t"):
                 rows += [(row, big, color if final else dim, t_style)
@@ -289,34 +295,39 @@ class Painter:
             if mode == "translation" and not item.get("t") and item.get("o"):
                 rows += [(row, small, dim, o_style) for row in self._wrap(item["o"], o_style, small, inner)]
             if rows:
-                blocks.append(rows)
+                blocks.append((rows, float(item.get("a", 1.0))))
         if not blocks and not adjusting:
             return None
         gap, pad_x, pad_y = 10, 20, 10
-        heights = [sum(int(size * 1.35) for _, size, _, _ in rows) + pad_y * 2 for rows in blocks]
+        heights = [sum(int(size * 1.35) for _, size, _, _ in rows) + pad_y * 2 for rows, _ in blocks]
         height = max(sum(heights) + gap * max(0, len(blocks) - 1), big * 2)
         image = Image.new("RGBA", (band_width, height + 4), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
         bg = tuple(style.get("bg") or (12, 14, 18)) + (int(255 * style.get("opacity", 60) / 100),)
         align = style.get("align", "center")
         y = 0
-        for rows, block_h in zip(blocks, heights):
+        for (rows, alpha), block_h in zip(blocks, heights):
             widths = [self._width(self._runs(text, row_style, size)) + outline * 2
                       for text, size, _, row_style in rows]
             block_w = int(max(widths)) + pad_x * 2
             left = {"left": 0, "right": band_width - block_w}.get(align, (band_width - block_w) // 2)
+            # 每一句畫在自己的一層,淡出時整層一起變透明(底色、字、外框一起淡)
+            layer = Image.new("RGBA", (block_w, block_h), (0, 0, 0, 0))
+            pen = ImageDraw.Draw(layer)
             if bg[3]:
-                draw.rounded_rectangle((left, y, left + block_w, y + block_h), radius=12, fill=bg)
-            row_y = y + pad_y
+                pen.rounded_rectangle((0, 0, block_w - 1, block_h - 1), radius=12, fill=bg)
+            row_y = pad_y
             for (text, size, fill, row_style), row_w in zip(rows, widths):
-                x = {"left": left + pad_x, "right": left + block_w - pad_x - row_w}.get(
-                    align, left + (block_w - row_w) / 2)
+                x = {"left": pad_x, "right": block_w - pad_x - row_w}.get(align, (block_w - row_w) / 2)
                 x += outline
                 for font, part in self._runs(text, row_style, size):
-                    draw.text((x, row_y + outline), part, font=font, fill=fill + (255,),
-                              stroke_width=outline, stroke_fill=edge + (255,))
+                    pen.text((x, row_y + outline), part, font=font, fill=fill + (255,),
+                             stroke_width=outline, stroke_fill=edge + (255,))
                     x += font.getlength(part)
                 row_y += int(size * 1.35)
+            if alpha < 1:
+                layer.putalpha(layer.getchannel("A").point(lambda v, a=alpha: int(v * a)))
+            image.alpha_composite(layer, (int(left), y))
             y += block_h + gap
         if adjusting:
             # 調整位置:只畫虛線框和說明,字幕本身不變色
@@ -334,6 +345,23 @@ class Painter:
 
 
 # ------------------------------------------------------------ 字幕視窗程式
+
+def fading(lines, style, elapsed):
+    """依「講完幾秒了」算每句的透明度:超過設定的秒數後在 FADE_TIME 秒內淡出,淡完就不顯示。
+    lines 裡每句的 i 是送來時已經講完幾秒(還在講的是 None);elapsed 是送來之後又過了幾秒。"""
+    fade = float(style.get("fade") or 0)
+    result = []
+    for item in lines:
+        idle = item.get("i")
+        alpha = 1.0
+        if fade > 0 and idle is not None:
+            over = idle + elapsed - fade
+            if over > 0:
+                alpha = round(max(0.0, 1 - over / FADE_TIME), 2)
+        if alpha > 0:
+            result.append(dict(item, a=alpha) if alpha < 1 else item)
+    return result
+
 
 def run(port, token, mouse=None):
     """字幕視窗程式的進入點;出錯時寫進 subtitle_error.log(這個程式沒有畫面可以顯示錯誤)。
@@ -462,6 +490,7 @@ def _run(port, token, mouse=None):
     style = dict(STYLE)
     painter = Painter()
     lines = []
+    received = time.monotonic()         # 收到這批字幕的時間:「講完幾秒了」從這裡繼續算
     adjusting = False
     drag = None
     last_key = None
@@ -492,6 +521,7 @@ def _run(port, token, mouse=None):
                 closed.set()
             elif kind == "lines":
                 lines = message["lines"]
+                received = time.monotonic()
             elif kind == "style":
                 moved = (message.get("x"), message.get("y")) != (style.get("x"), style.get("y"))
                 style.update({k: v for k, v in message.items() if k in STYLE})
@@ -520,10 +550,12 @@ def _run(port, token, mouse=None):
                 drag = None
             if drag is not None:
                 anchor = [x - drag[0], y - drag[1]]
-        key = (json.dumps(lines, ensure_ascii=False), json.dumps(style, ensure_ascii=False), adjusting, tuple(anchor))
+        visible = fading(lines, style, time.monotonic() - received)
+        key = (json.dumps(visible, ensure_ascii=False), json.dumps(style, ensure_ascii=False), adjusting,
+               tuple(anchor))
         if key != last_key:
             last_key = key
-            image = painter.paint(lines, style, band_width, adjusting) or Image.new("RGBA", (1, 1))
+            image = painter.paint(visible, style, band_width, adjusting) or Image.new("RGBA", (1, 1))
             size = image.size
             present(image, anchor[0] - size[0] // 2, anchor[1] - size[1])
         time.sleep(1 / 60 if drag is not None else 1 / 30)

@@ -1,5 +1,5 @@
 """圖片編輯視窗:在預覽上拖曳裁切框、旋轉、翻轉、四點校正。細調時畫面分成四格,各自放大裁切框的一個角;
-四點校正時拖曳四個角對準文件邊緣,旁邊有放大鏡;動畫可以播放預覽。"""
+四點校正時拖曳四個角對準文件邊緣,右邊設定區下方有放大鏡;動畫可以播放預覽。"""
 
 import math
 import threading
@@ -33,9 +33,15 @@ FILL_OPTIONS = [("clear", "透明"), ("white", "白色"), ("black", "黑色")]
 FILL_PREVIEW = {"white": (255, 255, 255), "black": (0, 0, 0)}
 IMAGE_EDGE = (150, 158, 173)   # 擴展畫布時原圖範圍的細框
 WARP_GRAB = 16        # 四點校正時滑鼠離角多近算是抓到
-LOUPE = 170           # 四點校正放大鏡的邊長
+LOUPE = 170           # 四點校正放大鏡的邊長(設定區下方空間夠大時放大到 LOUPE_MAX)
+LOUPE_MAX = 260
+LOUPE_SIDE_MIN = 120   # 設定區留的位置至少有這麼大才放進去,不然放在畫面角落
 LOUPE_ZOOM = 4
-WARP_HINT = "四點校正：拖曳四個角對準拍斜的文件、白板或畫面的邊緣，會拉正成長方形；滑鼠停在角上可用方向鍵逐像素移動；Enter 套用、Esc 取消"
+# 放大鏡的倍數是「比畫面上的圖大幾倍」(大照片在畫面上縮很小,照原圖像素算的話放大鏡只看得到一小片);
+# 滾滾輪可以換,最多放到原圖 1 像素 = 螢幕 LOUPE_PIXEL_MAX 像素
+LOUPE_ZOOMS = (2, 3, 4, 6, 8, 12, 16, 24, 32)
+LOUPE_PIXEL_MAX = 12
+WARP_HINT = "四點校正：拖曳四個角對準文件的邊緣；點選的角會在右邊放大，拖曳放大圖裡的圖片或按方向鍵微調；Enter 套用、Esc 取消"
 
 _checker = None
 _icons = {}
@@ -121,6 +127,12 @@ class ImageEditor:
         self.warping = False     # 四點校正模式:畫面顯示校正前的圖和四個角
         self.warp_points = None  # 校正模式中正在調整的四個角(比例座標)
         self.warp_hover = None
+        self.warp_selected = None     # 點選過的角:滑鼠離開後放大鏡還是顯示它,方向鍵也移動它
+        self.loupe_zoom = LOUPE_ZOOM
+        self._loupe_index = None      # 上一幀放大鏡顯示的是第幾個角
+        self._loupe_slot = None       # 設定區留給放大鏡的位置(調整模式校正時,裁切那一區)
+        self.loupe_block = None       # 放大鏡佔住的範圍:點在這裡不會點到底下的設定
+        self._crop_section_h = 260    # 裁切那一區的高度,校正時同樣高度留給放大鏡(版面才不會跳)
         self.locked = False
         self.lock_ratio = None   # 固定比例時的寬高比(像素)
         self.expand = False      # 擴展畫布:裁切框可以拉到圖片外,多出的部分補空白
@@ -128,6 +140,8 @@ class ImageEditor:
         self.drag = None
         self._views = {}
         self._scaled = None
+        self.loupe_rect = None       # 上一幀放大鏡畫在哪(測試用)
+        self._loupe = None           # 這一幀要畫的放大鏡:(畫面範圍, 第幾個角),等設定區畫完再畫
         self.canvas = pygame.Rect(0, 0, 0, 0)
         self.image_rect = pygame.Rect(0, 0, 1, 1)
         self.lock_rect = pygame.Rect(0, 0, 0, 0)
@@ -166,7 +180,7 @@ class ImageEditor:
         self.frames, self.frame_index, self.playing = [], 0, False
         self.error = self.message = ""
         self.fine, self.drag = False, None
-        self.warping, self.warp_points, self.warp_hover = False, None, None
+        self.warping, self.warp_points, self.warp_hover, self.warp_selected = False, None, None, None
         self.locked, self.lock_ratio = False, None
         crop = item.edit.crop
         self.expand = bool(crop) and (crop[0] < 0 or crop[1] < 0 or crop[2] > 1 or crop[3] > 1)
@@ -240,6 +254,7 @@ class ImageEditor:
         self.fine, self.drag = False, None
         self.warping = True
         self.warp_points = list(self.edit.warp or ops.FULL_CORNERS)
+        self.warp_hover = self.warp_selected = None
 
     def _finish_warp(self):
         """離開校正模式:四個角都還在圖片的四個角上就等於沒有校正。"""
@@ -252,6 +267,7 @@ class ImageEditor:
         before = self.edit.warp
         self.edit.warp = None if unchanged else points
         self.warping, self.warp_points, self.warp_hover, self.drag = False, None, None, None
+        self.warp_selected = None
         if self.edit.warp != before:
             cleared = bool(self.edit.crop)
             self.edit.crop = None       # 校正後是另一張圖,原本的裁切範圍對不上,清掉重新框
@@ -568,6 +584,8 @@ class ImageEditor:
     # ------------------------------------------------------------ 事件
 
     def handle_event(self, event, pos):
+        if self.handle_loupe(event, pos):       # 放大鏡可能蓋在設定上,要比設定先處理
+            return
         if self.embedded:
             if self.side_view.handle_event(event, pos):
                 return
@@ -690,21 +708,24 @@ class ImageEditor:
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:       # 取消:這次拖的角都不要,回到進來之前的樣子
                 self.warping, self.warp_points, self.warp_hover, self.drag = False, None, None, None
+                self.warp_selected = None
                 self.message = ""
                 return True
             if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 self._finish_warp()
                 return True
-            if event.key in NUDGE and self.warp_hover is not None:
+            target = self.warp_hover if self.warp_hover is not None else self.warp_selected
+            if event.key in NUDGE and target is not None:
                 width, height = self._turned_size()
                 dx, dy = NUDGE[event.key]
-                x, y = self.warp_points[self.warp_hover]
-                self._move_warp(self.warp_hover, (x + dx / width, y + dy / height))
+                x, y = self.warp_points[target]
+                self._move_warp(target, (x + dx / width, y + dy / height))
                 return True
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self.canvas.collidepoint(pos):
             index = self._warp_at(pos)
             if index is not None:
                 self.drag = {"warp": index}
+                self.warp_selected = index
             return True
         if self.drag is not None and "warp" in self.drag:
             self.warp_hover = self.drag["warp"]
@@ -713,9 +734,59 @@ class ImageEditor:
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 self.drag = None
             return True
-        if event.type == pygame.MOUSEMOTION and self.canvas.collidepoint(pos):
-            self.warp_hover = self._warp_at(pos)
+        if event.type == pygame.MOUSEMOTION:
+            self.warp_hover = self._warp_at(pos) if self.canvas.collidepoint(pos) else None
         return False
+
+    def handle_loupe(self, event, pos):
+        """放大鏡裡的操作:拖曳=拉動放大鏡裡的圖片(十字固定在中間,圖片下面對到的點就是新的角)、滾輪換倍數。
+        放大鏡可能蓋在設定上,要比設定先處理;用掉事件時回傳 True。"""
+        if not self.warping:
+            return False
+        if self.drag is not None and "loupe" in self.drag:
+            if event.type == pygame.MOUSEMOTION:
+                last = self.drag["last"]
+                self._loupe_shift(self.drag["loupe"], pos[0] - last[0], pos[1] - last[1])
+                self.drag["last"] = pos
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                self.drag = None
+            return True
+        box, index = self.loupe_rect, self._loupe_index
+        if box is None or index is None or not box.collidepoint(pos):
+            block = self.loupe_block
+            return bool(block and block.collidepoint(pos)
+                        and event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP))
+        if event.type == pygame.MOUSEWHEEL:
+            zooms = self._loupe_zooms()
+            at = zooms.index(min(self.loupe_zoom, zooms[-1])) + (1 if event.y > 0 else -1)
+            self.loupe_zoom = zooms[min(max(at, 0), len(zooms) - 1)]
+            return True
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            self.warp_selected = index
+            self.drag = {"loupe": index, "last": pos}
+            return True
+        return event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP)
+
+    def _loupe_zooms(self):
+        """這張圖可以用的倍數:放到原圖 1 像素 = 螢幕 LOUPE_PIXEL_MAX 像素為止。"""
+        scale = self._display_scale()
+        return [z for z in LOUPE_ZOOMS if scale * z <= LOUPE_PIXEL_MAX] or [LOUPE_ZOOMS[0]]
+
+    def _display_scale(self):
+        """畫面上的圖 1 個螢幕像素 = 原圖幾分之一像素(校正前的圖)。"""
+        width = self._view(True, warp=False).get_width()
+        return self.image_rect.width / max(1, width)
+
+    def loupe_pixels(self):
+        """放大鏡裡原圖 1 像素佔幾個螢幕像素。"""
+        return self._display_scale() * min(self.loupe_zoom, self._loupe_zooms()[-1])
+
+    def _loupe_shift(self, index, dx, dy):
+        """放大鏡裡的圖片被拉動 (dx, dy) 個螢幕像素:十字下面換成另一個點,角往反方向移動。"""
+        width, height = self._view(True, warp=False).get_size()
+        pixels = self.loupe_pixels()
+        x, y = self.warp_points[index]
+        self._move_warp(index, (x - dx / pixels / width, y - dy / pixels / height))
 
     # ------------------------------------------------------------ 繪製
 
@@ -772,6 +843,7 @@ class ImageEditor:
         view.layout(panel.inflate(-4, -16), bottom - (side.y - view.scroll) + 8)
         view.draw(screen, mouse_pos)
         self.side_clip = side
+        self.draw_loupe(screen, side, bottom)
 
     def draw(self, mouse_pos):
         screen = self.get_screen()
@@ -791,7 +863,7 @@ class ImageEditor:
         side = pygame.Rect(panel.right - 24 - SIDE_W, panel.y + 60, SIDE_W, body_h)
         self.canvas = pygame.Rect(panel.x + 24, panel.y + 60, side.x - 20 - (panel.x + 24), body_h)
         self._draw_canvas(screen, mouse_pos)
-        self._draw_side(screen, side, mouse_pos)
+        self.draw_loupe(screen, side, self._draw_side(screen, side, mouse_pos))
 
         footer_y = panel.bottom - 56
         text, color = self.hint()
@@ -838,24 +910,53 @@ class ImageEditor:
         pygame.draw.polygon(veil, (0, 0, 0, 0), [(x - rect.x, y - rect.y) for x, y in corners])
         screen.blit(veil, rect.topleft)
         pygame.draw.polygon(screen, self.accent, corners, 2)
-        active = self.drag["warp"] if self.drag is not None and "warp" in self.drag else self.warp_hover
+        # 放大鏡顯示:正在拖的角 > 滑鼠停著的角 > 點選過的角(滑鼠移開也一直顯示,才能在放大鏡裡微調)
+        if self.drag is not None and ("warp" in self.drag or "loupe" in self.drag):
+            active = self.drag.get("warp", self.drag.get("loupe"))
+        else:
+            active = self.warp_hover if self.warp_hover is not None else self.warp_selected
         for index, (x, y) in enumerate(corners):
             radius = 9 if index == active else 7
             pygame.draw.circle(screen, theme.BG_DEEP, (x, y), radius + 2)
             pygame.draw.circle(screen, self.accent, (x, y), radius, 0 if index == active else 3)
-        if active is not None:
-            self._draw_loupe(screen, area, active, corners[active])
+        self._loupe = (area, active) if active is not None else None
 
-    def _draw_loupe(self, screen, area, index, spot):
-        """放大鏡:放在畫面四個角落裡離四個點最遠的那個,不會擋住要拖的角。"""
+    def draw_loupe(self, screen, side=None, bottom=None):
+        """四點校正的放大鏡:點選、抓著或停在角上時顯示,放在右邊設定區(side),不會擋住圖片。
+        調整模式校正時放在裁切那一區(_draw_side 留的位置);其他時候放在設定的最後一項(bottom)下面空著的地方;
+        都放不下(視窗很小)才放在畫面四個角落裡離四個點最遠的那個。要在設定區畫完之後呼叫,才不會被蓋住。"""
+        slot, self._loupe_slot = self._loupe_slot, None
+        self.loupe_rect = self._loupe_index = None
+        # 留給放大鏡的位置底下是藏起來的裁切設定,沒顯示放大鏡時也不能點到
+        self.loupe_block = slot.clip(side) if slot is not None and side is not None else slot
+        if slot is not None and side is not None and not side.contains(slot):
+            slot = None                 # 設定區捲動後留的位置看不完整:放大鏡改放別處,不畫到設定區外面
+        if not self.warping or self._loupe is None:
+            return
+        area, index = self._loupe
+        self._loupe = None
+        corners = self._warp_screen()
+        free = side.bottom - (bottom + 16) if side is not None and bottom is not None else 0
+        if slot is not None and min(slot.width, slot.height) >= LOUPE_SIDE_MIN:
+            size = min(slot.width, slot.height, LOUPE_MAX)
+            box = pygame.Rect(0, 0, size, size)
+            box.center = slot.center
+        elif free >= LOUPE_SIDE_MIN:
+            size = min(side.width, free, LOUPE_MAX)
+            box = pygame.Rect(0, 0, size, size)
+            box.midbottom = (side.centerx, side.bottom)
+        else:
+            size = LOUPE
+            spots = [pygame.Rect(left, top, LOUPE, LOUPE) for left in (area.x + 12, area.right - 12 - LOUPE)
+                     for top in (area.y + 12, area.bottom - 12 - LOUPE)]
+            box = max(spots, key=lambda r: min(math.dist(r.center, c) for c in corners))
         base = self._view(True, warp=False)
         base_w, base_h = base.get_size()
         px, py = self.warp_points[index][0] * base_w, self.warp_points[index][1] * base_h
-        corners = self._warp_screen()
-        spots = [pygame.Rect(left, top, LOUPE, LOUPE) for left in (area.x + 12, area.right - 12 - LOUPE)
-                 for top in (area.y + 12, area.bottom - 12 - LOUPE)]
-        box = max(spots, key=lambda r: min(math.dist(r.center, c) for c in corners))
-        half = LOUPE / LOUPE_ZOOM / 2
+        self.loupe_rect, self._loupe_index = box, index
+        self.loupe_block = self.loupe_block or box
+        pixels = self.loupe_pixels()
+        half = size / pixels / 2
         source = pygame.Rect(int(px - half) - 1, int(py - half) - 1, int(half * 2) + 3, int(half * 2) + 3)
         rounded_panel(screen, box.inflate(6, 6), theme.PANEL, radius=8, border=self.accent)
         clipped = source.clip(base.get_rect())
@@ -863,13 +964,17 @@ class ImageEditor:
         screen.set_clip(box)
         _blit_checker(screen, box, box.topleft)
         if clipped.width and clipped.height:
-            zoom = LOUPE / (half * 2)
-            left = round(box.centerx + (clipped.x - px) * zoom)
-            top = round(box.centery + (clipped.y - py) * zoom)
-            size = (max(1, round(clipped.width * zoom)), max(1, round(clipped.height * zoom)))
-            screen.blit(pygame.transform.scale(base.subsurface(clipped), size), (left, top))
+            left = round(box.centerx + (clipped.x - px) * pixels)
+            top = round(box.centery + (clipped.y - py) * pixels)
+            scaled = (max(1, round(clipped.width * pixels)), max(1, round(clipped.height * pixels)))
+            resize = pygame.transform.scale if pixels >= 1 else pygame.transform.smoothscale
+            screen.blit(resize(base.subsurface(clipped), scaled), (left, top))
         pygame.draw.line(screen, self.accent, (box.centerx - 14, box.centery), (box.centerx + 14, box.centery), 1)
         pygame.draw.line(screen, self.accent, (box.centerx, box.centery - 14), (box.centerx, box.centery + 14), 1)
+        badge = pygame.Rect(box.x + 6, box.y + 6, 34, 20)
+        rounded_panel(screen, badge, theme.BG_DEEP, radius=6, alpha=200)
+        draw_text(screen, f"{min(self.loupe_zoom, self._loupe_zooms()[-1])}×", badge.center, 12, theme.TEXT,
+                  center=True)
         screen.set_clip(previous)
 
     def _draw_normal(self, screen, mouse_pos):
@@ -1043,42 +1148,53 @@ class ImageEditor:
         half = (inner - 12) // 2
         ready = self.base is not None
 
-        draw_text(screen, "裁切", (x, y), 14, theme.TEXT, bold=True)
-        y += 24
-        y += self.ratio.draw(screen, pygame.Rect(x, y, inner, 0), mouse_pos) + 10
-        values = self._crop_pixels()
-        lock_w, label_w = 34, 22
-        field_w = (inner - lock_w - 16 - label_w * 2) // 2
-        fx = x
-        for index, (key, label) in enumerate(FIELDS):
-            draw_text(screen, label, (fx, y + 8), 14, theme.TEXT_DIM)
-            field = self.fields[key]
-            text = str(values[key]) if ready else ""
-            if not field.focused and field.text != text:
-                field.set_text(text)
-            field.draw(screen, pygame.Rect(fx + label_w, y, field_w, 34), mouse_pos)
-            fx += label_w + field_w + 8
-            if index == 0:
-                self._draw_lock(screen, pygame.Rect(fx, y, lock_w, 34), mouse_pos)
-                fx += lock_w + 8
-        y += 44
-        draw_text(screen, "擴展畫布", (x, y + 3), 14, theme.TEXT)
-        draw_text(screen, "框可以拉到圖片外", (x + 70, y + 5), 12, theme.TEXT_FAINT)
-        self.expand_toggle.value = self.expand
-        self.expand_toggle.draw(screen, (x + inner - 42, y + 2), mouse_pos)
-        y += 32
-        # 旋轉多出的角也會補空白,所以沒開擴展畫布時也能選
-        draw_text(screen, "空白處", (x, y + 6), 13, theme.TEXT_DIM)
-        self.fill.index = [key for key, _ in FILL_OPTIONS].index(self.edit.fill)
-        self.fill.draw(screen, pygame.Rect(x + 52, y, inner - 52, 28), mouse_pos)
-        y += 38
-        self.btn_fine.filled = self.fine
-        self.btn_fine.label = "結束細調" if self.fine else "細調"
-        self.btn_fine.enabled = ready
-        self.btn_fine.draw(screen, pygame.Rect(x, y, half, 32), mouse_pos)
-        self.btn_clear_crop.enabled = self.edit.crop is not None
-        self.btn_clear_crop.draw(screen, pygame.Rect(x + half + 12, y, half, 32), mouse_pos)
-        y += 40
+        if self.warping:
+            # 校正時用不到裁切(完成校正會清掉裁切範圍),同樣大小的位置改放放大鏡,版面不會跳
+            draw_text(screen, "放大鏡", (x, y), 14, theme.TEXT, bold=True)
+            draw_text(screen, "滾輪換倍數", (x + inner, y + 3), 12, theme.TEXT_FAINT, right=True)
+            slot = pygame.Rect(x, y + 24, inner, self._crop_section_h - 24 - 10)
+            self._loupe_slot = slot
+            draw_text(screen, "點選一個角，就會在這裡放大", slot.center, 13, theme.TEXT_FAINT, center=True)
+            y += self._crop_section_h
+        else:
+            top = y
+            draw_text(screen, "裁切", (x, y), 14, theme.TEXT, bold=True)
+            y += 24
+            y += self.ratio.draw(screen, pygame.Rect(x, y, inner, 0), mouse_pos) + 10
+            values = self._crop_pixels()
+            lock_w, label_w = 34, 22
+            field_w = (inner - lock_w - 16 - label_w * 2) // 2
+            fx = x
+            for index, (key, label) in enumerate(FIELDS):
+                draw_text(screen, label, (fx, y + 8), 14, theme.TEXT_DIM)
+                field = self.fields[key]
+                text = str(values[key]) if ready else ""
+                if not field.focused and field.text != text:
+                    field.set_text(text)
+                field.draw(screen, pygame.Rect(fx + label_w, y, field_w, 34), mouse_pos)
+                fx += label_w + field_w + 8
+                if index == 0:
+                    self._draw_lock(screen, pygame.Rect(fx, y, lock_w, 34), mouse_pos)
+                    fx += lock_w + 8
+            y += 44
+            draw_text(screen, "擴展畫布", (x, y + 3), 14, theme.TEXT)
+            draw_text(screen, "框可以拉到圖片外", (x + 70, y + 5), 12, theme.TEXT_FAINT)
+            self.expand_toggle.value = self.expand
+            self.expand_toggle.draw(screen, (x + inner - 42, y + 2), mouse_pos)
+            y += 32
+            # 旋轉多出的角也會補空白,所以沒開擴展畫布時也能選
+            draw_text(screen, "空白處", (x, y + 6), 13, theme.TEXT_DIM)
+            self.fill.index = [key for key, _ in FILL_OPTIONS].index(self.edit.fill)
+            self.fill.draw(screen, pygame.Rect(x + 52, y, inner - 52, 28), mouse_pos)
+            y += 38
+            self.btn_fine.filled = self.fine
+            self.btn_fine.label = "結束細調" if self.fine else "細調"
+            self.btn_fine.enabled = ready
+            self.btn_fine.draw(screen, pygame.Rect(x, y, half, 32), mouse_pos)
+            self.btn_clear_crop.enabled = self.edit.crop is not None
+            self.btn_clear_crop.draw(screen, pygame.Rect(x + half + 12, y, half, 32), mouse_pos)
+            y += 40
+            self._crop_section_h = y - top
         pygame.draw.line(screen, theme.PANEL_EDGE, (x, y), (x + inner, y))
         y += 10
 

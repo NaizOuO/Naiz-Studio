@@ -199,7 +199,7 @@ def render(style, color_key, top="", middle="", bottom="", carve="zhu", texture=
 # ------------------------------------------------------------ 記住上次填的字
 
 def _config_dir():
-    return str(CONFIG_DIR or paths.APP_DIR)
+    return str(CONFIG_DIR or paths.SETTING_DIR)
 
 
 def load_settings():

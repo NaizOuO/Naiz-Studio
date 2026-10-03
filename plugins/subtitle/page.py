@@ -26,6 +26,20 @@ SOURCES = [("system", "電腦播放的聲音"), ("app", "單一程式"), ("mic",
 SOURCE_NOTES = {"system": "YouTube、B站、遊戲、Discord 等電腦正在播放的聲音都會翻譯",
                 "app": "只翻譯選的程式，例如只翻 Discord、不翻遊戲音樂",
                 "mic": "翻譯麥克風收到的聲音"}
+# 收音靈敏度:電腦聲音開得小時字幕可能出不來,放大後再給人聲偵測和辨識
+GAINS = [("auto", "自動"), ("1", "原本音量"), ("2", "放大 2 倍"), ("4", "放大 4 倍")]
+GAIN_NOTES = {"auto": "聲音太小時自動放大，電腦音量開得小也收得到（建議）",
+              "1": "照原本的音量，不放大",
+              "2": "固定放大 2 倍，聲音很小、自動還收不到時用",
+              "4": "固定放大 4 倍，聲音非常小時用；太大聲時可能破音"}
+COUNTS = [("1", "1 句"), ("2", "2 句"), ("3", "3 句")]
+FADES = [("0", "一直顯示"), ("4", "4 秒"), ("8", "8 秒"), ("15", "15 秒")]
+# 字幕紀錄存成什麼檔案(和錄音轉逐字稿一樣)
+OUTPUTS = [("both", "SRT + TXT"), ("srt", "只要 SRT"), ("txt", "只要 TXT"), ("off", "不存檔")]
+OUTPUT_NOTES = {"both": "字幕檔有時間軸，純文字方便閱讀與複製",
+                "srt": "有時間軸的字幕檔，可以直接掛在影片上或丟進剪輯軟體",
+                "txt": "沒有時間軸的純文字，方便閱讀與複製；也會記下字幕進行中改過的設定",
+                "off": "不存成檔案，只留在右邊的字幕紀錄（停止後還能複製，關掉就沒了）"}
 SETTINGS_W = 440
 HIDDEN = pygame.Rect(-10000, -10000, 0, 0)     # 這一幀沒畫出來(或捲到看不見)的設定:移到畫面外,不會被點到
 CONFIG_KEY = "subtitle"
@@ -70,7 +84,8 @@ class SubtitlePage(Page):
         self.recommended = (model, translator)
         saved = app.config.get(CONFIG_KEY) if isinstance(app.config.get(CONFIG_KEY), dict) else {}
         self.prefs = {"source": "system", "language": "auto", "model": model, "translate": True,
-                      "translator": translator, "target": "zh-TW", "partial": partial, **STYLE}
+                      "translator": translator, "target": "zh-TW", "partial": partial, "gain": "auto",
+                      "output": "both", **STYLE}
         self.prefs.update({k: v for k, v in saved.items() if k in self.prefs})
 
         self.source = SegmentedControl(SOURCES, accent=accent)
@@ -78,6 +93,8 @@ class SubtitlePage(Page):
         self.programs = []                  # [(pid, 名稱)]
         self.program_pick = Dropdown([("", "（讀取中）")], accent=accent, size=13)
         self.btn_refresh = Button("重新整理", filled=False, size=12)
+        self.gain = SegmentedControl(GAINS, accent=accent)
+        self.gain.index = [k for k, _ in GAINS].index(self.prefs["gain"]) if self.prefs["gain"] in dict(GAINS) else 0
         self.language = Dropdown(asr.LANGUAGES, accent=accent, size=13)
         self.language.set_value(self.prefs["language"])
         self.names = glossary.load(app.config)          # 專有名詞表(好幾個設定檔,選一個用)
@@ -94,10 +111,18 @@ class SubtitlePage(Page):
         self.mode = SegmentedControl(MODES, accent=accent)
         self.mode.index = [k for k, _ in MODES].index(self.prefs["mode"])
         self.size = Slider(20, 60, self.prefs["size"], step=2, accent=accent)
+        self.size_original = Slider(12, 60, self.prefs["size_original"], step=2, accent=accent)
         self.opacity = Slider(0, 100, self.prefs["opacity"], step=5, accent=accent)
         self.align = SegmentedControl(ALIGNS, accent=accent)
         self.align.index = [k for k, _ in ALIGNS].index(self.prefs["align"])
         self.outline = Slider(0, 8, self.prefs["outline"], accent=accent)
+        self.count = SegmentedControl(COUNTS, accent=accent)
+        self.count.index = max(0, min(2, int(self.prefs["count"]) - 1))
+        self.fade = SegmentedControl(FADES, accent=accent)
+        self.fade.index = next((i for i, (k, _) in enumerate(FADES) if int(k) == int(self.prefs["fade"])), 2)
+        self.output = SegmentedControl(OUTPUTS, accent=accent)
+        self.output.index = [k for k, _ in OUTPUTS].index(self.prefs["output"]) \
+            if self.prefs["output"] in dict(OUTPUTS) else 0
         self.palette = ColorPalette(accent)                 # 和 PDF 編輯器同一套顏色選單
         self.font_picker = SubtitleFontPicker(self, accent)
         self.btn_font = Button("", filled=False, size=13)
@@ -201,14 +226,95 @@ class SubtitlePage(Page):
     def _names_changed(self, data):
         """專有名詞改了:存檔;字幕進行中的話馬上用新的名詞。"""
         self.names = data
-        self.app.save_setting(glossary.KEY, glossary.stored(data))
+        try:
+            self.app.save_setting(glossary.KEY, glossary.save(data))
+        except OSError as exc:
+            self.notice = (f"專有名詞存不了：{exc}", theme.WARN)
+            self._notice_until = time.monotonic() + 5
         if self.engine is not None:
             self.engine.settings.glossary = glossary.terms(data)
 
+    def _label(self, key, value):
+        """設定值給人看的名稱(寫進字幕紀錄)。"""
+        if key == "source":
+            return dict(SOURCES).get(value, value)
+        if key == "model":
+            return next((name for k, name, _, _ in asr.MODELS if k == value), value)
+        if key == "language":
+            return dict(asr.LANGUAGES).get(value, value)
+        if key == "target":
+            return ollama.TARGET_NAMES.get(value, value)
+        if key == "translate":
+            return "開" if value else "關"
+        if key == "gain":
+            return dict(GAINS).get(value, value)
+        if key == "pid":
+            return next((name for pid, name in self.programs if str(pid) == str(value)), str(value))
+        return str(value)
+
+    def _change(self, key, value):
+        """改一項設定:記下來;字幕進行中的話交給引擎套用(字幕紀錄會記一行)。
+        換辨識模型、聲音來源會短暫中斷,其他的下一句就套用。"""
+        old = self.prefs.get(key)
+        if old == value:
+            return
+        engine = self.engine
+        if self.running and engine is not None and engine.state == "loading":
+            self.notice = ("字幕還在載入，載好後再改", theme.WARN)
+            self._notice_until = time.monotonic() + 3
+            return
+        if self.running and key == "translate" and value and not self._translate_ready():
+            return
+        self.prefs[key] = value
+        self._save()
+        if not self.running or engine is None:
+            return
+        titles = {"source": "聲音來源", "model": "辨識模型", "language": "原文語言", "translate": "翻譯",
+                  "target": "翻成", "translator": "翻譯模型", "gain": "收音靈敏度"}
+        changes = {key: value}
+        if key == "source":
+            if value == "app":
+                pid = int(self.program_pick.value or 0) or None
+                if pid is None:                 # 還沒選程式:選好再換過去
+                    self.notice = ("選好要翻譯的程式後就會換過去", self.tool.accent)
+                    self._notice_until = time.monotonic() + 4
+                    return
+                changes["pid"] = pid
+            else:
+                changes["pid"] = None
+        summary = f"{titles.get(key, key)} {self._label(key, old)} → {self._label(key, value)}"
+        if key == "source" and value == "app":
+            summary += f"（{self._label('pid', changes['pid'])}）"
+        engine.reconfigure(changes, summary)
+
+    def _change_program(self, pid):
+        """單一程式模式下換程式(字幕進行中的話換過去)。"""
+        engine = self.engine
+        if not (self.running and engine is not None and engine.state == "running"):
+            return
+        if self.prefs["source"] != "app" or not pid:
+            return
+        old = engine.settings.pid
+        if old == pid and engine.settings.source == "app":
+            return
+        old_text = self._label("pid", old) if engine.settings.source == "app" and old \
+            else self._label("source", engine.settings.source)
+        engine.reconfigure({"source": "app", "pid": pid}, f"聲音來源 {old_text} → {self._label('pid', pid)}")
+
+    def _translate_ready(self):
+        if self.ollama_state != "running":
+            self.notice = ("翻譯需要 Ollama：請先安裝並打開 Ollama", theme.WARN)
+        elif self.prefs["translator"] not in [name for name, _ in self.ollama_models]:
+            self.notice = ("請先下載翻譯模型（設定區下方可以直接下載）", theme.WARN)
+        else:
+            return True
+        self._notice_until = time.monotonic() + 4
+        return False
+
     def _translator_options(self):
-        """已經在本地的模型標「本地」;還沒下載的建議模型標「建議安裝」,選了就開始下載。"""
+        """已經在本地的模型標「本地」(實測很差的標「不建議」);還沒下載的建議模型標「建議安裝」,選了就開始下載。"""
         installed = [name for name, _ in self.ollama_models]
-        options = [(name, name, "本地") for name in installed]
+        options = [(name, name, "本地・不建議" if ollama.not_recommended(name) else "本地") for name in installed]
         options += [(name, name, f"建議安裝 {size}") for name, size, _, _ in ollama.SUGGESTED if name not in installed]
         return options
 
@@ -235,11 +341,12 @@ class SubtitlePage(Page):
         settings = Settings(source=prefs["source"], pid=int(self.program_pick.value or 0) or None,
                             model=prefs["model"], language=prefs["language"], translate=prefs["translate"],
                             translator=prefs["translator"], target=prefs["target"], partial=prefs["partial"],
-                            step=0.3 if asr.gpu() else 1.5, glossary=glossary.terms(self.names))
+                            step=0.3 if asr.gpu() else 1.5, glossary=glossary.terms(self.names),
+                            gain=prefs["gain"])
         self.engine = Engine(settings, on_update=self._changed)
         self.engine.start()
         base, number = time.strftime("字幕 %Y-%m-%d %H%M%S"), 2
-        while (output_dir() / f"{base}.txt").exists():
+        while (output_dir() / f"{base}.txt").exists() or (output_dir() / f"{base}.srt").exists():
             base = f"{time.strftime('字幕 %Y-%m-%d %H%M%S')} ({number})"
             number += 1
         self.session = {"base": base, "saved": 0}
@@ -272,12 +379,18 @@ class SubtitlePage(Page):
     def _save_transcript(self, force=False):
         """每多一句定稿就存一次(當機也不會全部不見):output\\subtitles\\字幕 日期 時間.txt / .srt。"""
         lines = self._transcript_lines()
-        if self.session is None or not lines or (not force and len(lines) == self.session["saved"]):
+        if self.session is None or not lines or (not force and len(lines) == self.session["saved"]) \
+                or self.prefs["output"] == "off":
             return
         stamp = time.strftime("%Y-%m-%d %H:%M")
         text = [f"Naiz Studio 即時字幕 {stamp}", ""]
         srt = []
-        for number, line in enumerate(lines, 1):
+        number = 0
+        for line in lines:
+            if line.notice:                     # 變更設定的說明:只寫進 txt(srt 常直接丟進剪輯軟體,不放)
+                text.append(f"[{_clock(line.start)}] ── {line.original}")
+                continue
+            number += 1
             translated = "" if line.same else line.translation
             original = line.translation if line.same and line.translation else line.original
             text.append(f"[{_clock(line.start)}] {original}")
@@ -288,8 +401,11 @@ class SubtitlePage(Page):
         try:
             folder = output_dir()
             folder.mkdir(parents=True, exist_ok=True)
-            (folder / f"{self.session['base']}.txt").write_text("\n".join(text) + "\n", encoding="utf-8")
-            (folder / f"{self.session['base']}.srt").write_text("\n".join(srt), encoding="utf-8")
+            output = self.prefs["output"]
+            if output in ("both", "txt"):
+                (folder / f"{self.session['base']}.txt").write_text("\n".join(text) + "\n", encoding="utf-8")
+            if output in ("both", "srt"):
+                (folder / f"{self.session['base']}.srt").write_text("\n".join(srt), encoding="utf-8")
             self.session["saved"] = len(lines)
         except OSError as exc:
             self.notice = (f"字幕紀錄存不了：{exc}", theme.WARN)
@@ -297,6 +413,8 @@ class SubtitlePage(Page):
     def _copy(self, lines, what):
         parts = []
         for line in lines:
+            if line.notice:
+                continue
             if line.same or not line.translation:
                 parts.append(line.translation or line.original)
             else:
@@ -340,8 +458,12 @@ class SubtitlePage(Page):
         if engine is not None and self._dirty and time.monotonic() - self._pushed > 0.05:
             self._dirty = False
             self._pushed = time.monotonic()
-            self.overlay.lines([("", line.translation or line.original, line.final) if line.same
-                                else (line.original, line.translation, line.final) for line in engine.recent()])
+            items = []
+            for line, idle in engine.recent(int(self.prefs["count"])):
+                age = idle if line.final else None
+                items.append(("", line.translation or line.original, line.final, age) if line.same
+                             else (line.original, line.translation, line.final, age))
+            self.overlay.lines(items)
         if engine is not None and self.session is not None and time.monotonic() - self._saved_at > 1:
             self._saved_at = time.monotonic()
             self._save_transcript()
@@ -368,9 +490,9 @@ class SubtitlePage(Page):
     def _controls(self):
         buttons = [self.btn_refresh, self.btn_ollama, self.btn_font, self.btn_names] + \
             [button for button, _ in self.pull_buttons]
-        return buttons, [self.source, self.mode, self.align], \
+        return buttons, [self.source, self.gain, self.mode, self.align, self.count, self.fade, self.output], \
             [self.program_pick, self.language, self.names_pick, self.target, self.translator], \
-            [self.size, self.outline, self.opacity]
+            [self.size, self.size_original, self.outline, self.opacity]
 
     def _draw_settings(self, rect, mouse_pos):
         screen = self.screen
@@ -427,11 +549,18 @@ class SubtitlePage(Page):
         screen = self.screen
         accent = self.tool.accent
         prefs = self.prefs
-        locked = self.running
-        hint = "字幕進行中，停止後才能更改" if locked else ""
+        for control, key, options in ((self.source, "source", SOURCES), (self.gain, "gain", GAINS),
+                                      (self.output, "output", OUTPUTS), (self.mode, "mode", MODES),
+                                      (self.align, "align", ALIGNS)):
+            keys = [k for k, _ in options]
+            if prefs[key] in keys:
+                control.index = keys.index(prefs[key])
+        self.count.index = max(0, min(2, int(prefs["count"]) - 1))
+        self.fade.index = next((i for i, (k, _) in enumerate(FADES) if int(k) == int(prefs["fade"])), 2)
+        hint = "進行中也能改，會記在字幕紀錄" if self.running else ""
         draw_text(screen, "即時字幕", (x, y), 16, theme.TEXT, bold=True)
         draw_text(screen, hint or hardware.describe(), (x + inner, y + 10), 11,
-                  theme.WARN if hint else theme.TEXT_FAINT, right=True)
+                  accent if hint else theme.TEXT_FAINT, right=True)
         y += 34
 
         y = self._heading("聲音來源", x, y)
@@ -447,7 +576,15 @@ class SubtitlePage(Page):
             self.program_pick.draw(screen, pygame.Rect(x, y, inner - 96, 30), mouse_pos)
             self.btn_refresh.draw(screen, pygame.Rect(x + inner - 88, y, 88, 30), mouse_pos)
             y += 40
-        y += 6
+        draw_text(screen, "收音靈敏度", (x, y + 7), 13, theme.TEXT)
+        self.gain.draw(screen, pygame.Rect(x + 90, y, inner - 90, 30), mouse_pos)
+        y += 36
+        note = GAIN_NOTES[prefs["gain"]]
+        engine = self.engine
+        if self.running and engine is not None and engine.state == "running":
+            note = f"目前放大 {engine.gain:.1f} 倍" + ("（聲音很小，建議把電腦音量開大一點）" if engine.gain >= 7.5 else "")
+        draw_text(screen, widgets.clip_text(note, 12, inner), (x, y), 12, theme.TEXT_FAINT)
+        y += 28
 
         draw_text(screen, "原文語言", (x, y + 6), 14, theme.TEXT, bold=True)
         if not self.language.is_open:
@@ -475,7 +612,7 @@ class SubtitlePage(Page):
         for key, name, dep, note in asr.MODELS:
             row = pygame.Rect(x, y, inner, 44)
             chosen = key == prefs["model"]
-            hover = row.collidepoint(mouse_pos) and not locked
+            hover = row.collidepoint(mouse_pos)
             rounded_panel(screen, row, tuple(int(c * 0.25) for c in accent) if chosen else
                           (theme.PANEL_LIGHT if hover else theme.BG_DEEP), radius=8, alpha=220,
                           border=accent if chosen else None)
@@ -531,11 +668,35 @@ class SubtitlePage(Page):
                              border_radius=5)
             self.swatches.append((swatch, color_key))
             y += 32
+            if slider is self.size and prefs["mode"] == "both":
+                # 原文和翻譯一起顯示時,原文另外調大小(只顯示其中一種時用上面的「字的大小」)
+                draw_text(screen, "原文大小", (x, y + 3), 13, theme.TEXT)
+                draw_text(screen, str(int(self.size_original.value)), (x + inner - 40, y + 12), 13, theme.TEXT_DIM,
+                          right=True)
+                self.size_original.draw(screen, pygame.Rect(x + 80, y + 9, inner - 170, 14), mouse_pos)
+                y += 32
         draw_text(screen, "右邊的色塊依序是：文字、外框、底色的顏色", (x, y), 11, theme.TEXT_FAINT)
-        y += 20
+        y += 24
+        draw_text(screen, "畫面上", (x, y + 6), 13, theme.TEXT)
+        self.count.draw(screen, pygame.Rect(x + 80, y, inner - 80, 28), mouse_pos)
+        y += 34
+        draw_text(screen, "沒人說話", (x, y + 6), 13, theme.TEXT)
+        self.fade.draw(screen, pygame.Rect(x + 80, y, inner - 80, 28), mouse_pos)
+        y += 34
+        fade_note = "字幕一直留在畫面上" if prefs["fade"] in (0, "0") else \
+            f"講完 {int(prefs['fade'])} 秒都沒人說話，字幕就慢慢淡出"
+        draw_text(screen, fade_note, (x, y), 12, theme.TEXT_FAINT)
+        y += 22
         for line in widgets.wrap_text(FULLSCREEN_NOTE, 12, inner, max_lines=2):
             draw_text(screen, line, (x, y), 12, theme.TEXT_FAINT)
             y += 18
+        y += 12
+
+        y = self._heading("字幕紀錄", x, y, "自動存在 output\\subtitles")
+        self.output.draw(screen, pygame.Rect(x, y, inner, 30), mouse_pos)
+        y += 36
+        draw_text(screen, widgets.clip_text(OUTPUT_NOTES[prefs["output"]], 12, inner), (x, y), 12, theme.TEXT_FAINT)
+        y += 22
         return y + 8
 
     def _ollama_rows(self, x, y, inner, mouse_pos):
@@ -586,7 +747,7 @@ class SubtitlePage(Page):
         rounded_panel(screen, rect, theme.PANEL, radius=12, alpha=228, border=theme.PANEL_EDGE)
         engine = self.engine
         lines = [line for line in (engine.lines if engine else []) if line.original]
-        draw_text(screen, f"字幕紀錄 ({sum(line.final for line in lines)})", (rect.x + 16, rect.y + 13), 15,
+        draw_text(screen, f"字幕紀錄 ({sum(line.final and not line.notice for line in lines)})", (rect.x + 16, rect.y + 13), 15,
                   theme.TEXT, bold=True)
         right = rect.right - 14
         self.btn_open.draw(screen, pygame.Rect(right - 84, rect.y + 10, 84, 24), mouse_pos)
@@ -615,7 +776,9 @@ class SubtitlePage(Page):
         width = area.width - 90
         blocks = []
         for line in lines:
-            if line.same:
+            if line.notice:                     # 變更設定的說明:小字、不能點
+                original, translated = widgets.wrap_text(f"── {line.original}", 12, width), []
+            elif line.same:
                 original, translated = [], widgets.wrap_text(line.translation or line.original, 15, width)
             else:
                 original = widgets.wrap_text(line.original, 12, width)
@@ -632,12 +795,12 @@ class SubtitlePage(Page):
         for line, original, translated, height in blocks:
             if y + height >= area.y and y <= area.bottom:
                 row_rect = pygame.Rect(area.x + 6, y - 3, area.width - 20, height)
-                if line.final:
+                if line.final and not line.notice:
                     self.line_rects.append((row_rect.clip(area), line))
                     if row_rect.collidepoint(mouse_pos) and area.collidepoint(mouse_pos):
                         rounded_panel(screen, row_rect, theme.PANEL_LIGHT, radius=6, alpha=160)
                         draw_text(screen, "點一下複製", (row_rect.right - 8, y + 2), 11, theme.TEXT_FAINT, right=True)
-                dim = theme.TEXT_FAINT if line.final else theme.TEXT_DIM
+                dim = self.tool.accent if line.notice else (theme.TEXT_FAINT if line.final else theme.TEXT_DIM)
                 draw_text(screen, _clock(line.start), (area.x + 16, y + 2), 12, theme.TEXT_FAINT)
                 row_y = y
                 for row in original:
@@ -727,13 +890,19 @@ class SubtitlePage(Page):
                     self.names["active"] = dropdown.value       # 進行中也能換,馬上生效
                     self._names_changed(self.names)
                     return
-                if key and dropdown.value != before and not self.running and dropdown.value:
+                if key is None and dropdown.value != before:
+                    self._change_program(int(dropdown.value or 0) or None)     # 單一程式:換程式
+                elif key and dropdown.value != before and dropdown.value:
                     if key == "translator" and dropdown.value not in [name for name, _ in self.ollama_models]:
                         self._pull(dropdown.value)          # 還沒下載的建議模型:開始下載,下載完自動選用
                         dropdown.set_value(self.prefs["translator"])
                     else:
-                        self.prefs[key] = dropdown.value
-                        self._save()
+                        self._change(key, dropdown.value)
+                        reason = ollama.not_recommended(dropdown.value) if key == "translator" else ""
+                        if reason:
+                            self.notice = (f"這個模型實測翻譯很差（{reason}），建議用 qwen3:8b 或 translategemma",
+                                           theme.WARN)
+                            self._notice_until = time.monotonic() + 6
                 return
         # 捲動條在設定區右邊緣外一點;拖曳捲動條、中鍵自動捲動時滑鼠移出範圍也要繼續交給它(才收得到放開)
         settings, lines = self.settings_view, self.lines_view
@@ -744,7 +913,8 @@ class SubtitlePage(Page):
                 and lines.handle_event(event, mouse_pos):
             self.follow = lines.scroll >= lines.max_scroll - 4
             return
-        for slider, key in ((self.size, "size"), (self.opacity, "opacity"), (self.outline, "outline")):
+        for slider, key in ((self.size, "size"), (self.size_original, "size_original"), (self.opacity, "opacity"),
+                            (self.outline, "outline")):
             if slider.handle(event, mouse_pos):
                 self.prefs[key] = int(slider.value)
                 if self.overlay.alive:
@@ -788,10 +958,28 @@ class SubtitlePage(Page):
         if self.mode.clicked(pos, True):
             self._set_style("mode", self.mode.value)
             return
+        if self.count.clicked(pos, True):
+            self._set_style("count", int(self.count.value))
+            self._dirty = True
+            return
+        if self.fade.clicked(pos, True):
+            self._set_style("fade", int(self.fade.value))
+            return
+        if self.output.clicked(pos, True):
+            self.prefs["output"] = self.output.value
+            self._save()
+            self._save_transcript(force=True)
+            return
+        if self.gain.clicked(pos, True):
+            self._change("gain", self.gain.value)
+            if self.engine is not None and self.running:
+                self.engine.settings.gain = self.prefs["gain"]
+            return
         if self.align.clicked(pos, True):
             self._set_style("align", self.align.value)
             return
         if self.btn_names.clicked(pos, True):
+            self.names = glossary.load(self.app.config)     # 重新讀資料夾:別人給的設定檔放進去就看得到
             self.names_dialog.open(self.names)
             return
         if self.btn_font.clicked(pos, True):
@@ -812,23 +1000,23 @@ class SubtitlePage(Page):
                 self.notice = ("正在打開 Ollama…", theme.TEXT_DIM)
                 self._ollama_checked = time.monotonic() - 1
             return
-        if self.running:
-            return
         if self.source.clicked(pos, True):
-            prefs["source"] = self.source.value
-            if prefs["source"] == "app":
+            if self.source.value == "app":
                 self._refresh_programs()
-            self._save()
+            self._change("source", self.source.value)
         elif self.btn_refresh.clicked(pos, True):
             self._refresh_programs()
         elif self.translate_on.clicked(pos, True):
-            prefs["translate"] = self.translate_on.value
-            self._save()
+            self._change("translate", self.translate_on.value)
+            self.translate_on.value = prefs["translate"]
         else:
             row = next((key for rect, key in self.model_rows if rect.collidepoint(pos)), None)
             if row is not None:
-                prefs["model"] = row
-                self._save()
+                missing = asr.required(row)
+                if missing and self.running:            # 字幕進行中換成還沒下載的模型:先問要不要下載
+                    self.app.consent.open("辨識模型", missing, on_done=lambda: self._change("model", row))
+                else:
+                    self._change("model", row)
 
     def _pull(self, name):
         if self.pull is not None:

@@ -72,7 +72,7 @@ def from_hex(text):
 
 
 def _config_dir():
-    return str(CONFIG_DIR or paths.APP_DIR)
+    return str(CONFIG_DIR or paths.SETTING_DIR)
 
 
 def _load_recent():

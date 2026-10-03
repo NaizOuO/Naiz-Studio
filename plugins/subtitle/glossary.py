@@ -1,37 +1,51 @@
 """專有名詞表:人名、地名、招式名等固定的翻法,可以存好幾個設定檔(例如一部動畫一個、一款遊戲一個),
-使用者選要用哪一個。存在 config.json 的 subtitle_glossary。
+使用者選要用哪一個。每個設定檔存成「setting\\subtitle_glossary」資料夾裡的一個 .json(方便匯入匯出,見 core/profiles.py);
+config.json 的 subtitle_glossary 只記目前用哪一個(舊版存在 config.json 裡的會自動搬過去)。
 
 用在兩個地方:
 - 翻譯:這句(和前面幾句)出現的名詞,告訴翻譯模型一定要這樣翻;模型還是照抄原文時直接換成譯名
 - 辨識:語言確定時把名詞的原文當成提示給 Whisper,名字比較不會聽錯(例如「ジェバンニ」聽成「ジェ番」)
 """
 
+from core.profiles import ProfileStore
+
 KEY = "subtitle_glossary"
 NONE = ""                   # 「不使用」
 MAX_PROMPT_TERMS = 40       # Whisper 的提示有長度上限,名詞太多時只給前面這些
 
 
+def _clean(item):
+    source = str(item.get("source", "")).strip()
+    if not source:
+        return None
+    return {"source": source, "target": str(item.get("target", "")).strip(), "on": bool(item.get("on", True))}
+
+
+STORE = ProfileStore("subtitle_glossary", "即時字幕的專有名詞表：source=原文、target=固定的翻法、on=是否啟用", _clean)
+
+
 def load(config):
     raw = config.get(KEY) if isinstance(config.get(KEY), dict) else {}
-    profiles = {}
-    for name, terms in (raw.get("profiles") if isinstance(raw.get("profiles"), dict) else {}).items():
+    profiles = STORE.load()
+    # 舊版(v1.18.0)把設定檔存在 config.json 裡:資料夾還沒有的搬過去
+    old = raw.get("profiles") if isinstance(raw.get("profiles"), dict) else {}
+    moved = False
+    for name, items in old.items():
         name = str(name).strip()
-        if not name:
-            continue
-        profiles[name] = [{"source": str(t.get("source", "")).strip(), "target": str(t.get("target", "")).strip(),
-                           "on": bool(t.get("on", True))}
-                          for t in (terms if isinstance(terms, list) else [])
-                          if isinstance(t, dict) and str(t.get("source", "")).strip()]
+        if name and name not in profiles:
+            profiles[name] = [item for item in (_clean(i) for i in items if isinstance(i, dict)) if item]
+            moved = True
+    if moved:
+        STORE.save(profiles)
     active = str(raw.get("active", NONE))
     return {"active": active if active in profiles else NONE, "profiles": profiles}
 
 
-def stored(data):
-    """寫回 config.json 的樣子(加一行說明,使用者打開設定檔時看得懂)。"""
-    return {"說明": "即時字幕的專有名詞表：source=原文、target=固定的翻法、on=是否啟用；active=目前使用的設定檔",
-            "active": data["active"],
-            "profiles": {name: [{"source": t["source"], "target": t["target"], "on": t["on"]} for t in terms]
-                         for name, terms in data["profiles"].items()}}
+def save(data):
+    """存檔:設定檔寫進資料夾;回傳要寫進 config.json 的部分(只有目前用哪一個)。"""
+    STORE.save(data["profiles"], data.pop("removed", ()))
+    return {"說明": "即時字幕目前使用的專有名詞設定檔；設定檔本身在「setting\\subtitle_glossary」資料夾",
+            "active": data["active"]}
 
 
 def terms(data):

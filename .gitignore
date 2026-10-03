@@ -16,14 +16,13 @@ PDF Studio/
 # 執行時才產生的東西
 output/
 error.log
+subtitle_error.log
 
 # 使用者同意後才下載的外部元件與模型
 bin/
 models/
-fonts/
 
-# 使用者存的簽名、畫到一半的電路圖屬於個人資料
-signatures/
+# 畫到一半的電路圖屬於個人資料
 circuits/
 
 # 測試或處理中的 PDF 屬於個人檔案
@@ -32,14 +31,21 @@ circuits/
 # 測試用的檔案(使用者放的樣品、測試產生的檔案),不進版本控制
 testfile/
 
-# 使用者的個人設定(程式會自動建立預設值)
-config.json
+# setting 是使用者的個人設定(config.json、簽名、字型、專有名詞與修正錯字的設定檔等,程式會自動建立),
+# 只追蹤 images 裡的介面素材,使用者自己放的背景圖不納入
+setting/*
+!setting/images/
+setting/images/*
+!setting/images/app_icon.png
+!setting/images/app_icon.ico
+!setting/images/ui_*.png
 
-# images 只追蹤介面素材,使用者自己放的背景圖不納入
-images/*
-!images/app_icon.png
-!images/app_icon.ico
-!images/ui_*.png
+# 舊版(v1.18.0 以前)放在程式資料夾的設定,啟動時會搬進 setting
+/config.json
+/config.bak*.json
+/images/
+/fonts/
+/signatures/
 
 # 擴充模組存的資料、更新時的暫存
 mods_data/

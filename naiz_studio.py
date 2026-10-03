@@ -52,6 +52,7 @@ IDLE_SECONDS = 1.5      # 這麼久沒有任何操作就降低畫面更新頻率
 
 class App:
     def __init__(self):
+        paths.migrate_legacy()      # 舊版放在程式資料夾的設定、圖片、字型、簽名搬進 setting
         pygame.init()
         icon_path = paths.IMAGES_DIR / "app_icon.png"
         if icon_path.exists():
@@ -66,7 +67,7 @@ class App:
         pygame.display.set_caption("Naiz Studio")
         self.clock = pygame.time.Clock()
 
-        self.config = theme.load_config(str(paths.APP_DIR))
+        self.config = theme.load_config(str(paths.SETTING_DIR))
         self.background = None
         self.rebuild_background()
         self.dev_mode = bool(self.config.get("dev_mode", False))
@@ -93,6 +94,7 @@ class App:
         self.gear_rect = pygame.Rect(0, 0, 0, 0)
         self.title_clicks = []
         self.btn_home = Button("首頁", filled=False, size=14)
+        self.btn_output = Button("輸出資料夾", filled=False, size=14)    # 首頁:打開所有工具輸出的 output 資料夾
         self.copy_toast = None
         self.tool_error = None          # (工具名稱, 時間):工具或模組出錯被關掉時,首頁顯示提示
         self.dialog = Dialog(lambda: self.screen, theme.ACCENT)
@@ -124,7 +126,7 @@ class App:
     # ------------------------------------------------------------ 狀態
 
     def rebuild_background(self):
-        image = theme.load_background(str(paths.APP_DIR), self.config)
+        image = theme.load_background(paths.IMAGES_DIR, self.config)
         self.background = theme.Background(image, self.config) if image else None
 
     def reload_tools(self):
@@ -167,9 +169,9 @@ class App:
         self.dev_mode = enabled
         self.config["dev_mode"] = enabled
         # 只改這一個鍵再寫回,避免把設定面板裡還沒按儲存的背景變更一起存進去
-        stored = theme.load_config(str(paths.APP_DIR))
+        stored = theme.load_config(str(paths.SETTING_DIR))
         stored["dev_mode"] = enabled
-        theme.save_config(str(paths.APP_DIR), stored)
+        theme.save_config(str(paths.SETTING_DIR), stored)
         self.reload_tools()
 
     def deactivate_page(self):
@@ -251,7 +253,8 @@ class App:
         badge = self.badge_text() if not self.current else None
         if badge:
             text, color = badge
-            self.update_badge = pygame.Rect(crumb_right + 16, 19, theme.font(13).size(text)[0] + 24, 28)
+            # 兩端是半圓(圓角 14),左右各留 20,字才不會碰到弧線
+            self.update_badge = pygame.Rect(crumb_right + 16, 19, theme.font(13).size(text)[0] + 40, 28)
             hover = self.update_badge.collidepoint(mouse_pos)
             rounded_panel(self.screen, self.update_badge, tuple(int(c * (0.4 if hover else 0.25)) for c in color),
                           radius=14, border=color)
@@ -271,6 +274,8 @@ class App:
             self.btn_home.draw(self.screen, home, mouse_pos)
             toolbar = pygame.Rect(crumb_right + 24, 16, home.x - 12 - (crumb_right + 24), 34)
             self.guard(self.current, self.pages[self.current.id].draw_toolbar, toolbar, mouse_pos)
+        else:
+            self.btn_output.draw(self.screen, pygame.Rect(width - 186, 17, 110, 32), mouse_pos)
 
     def draw_home(self, rect, mouse_pos):
         draw_text(self.screen, "工具", (rect.x, rect.y), 24, theme.TEXT, bold=True)
@@ -414,6 +419,13 @@ class App:
         for row, line in enumerate(widgets.wrap_text(note, 13, card.width - 36, max_lines=3)):
             draw_text(self.screen, line, (card.x + 18, card.y + 54 + row * 19), 13, theme.WARN)
 
+    def open_output_folder(self):
+        try:
+            paths.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            os.startfile(paths.OUTPUT_DIR)
+        except OSError:
+            pass
+
     def open_mods_folder(self):
         try:
             paths.MODS_DIR.mkdir(parents=True, exist_ok=True)
@@ -497,9 +509,9 @@ class App:
     def save_setting(self, key, value):
         """只改 config.json 裡的一項(面板上還沒按儲存的其他改動不會跟著存進去)。"""
         self.config[key] = value
-        stored = theme.load_config(str(paths.APP_DIR))
+        stored = theme.load_config(str(paths.SETTING_DIR))
         stored[key] = value
-        theme.save_config(str(paths.APP_DIR), stored)
+        theme.save_config(str(paths.SETTING_DIR), stored)
 
     def poll_shortcut(self):
         """exe 版第一次開啟時詢問要不要建立桌面捷徑;不論選哪個都只問一次,桌面已經有捷徑就不問。"""
@@ -691,6 +703,9 @@ class App:
             if self.update_badge.collidepoint(mouse_pos):
                 self.click_badge()
                 return True
+            if not self.current and self.btn_output.clicked(mouse_pos, True):
+                self.open_output_folder()
+                return True
             if self.current and self.btn_home.clicked(mouse_pos, True):
                 self.deactivate_page()
                 self.guard(self.current, self.pages[self.current.id].leave, self.go_home)  # 有未儲存的變更時工具會先詢問
@@ -783,17 +798,18 @@ class App:
 
 
 def main():
-    # 給其他程式呼叫的命令列模式:不開視窗,做完就結束
-    if len(sys.argv) > 1 and sys.argv[1] == "--cli":
-        from core.cli import main as cli_main
-
-        sys.exit(cli_main(sys.argv[2:]))
     # 即時字幕的字幕視窗:另一個程式,只開字幕,不載入整個 Naiz Studio
     if len(sys.argv) > 3 and sys.argv[1] == "--subtitle-overlay":
         from plugins.subtitle.overlay import run as run_overlay
 
         run_overlay(int(sys.argv[2]), sys.argv[3])
         return
+    # 給其他程式呼叫的命令列模式:不開視窗,做完就結束
+    if len(sys.argv) > 1 and sys.argv[1] == "--cli":
+        from core.cli import main as cli_main
+
+        paths.migrate_legacy()
+        sys.exit(cli_main(sys.argv[2:]))
 
     # 用 pythonw 啟動時沒有主控台,錯誤訊息會直接消失,所以改寫進 log 並跳視窗告知
     try:

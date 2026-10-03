@@ -152,9 +152,9 @@ class TranscriptPage(Page):
                 srt = transcribe.transcribe(item.path, model, script, progress=progress, speakers=speakers,
                                             cancel=item.cancel_event)
                 fixed = 0
-                rules = corrections.load()
-                if rules["enabled"]:
-                    srt, fixed = corrections.apply_srt(srt, rules["rules"],
+                fix = corrections.load()
+                if fix["enabled"]:
+                    srt, fixed = corrections.apply_srt(srt, corrections.rules(fix),
                                                        lambda text: transcribe.convert_script(text, script))
                 folder.mkdir(parents=True, exist_ok=True)
                 base = free_base(folder, item.path.stem)
@@ -310,12 +310,16 @@ class TranscriptPage(Page):
         self.fix_toggle.value = data["enabled"]
         draw_text(screen, "修正錯字", (x, y + 3), 14, theme.TEXT)
         self.fix_toggle.draw(screen, (right - 60, y + 2), mouse_pos)
-        active = sum(rule["on"] for rule in data["rules"])
+        active = sum(rule["on"] for rule in corrections.rules(data))
         self.btn_fix.label = f"編輯規則({active})"
         self.btn_fix.draw(screen, pygame.Rect(right - 60 - 12 - 112, y - 2, 112, 30), mouse_pos)
         y += 34
-        note = ("轉錄後自動把錯字換成正確的字；只要文字相同就會換，詳見編輯規則" if data["enabled"]
-                else "已關閉，轉錄結果不會替換任何字")
+        if not data["enabled"]:
+            note = "已關閉，轉錄結果不會替換任何字"
+        elif data["active"]:
+            note = f"使用「{data['active']}」：轉錄後自動把錯字換成正確的字，詳見編輯規則"
+        else:
+            note = "還沒有規則，按「編輯規則」新增"
         draw_text(screen, widgets.clip_text(note, 12, inner), (x, y), 12, theme.TEXT_FAINT)
         y += 28
 

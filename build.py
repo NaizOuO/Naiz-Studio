@@ -1,7 +1,7 @@
 """用 PyInstaller 打包成單一 exe,並整理成可以直接上傳 Release 的資料夾與 zip。
 
 用法:python build.py v1.9.2
-產出:dist/_new/Naiz Studio/(exe、images、README.md、LICENSE)與 dist/Naiz Studio v1.9.2.zip
+產出:dist/_new/Naiz Studio/(exe、setting/images、README.md、LICENSE)與 dist/Naiz Studio v1.9.2.zip
 dist/Naiz Studio/ 不會被動到:那是自己用的一份,用程式內的更新功能換成新版(順便測試更新)。
 另外會用 dist 裡上一版的 zip 做出「從上一版升級」的補丁(需要 zstd 指令),和 zip 一起上傳到 Release,
 已經安裝的人更新時只要下載補丁。
@@ -10,7 +10,7 @@ dist/Naiz Studio/ 不會被動到:那是自己用的一份,用程式內的更新
 打包擴充模組:python build.py mod circuit → dist/circuit-v0.1.0.zip(版本照模組 __init__.py 的 version)
 
 換圖示:python build.py icon 畫好的圖.png(建議 1024×1024、透明背景)
-產出 images/app_icon.png(視窗圖示,256)與 images/app_icon.ico(16～256 各種尺寸)
+產出 setting/images/app_icon.png(視窗圖示,256)與 setting/images/app_icon.ico(16～256 各種尺寸)
 """
 
 import os
@@ -46,7 +46,7 @@ def plugin_modules():
 
 
 def ui_images():
-    folder = ROOT / "images"
+    folder = ROOT / "setting" / "images"
     return [folder / "app_icon.png", folder / "app_icon.ico", *sorted(folder.glob("ui_*.png"))]
 
 
@@ -85,7 +85,7 @@ def version_file(version):
 
 def pyinstaller_args(script, name, windowed=True, workdir=None, version=None):
     args = [str(script), "--noconfirm", "--onefile", "--name", name,
-            "--icon", str(ROOT / "images" / "app_icon.ico"),
+            "--icon", str(ROOT / "setting" / "images" / "app_icon.ico"),
             "--paths", str(ROOT),
             # 插件原始檔要放進 exe,程式才能照資料夾載入(開發者插件不在這裡,不會被打包)
             "--add-data", f"{ROOT / 'plugins'};plugins"]
@@ -110,8 +110,8 @@ def pyinstaller_args(script, name, windowed=True, workdir=None, version=None):
 
 def release_files():
     """除了 exe 以外要放進發布資料夾的檔案:[(來源, 資料夾內的路徑)]。"""
-    # 圖示和介面圖片是從 exe 旁邊的 images 資料夾讀取的;授權檔也放進去,下載的人才看得到
-    files = [(image, Path("images") / image.name) for image in ui_images()]
+    # 圖示和介面圖片是從 exe 旁邊的 setting\images 資料夾讀取的;授權檔也放進去,下載的人才看得到
+    files = [(image, Path("setting") / "images" / image.name) for image in ui_images()]
     files += [(ROOT / name, Path(name)) for name in ("README.md", "LICENSE") if (ROOT / name).is_file()]
     return files
 
@@ -203,7 +203,7 @@ def main():
 
     PyInstaller.__main__.run(pyinstaller_args(ROOT / "naiz_studio.py", NAME, version=VERSION))
 
-    (release / "images").mkdir(parents=True, exist_ok=True)
+    (release / "setting" / "images").mkdir(parents=True, exist_ok=True)
     os.replace(dist / f"{NAME}.exe", exe)
     for source, relative in release_files():
         shutil.copy2(source, release / relative)
@@ -236,7 +236,7 @@ def make_icon(source):
         if size <= 48:
             frame = frame.filter(ImageFilter.UnsharpMask(radius=0.6, percent=60, threshold=2))
         frames.append(frame)
-    images = ROOT / "images"
+    images = ROOT / "setting" / "images"
     frames[-1].save(images / "app_icon.png")
     frames[-1].save(images / "app_icon.ico", sizes=[(s, s) for s in ICON_SIZES], append_images=frames[:-1])
     print(f"已更新 {images / 'app_icon.png'} 與 app_icon.ico({len(ICON_SIZES)} 種尺寸)")

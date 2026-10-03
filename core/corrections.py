@@ -1,4 +1,6 @@
-"""修正錯字:辨識完成後,把常辨識錯的字換成正確的字(不會重新辨識)。規則存在 config.json 的 corrections。
+"""修正錯字:辨識完成後,把常辨識錯的字換成正確的字(不會重新辨識)。
+規則可以存好幾個設定檔(例如一門課一個),每個設定檔是「setting\\transcript_corrections」資料夾裡的一個 .json
+(方便匯入匯出,見 profiles.py);config.json 的 corrections 只記開關和目前用哪一個(舊版的規則會自動搬過去)。
 
 比對方式:英文不分大小寫、只換完整單字(Map 不會換到 Mapping);中文直接比對。
 所有規則一次掃過,換上去的字不會再被別的規則換第二次;同一份檔案重複套用也不會越換越長。
@@ -7,32 +9,61 @@
 import re
 
 from . import paths, theme
+from .profiles import ProfileStore
 
 KEY = "corrections"
+DEFAULT_NAME = "預設"         # 舊版的規則、還沒建設定檔就新增規則時,放進這個設定檔
 _TIME = re.compile(r"\d+:\d+:\d+[,.]\d+\s*-->")
 _LABEL = re.compile(r"^((?:說話者|说话者) \d+:)")
 
 
+def _clean(rule):
+    wrong = str(rule.get("wrong", "")).strip()
+    if not wrong:
+        return None
+    return {"wrong": wrong, "right": str(rule.get("right", "")).strip(), "on": bool(rule.get("on", True))}
+
+
+STORE = ProfileStore("transcript_corrections", "錄音轉逐字稿的修正錯字規則：wrong=辨識錯的字、right=正確的字、on=是否啟用", _clean)
+
+
 def load():
-    config = theme.load_config(str(paths.APP_DIR))
+    """{"enabled": 開關, "active": 使用中的設定檔(沒有設定檔時是空字串), "profiles": {名稱: [規則]}}"""
+    config = theme.load_config(str(paths.SETTING_DIR))
     raw = config.get(KEY) if isinstance(config.get(KEY), dict) else {}
-    rules = []
-    for rule in raw.get("rules") if isinstance(raw.get("rules"), list) else []:
-        if isinstance(rule, dict) and str(rule.get("wrong", "")).strip():
-            rules.append({"wrong": str(rule["wrong"]).strip(), "right": str(rule.get("right", "")).strip(),
-                          "on": bool(rule.get("on", True))})
-    return {"enabled": bool(raw.get("enabled", True)), "rules": rules}
+    profiles = STORE.load()
+    active = str(raw.get("active", ""))
+    data = {"enabled": bool(raw.get("enabled", True)), "active": active, "profiles": profiles}
+    # 舊版(v1.18.0 以前)把規則直接存在 config.json:搬進「預設」設定檔
+    old = [rule for rule in (_clean(r) for r in raw.get("rules", []) if isinstance(r, dict)) if rule] \
+        if isinstance(raw.get("rules"), list) else []
+    if "rules" in raw:
+        if old:
+            target = profiles.setdefault(DEFAULT_NAME, [])
+            known = {rule["wrong"].lower() for rule in target}
+            target += [rule for rule in old if rule["wrong"].lower() not in known]
+            data["active"] = DEFAULT_NAME
+        save(data)          # config.json 裡的舊規則拿掉,刪掉「預設」後才不會又搬回來
+    if data["active"] not in profiles:
+        data["active"] = next(iter(profiles), "")
+    return data
 
 
 def save(data):
-    # 只改這一個鍵再寫回,不動到其他設定
-    stored = theme.load_config(str(paths.APP_DIR))
+    STORE.save(data["profiles"], data.pop("removed", ()))
+    # config.json 只改這一個鍵再寫回,不動到其他設定
+    stored = theme.load_config(str(paths.SETTING_DIR))
     stored[KEY] = {
-        "說明": "錄音轉逐字稿的修正錯字規則：wrong=辨識錯的字、right=正確的字、on=是否啟用",
+        "說明": "錄音轉逐字稿的修正錯字：enabled=是否開啟、active=使用中的設定檔；規則在「setting\\transcript_corrections」資料夾",
         "enabled": bool(data.get("enabled", True)),
-        "rules": [{"wrong": r["wrong"], "right": r["right"], "on": bool(r["on"])} for r in data.get("rules", [])],
+        "active": data.get("active", ""),
     }
-    return theme.save_config(str(paths.APP_DIR), stored)
+    return theme.save_config(str(paths.SETTING_DIR), stored)
+
+
+def rules(data):
+    """使用中的設定檔裡的規則(包含關掉的)。"""
+    return data["profiles"].get(data["active"], [])
 
 
 def _piece(text):

@@ -390,7 +390,7 @@ class Catalog:
         return None
 
     def _pdf_face(self, face_id):
-        """從 PDF 取出的原字型(見 pdffonts),存在 fonts\\pdf\\。"""
+        """從 PDF 取出的原字型(見 pdffonts),存在 setting\\fonts\\pdf\\。"""
         face = self._custom_cache.get(face_id)
         if face is None:
             path = paths.FONTS_DIR / "pdf" / face_id[4:]

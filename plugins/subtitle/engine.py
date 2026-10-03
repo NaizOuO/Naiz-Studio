@@ -62,8 +62,14 @@ _KANA = re.compile(r"[\u3040-\u30ff]")
 _TAGS = re.compile(r"\*[^*]*\*|\[[^\]]*\]|\([^)]*\)|（[^）]*）|【[^】]*】|[♪♫#]+")
 _SENTENCE_END = re.compile(r"[。？！.?!…][」』\"']?$")
 SPLIT_AFTER = 1.0           # 一口氣講好幾句時,前面講完的句子(前後兩次辨識都一樣)至少這麼長才先定稿
+SETTLE_SHORT = 0.6          # 定稿那次辨識的字數不到畫面上那句的這個比例,當作漏字,用畫面上那句
 BLIND_WINDOW = 4.0          # 配樂、爆炸很大聲時人聲偵測常抓不到台詞:每這麼多秒直接聽一次
 BLIND_LOUD = 500            # 聲音大小(RMS)超過這個才直接聽(安靜時不聽,免得對著靜音亂猜)
+GAIN_TARGET = 0.5           # 自動收音:把最近的峰值放大到這麼大(約 -6 dB)
+GAIN_MAX = 32.0             # 最多放大幾倍(Whisper 本身不怕小聲,主要是讓人聲偵測抓得到)
+GAIN_CEILING = 0.95         # 自動放大後的峰值不超過這個(突然很大聲時馬上降,不破音)
+GAIN_FLOOR = 0.0005         # 比這個小的片段當作安靜,不拿來估計(不然安靜時會越放越大)
+GAIN_WINDOW = 250           # 看最近幾段聲音(每段約 20 毫秒,約 5 秒)
 MIN_CONFIDENCE = -0.5       # 直接聽的結果:Whisper 的把握(平均對數機率)要高於這個才算數
 BLIND_SHIFT = 1.5           # 直接聽到東西時,多聽前面這麼多秒再聽一次確認
 
@@ -94,6 +100,34 @@ def merge(committed, hypothesis):
     return committed + hypothesis[block.b + block.size + rest:]
 
 
+def settle(displayed, committed, final):
+    """定稿的原文。定稿時會用整句的聲音重新辨識一次,但這次有時反而漏掉很多字(配樂、講很快時):
+    畫面上已經固定的開頭不改,只換後面不確定的字;定稿那次明顯比畫面上的短很多時,用畫面上那句。"""
+    if not displayed:
+        return final
+    text = merge(committed, final) if committed else final
+    if len(text) < len(displayed) * SETTLE_SHORT:
+        return displayed
+    return text
+
+
+def displayed_prefix(displayed, finished):
+    """拆成上下句時,前半句在畫面上那句裡對應的部分(finished 是最新辨識出的前半句)。
+    對應不起來(畫面上那句和最新辨識差太多)時回傳 None:這次先不拆,等辨識穩定。"""
+    if not displayed:
+        return finished
+    if displayed.startswith(finished):
+        return finished
+    matcher = difflib.SequenceMatcher(None, displayed, finished, autojunk=False)
+    blocks = [b for b in matcher.get_matching_blocks() if b.size]
+    if not blocks or sum(b.size for b in blocks) < len(finished) * 0.7:
+        return None
+    end = blocks[-1].a + blocks[-1].size
+    while end < len(displayed) and _CLAUSE.match(displayed[end]):        # 句尾的標點一起帶走
+        end += 1
+    return displayed[:end].rstrip()
+
+
 def stable_translation(text):
     """講到一半的翻譯裡可以先固定的部分:到最後一個逗號、句號為止;沒有的話留到倒數第三個字。"""
     marks = list(_CLAUSE.finditer(text))
@@ -122,6 +156,7 @@ class Line:
     translated_at: float = 0.0
     same: bool = False          # 原文就是目標語言,沒有翻譯
     segments: list = field(default_factory=list)    # 上一次辨識的分段(找出已經講完的句子)
+    notice: bool = False        # 字幕紀錄裡的說明行(變更設定、重新開始),不是有人說的話
 
 
 @dataclass
@@ -137,6 +172,7 @@ class Settings:
     step: float = 0.3           # 每收到這麼多秒的新聲音就重新辨識一次
     glossary: list = field(default_factory=list)    # 專有名詞 [(原文, 譯名)];字幕進行中改了也會馬上用
     verbatim: bool = True       # 辨識時保留語助詞、結巴(給 Whisper 口語的提示)
+    gain: str = "auto"          # 收音靈敏度:auto 自動放大太小的聲音,或固定倍數 "1" "2" "4"
     extra: dict = field(default_factory=dict)
 
 
@@ -250,6 +286,11 @@ class Engine:
         self._capture = None
         self._vad = None
         self.started_at = None
+        self._paused = threading.Event()    # 字幕進行中換辨識模型、聲音來源:聲音照收,辨識先停
+        self._reconfiguring = threading.Lock()
+        self.gain = 1.0                     # 目前放大的倍數(自動時會跟著聲音大小變)
+        self.level = 0.0                    # 最近的音量(0～1,放大前),畫面上可以顯示
+        self._peaks = []                    # 最近每段聲音的峰值(自動放大用)
 
     # ------------------------------------------------------------ 開始、停止
 
@@ -323,11 +364,42 @@ class Engine:
     # ------------------------------------------------------------ 聲音
 
     def _feed(self, pcm):
+        pcm = self._amplify(pcm)
         probs = self._vad.feed(pcm)
         with self._lock:
             self._audio += pcm
             self._probs += probs
         self._new_audio.set()
+
+    def _amplify(self, pcm):
+        """收音靈敏度:聲音太小時放大(人聲偵測和辨識對太小的聲音不靈敏)。
+        自動:看最近幾秒的峰值,放大到峰值約 -6 dB,最多 8 倍;安靜時不會越放越大(只看夠響的片段)。"""
+        if not pcm:
+            return pcm
+        import numpy
+
+        samples = numpy.frombuffer(pcm, numpy.int16).astype(numpy.float32)
+        peak = float(numpy.abs(samples).max()) / 32768
+        self.level = peak
+        setting = self.settings.gain
+        if setting == "auto":
+            if peak > GAIN_FLOOR:                       # 只用有聲音的片段估計(安靜時保持原本的倍數)
+                self._peaks = (self._peaks + [peak])[-GAIN_WINDOW:]
+            if self._peaks:
+                loud = sorted(self._peaks)[int(len(self._peaks) * 0.9)]
+                wanted = min(GAIN_MAX, max(1.0, GAIN_TARGET / max(loud, 1e-4)))
+                # 慢慢調,音量突然變大(爆炸聲)時馬上降,免得破音
+                self.gain = wanted if wanted < self.gain else self.gain + (wanted - self.gain) * 0.05
+            if peak * self.gain > GAIN_CEILING:      # 這一段放大後會破音:馬上降到剛好不破
+                self.gain = max(1.0, GAIN_CEILING / max(peak, 1e-4))
+        else:
+            try:
+                self.gain = max(0.25, float(setting))
+            except ValueError:
+                self.gain = 1.0
+        if abs(self.gain - 1.0) < 0.05:
+            return pcm
+        return numpy.clip(samples * self.gain, -32768, 32767).astype(numpy.int16).tobytes()
 
     def _now(self):
         """目前收到的聲音長度(秒,從開始算)。"""
@@ -374,6 +446,15 @@ class Engine:
                 return start + index * FRAME_SECONDS
         return None
 
+    def _sentence_cut(self, line, sentence, now):
+        """一句太長時切在哪:最近一次辨識裡,最後一個講完的句子的結尾(至少 2 秒、離現在至少 0.5 秒);沒有的話 None。"""
+        if line is None or not line.segments:
+            return None
+        groups = sentences(line.segments, line.language in SPACED)[:-1]      # 最後一句可能還在講
+        ends = [sentence + g[1] for g in groups if _SENTENCE_END.search(g[2]) and g[1] >= 2.0]
+        ends = [t for t in ends if t <= now - 0.5]
+        return ends[-1] if ends else None
+
     def _quietest(self, start, end):
         """start～end 之間最安靜的地方(一句太長要切開時切在這裡)。"""
         with self._lock:
@@ -406,6 +487,8 @@ class Engine:
                 self._fail(self._capture.error)
                 return
             now = self._now()
+            if self._paused.is_set():
+                continue                    # 換辨識模型、聲音來源中:聲音先存著,好了再一起辨識
             if sentence is None:
                 begin = self._first_speech(scanned, now)
                 scanned = max(scanned, now - 0.1)
@@ -414,6 +497,8 @@ class Engine:
                         try:
                             self._blind(max(blind_at, now - BLIND_WINDOW), now)
                         except Exception as exc:
+                            if self._paused.is_set():
+                                continue            # 正在換辨識模型:舊的被關掉了,不算出錯
                             self._fail(f"語音辨識中斷：{exc}")
                             return
                         blind_at = now
@@ -432,7 +517,9 @@ class Engine:
             last = now
             end = now
             if too_long and not done:
-                end = self._quietest(now - 4, now)                  # 切在最近 4 秒內最安靜的地方
+                # 一句太長要切開:優先切在句子結尾(最近一次辨識的句號、問號),找不到才切在最近 4 秒內最安靜的地方
+                # (有配樂時最安靜的地方常在句子中間,切下來的前半句會只剩一兩個字)
+                end = self._sentence_cut(line, sentence, now) or self._quietest(now - 4, now)
             elif done:
                 end = now - quiet + 0.2
             speech = self._speech(sentence, end)
@@ -462,6 +549,8 @@ class Engine:
                         # 自動判斷出是中文:加上提示再辨識一次(繁體、有標點)
                         text, _, _ = self.server.transcribe(audio, "zh", self._prompt("zh"))
             except Exception as exc:
+                if self._paused.is_set():
+                    continue                    # 正在換辨識模型:舊的被關掉了,這次不算,換好後重新辨識
                 self._fail(f"語音辨識中斷：{exc}")
                 return
             self.costs = (self.costs + [time.perf_counter() - started])[-20:]
@@ -476,13 +565,30 @@ class Engine:
                     line = Line(self._next_id, sentence, end, language=language)
                     self._next_id += 1
                     self.lines.append(line)
+                if final and line.original and line.language and line.language != language \
+                        and len(text) < len(line.original) * SETTLE_SHORT:
+                    # 定稿時語言判斷改了、字又少很多(日文長句變成英文「Wait.」):多半是判斷錯,照畫面上那句
+                    text, language = line.original, line.language
+                # 畫面上已經顯示的原文(同一種語言時才拿來比;語言判斷改了的話整句換掉是對的)
+                displayed = line.original if line.language == language else ""
                 line.end, line.language = end, language
                 if final:
                     groups = sentences(segments, spaced) if end - sentence > 4 else []
+                    joined = "".join(g[2] for g in groups)
+                    if displayed and len(joined) < len(displayed) * SETTLE_SHORT:
+                        groups = []                     # 定稿那次漏掉很多字:不拆,用畫面上那句
                     if len(groups) > 1:
                         self._finish_groups(line, groups, sentence, speech)    # 一口氣講好幾句:一句一行
                     else:
-                        line.original = text
+                        if too_long and not done:
+                            # 被切開的前半句:和畫面上那句對應的部分(後半句會變成下一句,不能整句留著);
+                            # 定稿那次辨識和畫面對不上時,用最近一次辨識裡切點之前的那幾句
+                            planned = (" " if spaced else "").join(
+                                g[2] for g in sentences(line.segments, spaced) if sentence + g[1] <= end + 0.05)
+                            shown = displayed_prefix(displayed, text) or displayed_prefix(displayed, planned) or planned
+                            line.original = settle(shown or "", "", text)
+                        else:
+                            line.original = settle(displayed, line.committed, text)
                         self._commit(line)
                 else:
                     # 一口氣講好幾句(對話很快、沒停頓):前面講完、前後兩次辨識都一樣的句子先定稿,後面的當新的一句
@@ -490,8 +596,10 @@ class Engine:
                     line.segments = segments
                     finished = (" " if spaced else "").join(g[2] for g in sentences(segments, spaced)[:count])
                     finished = self._clean(finished, speech, language) if count else ""
-                    if finished and cut >= SPLIT_AFTER and end - (sentence + cut) >= 0.5:
-                        line.original, line.end = finished, sentence + cut
+                    # 前半句照畫面上顯示的字切(用最新辨識的字的話,看過的內容會被換掉);對不起來就先不拆
+                    first_half = displayed_prefix(displayed, finished) if finished else None
+                    if first_half and cut >= SPLIT_AFTER and end - (sentence + cut) >= 0.5:
+                        line.original, line.end = first_half, sentence + cut
                         self._commit(line)
                         self.on_update()
                         sentence, line, last = sentence + cut, None, now
@@ -565,7 +673,8 @@ class Engine:
         """這句定稿、送去翻譯。只有語助詞(「嗯。」「えーと」)又緊接在上一句後面時,接到上一句後面,
         不另外佔一行(字幕才不會一行一個「嗯」,太零碎)。"""
         line.final = True
-        previous = next((l for l in reversed(self.lines) if l.final and l is not line and l.original), None)
+        previous = next((l for l in reversed(self.lines)
+                         if l.final and l is not line and l.original and not l.notice), None)
         if previous is not None and filler_only(line.original, line.language) \
                 and line.start - previous.end <= MERGE_GAP and len(previous.original) < MERGE_LIMIT:
             joiner = " " if previous.language in SPACED else ""
@@ -669,7 +778,7 @@ class Engine:
                 line, text, final, queued = job
             # 前面三句的原文和譯文:人名、稱呼才會前後一致(只給原文時同一個人名每句翻得不一樣)
             context = [(l.original, "" if l.same else l.translation)
-                       for l in self.lines if l.final and l.id < line.id][-3:]
+                       for l in self.lines if l.final and l.id < line.id and not l.notice][-3:]
             language = line.language or s.language
             # 講到一半:接著上次的翻譯繼續翻(已經固定的部分不重翻),原文是接著上次翻的那段長出來的才這樣做。
             # 講完:整句重翻(接著半句的翻譯硬接,容易變成「前半句的翻譯 + 整句的翻譯」);
@@ -708,11 +817,108 @@ class Engine:
     # ------------------------------------------------------------ 給畫面用
 
     def recent(self, count=2):
-        """字幕上要顯示的幾句:最後一句(可能還在長),和它前一句(如果是最近才講完的)。"""
-        lines = [line for line in self.lines if line.original]
-        if not lines:
-            return []
-        shown = lines[-count:]
+        """字幕上要顯示的最後幾句:[(那一句, 講完幾秒了)];還在講的那句是 0 秒。說明行不算。"""
+        lines = [line for line in self.lines if line.original and not line.notice]
         now = self._now() if self.started_at is not None else 0
-        return [line for line in shown if line is lines[-1] or now - line.end < 8]
+        return [(line, max(0.0, now - line.end) if line.final else 0.0) for line in lines[-count:]]
+
+    # ------------------------------------------------------------ 字幕進行中改設定
+
+    def notice(self, text):
+        """在字幕紀錄裡加一行說明(變更設定、重新開始);字幕視窗不顯示。"""
+        now = self._now() if self.started_at is not None else 0.0
+        line = Line(self._next_id, now, now, original=text, final=True, notice=True)
+        self._next_id += 1
+        self.lines.append(line)
+        self.on_update()
+
+    def reconfigure(self, changes, summary):
+        """字幕進行中改設定:changes 是 {Settings 欄位: 新值},summary 是給人看的「辨識模型 推薦 → 最準確」。
+        換辨識模型、聲音來源要短暫中斷:聲音照收、辨識先停,重新載入好了再補上這段時間的字幕;
+        其他設定下一句就用新的。字幕紀錄裡會記下變更了什麼、說明、什麼時候繼續。"""
+        s = self.settings
+        old_translator, was_translating = s.translator, s.translate
+        restart_model = "model" in changes and changes["model"] != s.model
+        restart_source = any(k in changes and changes[k] != getattr(s, k) for k in ("source", "pid"))
+        for key, value in changes.items():
+            setattr(s, key, value)
+        if not (restart_model or restart_source):
+            self.notice(f"變更設定：{summary}（下一句開始套用）")
+            self._switch_translator(old_translator, was_translating)
+            return
+        self.notice(f"變更設定：{summary}")
+        if restart_model:
+            gpu = "（顯示卡約需 30 秒）" if asr.gpu() else ""
+            self.notice(f"說明：正在載入新的辨識模型{gpu}，這段時間的聲音會先存著，載入後補上字幕")
+        else:
+            self.notice("說明：正在換聲音來源，換好就繼續")
+        self._paused.set()
+
+        def work():
+            began = time.monotonic()
+            with self._reconfiguring:
+                try:
+                    if restart_source:
+                        self._restart_capture()
+                    if restart_model:
+                        self.message = "載入新的辨識模型"
+                        self.on_update()
+                        old, self.server = self.server, None
+                        if old is not None:
+                            old.stop()                  # 先關舊的,顯示卡才放得下新的
+                        server = asr.Server(s.model)
+                        server.start(cancel=self._stop)
+                        if self._stop.is_set():
+                            server.stop()               # 載入時使用者按了停止:不留下沒人管的辨識程式
+                            return
+                        self.server = server
+                    if self._stop.is_set():
+                        return
+                    self.costs = []
+                    self.state, self.message = "running", "字幕進行中"
+                    self._paused.clear()
+                    self._new_audio.set()
+                    # 字幕紀錄左邊的時間是「開始後過了多久」,這裡不寫時鐘時間,寫中斷了多久
+                    self.notice(f"字幕繼續（中斷了 {max(1, round(time.monotonic() - began))} 秒）")
+                    self._switch_translator(old_translator, was_translating)
+                except Exception as exc:
+                    if not self._stop.is_set():
+                        self._fail(f"變更設定失敗：{exc}")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _restart_capture(self):
+        s = self.settings
+        if self._capture is not None:
+            self._capture.stop()
+        if self._capture_factory is not None:
+            self._capture = self._capture_factory(self._feed)
+        else:
+            from .capture import Capture
+            self._capture = Capture(s.source, self._feed, s.pid)
+        self._capture.start()
+        if hasattr(self._capture, "started"):
+            self._capture.started.wait(5)
+        if getattr(self._capture, "error", ""):
+            raise RuntimeError(self._capture.error)
+
+    def _switch_translator(self, old, was_translating):
+        """換翻譯模型或打開翻譯:先載入新的(載好前照常用舊的設定翻),再把舊的移出顯示卡。"""
+        s = self.settings
+        if not s.translate or (s.translator == old and was_translating):
+            if was_translating and not s.translate:
+                threading.Thread(target=ollama.unload, args=(old,), daemon=True).start()
+            return
+
+        def work():
+            try:
+                ollama.preload(s.translator)
+            except Exception as exc:
+                self.message = f"翻譯模型載入失敗：{exc}"
+                self.on_update()
+                return
+            if was_translating and old != s.translator:
+                ollama.unload(old)
+
+        threading.Thread(target=work, daemon=True).start()
 

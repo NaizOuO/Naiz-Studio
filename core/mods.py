@@ -20,13 +20,13 @@ NAME_PATTERN = re.compile(r"^[A-Za-z0-9_\-]+$")
 # ------------------------------------------------------------ 啟用清單(存在 config.json)
 
 def enabled():
-    return set(theme.load_config(str(paths.APP_DIR)).get(CONFIG_KEY, []))
+    return set(theme.load_config(str(paths.SETTING_DIR)).get(CONFIG_KEY, []))
 
 
 def _save_enabled(names):
-    stored = theme.load_config(str(paths.APP_DIR))       # 只改這一個鍵,其他設定照原樣寫回
+    stored = theme.load_config(str(paths.SETTING_DIR))       # 只改這一個鍵,其他設定照原樣寫回
     stored[CONFIG_KEY] = sorted(names)
-    theme.save_config(str(paths.APP_DIR), stored)
+    theme.save_config(str(paths.SETTING_DIR), stored)
 
 
 def enable(name):

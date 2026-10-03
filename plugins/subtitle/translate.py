@@ -28,6 +28,15 @@ TARGETS = [("zh-TW", "台灣繁體中文", "Traditional Chinese (Taiwan)", "zh-T
 TARGET_NAMES = {key: name for key, name, _, _ in TARGETS}
 SOURCE_NAMES = {"en": "English", "ja": "Japanese", "ko": "Korean", "zh": "Chinese", "es": "Spanish", "fr": "French",
                 "de": "German", "ru": "Russian", "th": "Thai", "vi": "Vietnamese"}
+# 實測翻譯很差的模型(名稱含這些字):選單上標「不建議」,選了會提醒
+NOT_RECOMMENDED = {"llama3-taide": "翻出來常和原文無關", "llama-3-taiwan": "日文常翻錯"}
+
+
+def not_recommended(name):
+    """實測很差的模型回傳原因,其他回傳空字串。"""
+    return next((reason for key, reason in NOT_RECOMMENDED.items() if key in name), "")
+
+
 # 建議下載的模型:(名稱, 大小, 大約需要的顯示卡記憶體 GB, 說明);依電腦配備標出建議
 SUGGESTED = [
     ("translategemma:4b", "3.3 GB", 4, "Google 的翻譯專用模型；沒有獨立顯示卡也能用(每句約 2～3 秒)"),

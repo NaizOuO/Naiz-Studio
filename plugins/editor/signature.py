@@ -1,6 +1,6 @@
 """插入的圖片與簽名:讀圖、手寫簽名、從照片取出簽名,以及選簽名的小視窗。
 
-簽名存在程式資料夾的 signatures\\(PNG,背景透明),只存在本地,下次可以直接點選使用。
+簽名存在程式資料夾的 setting\\signatures\\(PNG,背景透明),只存在本地,下次可以直接點選使用。
 """
 
 import io
@@ -30,7 +30,7 @@ ERASER_RADIUS = 9           # 簽名板橡皮擦的半徑(像素)
 
 
 def sign_dir():
-    return paths.APP_DIR / "signatures"
+    return paths.SIGNATURES_DIR
 
 
 # ------------------------------------------------------------ 圖片
@@ -399,7 +399,7 @@ class SignaturePanel:
     def _draw_list(self, screen, panel, mouse_pos):
         x, inner = panel.x + 24, PANEL_W - 48
         draw_text(screen, "簽名", (x, panel.y + 18), 17, theme.TEXT, bold=True)
-        draw_text(screen, "點一下簽名就能放到頁面上；簽名只存在本地的 signatures\\ 資料夾",
+        draw_text(screen, "點一下簽名就能放到頁面上；簽名只存在本地的 setting\\signatures\\ 資料夾",
                   (x, panel.y + 48), 12, theme.TEXT_FAINT)
         area = pygame.Rect(x, panel.y + 76, inner, panel.height - 76 - 100)
         rounded_panel(screen, area, theme.BG_DEEP, radius=10, alpha=200)

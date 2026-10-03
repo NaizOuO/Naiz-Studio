@@ -1,4 +1,7 @@
-"""專有名詞的編輯視窗:建立、刪除設定檔,在設定檔裡新增、開關、刪除名詞(和逐字稿的「修正錯字」同一套操作)。"""
+"""專有名詞的編輯視窗:建立、刪除設定檔,在設定檔裡新增、開關、刪除名詞(和逐字稿的「修正錯字」同一套操作);
+「開啟資料夾」打開設定檔所在的資料夾,方便匯入匯出。"""
+
+import os
 
 import pygame
 
@@ -33,6 +36,7 @@ class GlossaryDialog:
         self.target = TextInput(placeholder="譯名，例如：尼亞", accent=accent, size=14)
         self.btn_add = Button("新增", accent=accent, size=14)
         self.btn_close = Button("關閉", filled=False, size=14)
+        self.btn_folder = Button("開啟資料夾", filled=False, size=13)
         self.view = ScrollView(accent=accent)
         self.list_area = pygame.Rect(0, 0, 0, 0)
         self.rows = []
@@ -99,6 +103,7 @@ class GlossaryDialog:
             return
         removed = self.editing
         del self.data["profiles"][removed]
+        self.data.setdefault("removed", []).append(removed)     # 存檔時把它的檔案刪掉
         if self.data["active"] == removed:
             self.data["active"] = glossary.NONE
         self.editing = next(iter(self.data["profiles"]), "")
@@ -181,6 +186,8 @@ class GlossaryDialog:
             self.add()
         elif self.btn_close.clicked(pos, True):
             self.close()
+        elif self.btn_folder.clicked(pos, True):
+            os.startfile(glossary.STORE.ensure_folder())
 
     # ------------------------------------------------------------ 繪製
 
@@ -271,4 +278,7 @@ class GlossaryDialog:
         screen.set_clip(None)
         self.view.draw(screen, mouse_pos)
         self.btn_close.draw(screen, pygame.Rect(panel.right - 24 - 90, footer_y, 90, 36), mouse_pos)
+        self.btn_folder.draw(screen, pygame.Rect(x, footer_y, 110, 36), mouse_pos)
+        draw_text(screen, widgets.clip_text("設定檔存在這裡，可以複製給別人，或放入別人給的檔案", 12, inner - 240),
+                  (x + 122, footer_y + 11), 12, theme.TEXT_FAINT)
         self.profile.draw_menu(screen, mouse_pos)

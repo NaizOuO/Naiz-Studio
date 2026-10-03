@@ -92,7 +92,7 @@ class FontPicker:
         sections = [
             ("常用", "最近用過的字型", recent, "recent", "還沒有用過的字型"),
             ("本地", "電腦上的字型，依字型檔的授權設定判斷能不能嵌入", fonts.CATALOG.system, "system", "沒有字型"),
-            ("個人", "自己加入的字型，放在 fonts\\custom\\；也可以把字型檔直接拖進這個視窗",
+            ("個人", "自己加入的字型，放在 setting\\fonts\\custom\\；也可以把字型檔直接拖進這個視窗",
              fonts.CATALOG.custom(), "custom", "還沒有加入字型"),
             ("開源", "開源字型包，需要時才下載，可以自由嵌入 PDF", fonts.CATALOG.packs(), "pack", "沒有字型"),
         ]

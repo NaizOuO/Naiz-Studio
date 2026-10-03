@@ -1051,6 +1051,7 @@ class PhotoPage(Page):
         view.draw(screen, mouse_pos)
         self._side_view, self.side_clip = view, side
         self._clip_side(side)
+        return bottom
 
     def _clip_side(self, clip):
         def cut(rect):
@@ -1581,7 +1582,8 @@ class PhotoPage(Page):
             self.gallery = []
             editor.canvas = self.canvas
             editor._draw_warp(self.screen, mouse_pos)
-            self._scrolled_side(side, self._draw_scan_side, mouse_pos)
+            bottom = self._scrolled_side(side, self._draw_scan_side, mouse_pos)
+            editor.draw_loupe(self.screen, side, bottom)     # 放大鏡放在設定區下方,不擋圖片
             self.hover_preset = next(((changes, name) for rect, changes, name in self.gallery
                                       if rect.collidepoint(mouse_pos)), None)
         # 畫面下方的單獨按鈕:對準四角 ↔ 預覽結果
@@ -1736,7 +1738,8 @@ class PhotoPage(Page):
                     text = "選好方式按「自動去背」；背景透明時，原格式的 JPG 會自動存成 PNG"
                 color = theme.TEXT_DIM
             elif mode == "scan":
-                text, color = ("拖曳四個角對準文件的邊，滑鼠停在角上可用方向鍵微調；對好後按「預覽結果」或 Enter，Esc 取消"
+                text, color = ("拖曳四個角對準文件的邊；點選的角會在右邊放大，拖曳放大圖裡的圖片或按方向鍵微調；"
+                               "對好後按「預覽結果」或 Enter，Esc 取消"
                                if self.editor.warping else "邊沒對準時按畫面下方的「調整四個角」；依左邊清單的順序輸出"), \
                     theme.TEXT_DIM
             else:
@@ -1816,6 +1819,8 @@ class PhotoPage(Page):
         if event.type == pygame.KEYDOWN and event.key in (pygame.K_LEFT, pygame.K_RIGHT) \
                 and self.mode.value == "cutout" and self.current is not None and self._cutout_event(event, mouse_pos):
             return                  # 滑鼠停在去背的滑桿上按 ← →:細調數值(設定區的捲動不會先接走)
+        if self.mode.value == "scan" and self.current is not None and self.editor.handle_loupe(event, mouse_pos):
+            return                  # 放大鏡蓋在設定區下方,要比設定先處理
         side_view = self._side_view
         # 捲動條在設定區右邊緣外一點;拖曳捲動條、中鍵自動捲動時滑鼠移出範圍也要繼續交給它
         if self.mode.value in ("color", "effect", "scan", "hd", "cutout") and side_view is not None \

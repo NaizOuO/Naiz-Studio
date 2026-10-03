@@ -51,7 +51,7 @@ class SettingsPanel:
     # ------------------------------------------------------------ 狀態
 
     def open(self):
-        self.bg_files = theme.list_images(str(paths.APP_DIR))
+        self.bg_files = theme.list_images(paths.IMAGES_DIR)
         current = self.config.get("bg_image", "")
         self.bg_index = self.bg_files.index(current) + 1 if current in self.bg_files else 0
         self.mode.index = next(
@@ -93,12 +93,12 @@ class SettingsPanel:
             self.dirty = True
 
     def save(self):
-        if theme.save_config(str(paths.APP_DIR), self.config):
+        if theme.save_config(str(paths.SETTING_DIR), self.config):
             self.dirty = False
             self.saved_at = pygame.time.get_ticks()
 
     def revert(self):
-        self.app.config = theme.load_config(str(paths.APP_DIR))
+        self.app.config = theme.load_config(str(paths.SETTING_DIR))
         self.app.rebuild_background()
         self.open()
 

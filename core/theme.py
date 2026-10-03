@@ -126,6 +126,7 @@ def _backup_broken_config(base_dir: str, path: str) -> bool:
 def save_config(base_dir: str, config: dict) -> bool:
     # 先寫暫存檔再換掉原檔:寫到一半程式被關掉或磁碟滿了,原本的 config.json 也不會被寫壞
     try:
+        Path(base_dir).mkdir(parents=True, exist_ok=True)
         with files.atomic_path(Path(base_dir) / "config.json") as temp:
             with open(temp, "w", encoding="utf-8") as fp:
                 json.dump(config, fp, indent=4, ensure_ascii=False)
@@ -139,8 +140,7 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
 UI_ASSET_PREFIXES = ("app_icon", "ui_")
 
 
-def list_images(base_dir: str) -> list:
-    folder = os.path.join(base_dir, "images")
+def list_images(folder) -> list:
     if not os.path.isdir(folder):
         return []
     return sorted(name for name in os.listdir(folder)
@@ -148,12 +148,12 @@ def list_images(base_dir: str) -> list:
                   and not name.lower().startswith(UI_ASSET_PREFIXES))
 
 
-def load_background(base_dir: str, config: dict):
-    """讀 images/ 裡指定的背景圖;沒設定或載入失敗就回傳 None,改用純色底。"""
+def load_background(folder, config: dict):
+    """讀圖片資料夾(setting\\images)裡指定的背景圖;沒設定或載入失敗就回傳 None,改用純色底。"""
     name = config.get("bg_image", "")
     if not name:
         return None
-    path = os.path.join(base_dir, "images", name)
+    path = os.path.join(folder, name)
     if not os.path.exists(path):
         return None
     try:

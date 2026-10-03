@@ -36,6 +36,10 @@ SILENT = 0x2
 CLSCTX_ALL = 23
 E_CAPTURE, E_CONSOLE = 1, 0
 SESSION_ACTIVE = 1
+SESSION_EXPIRED = 2
+# 開著視窗但不會出聲音、列出來只會讓清單變長的系統程式
+HIDDEN_PROGRAMS = {"explorer.exe", "textinputhost.exe", "applicationframehost.exe", "systemsettings.exe",
+                   "shellexperiencehost.exe", "searchhost.exe", "startmenuexperiencehost.exe", "lockapp.exe"}
 
 
 class WAVEFORMATEX(Structure):
@@ -377,8 +381,28 @@ def _description(path):
     return name
 
 
+def _window_pids():
+    """有開著(看得到、有標題)視窗的程式。"""
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    pids = set()
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def visit(hwnd, _):
+        if user32.IsWindowVisible(hwnd) and user32.GetWindowTextLengthW(hwnd) > 0 \
+                and not user32.GetWindow(hwnd, 4):                               # 不算附屬在別的視窗下的
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, byref(pid))
+            pids.add(pid.value)
+        return True
+
+    user32.EnumWindows(callback_type(visit), 0)
+    return pids
+
+
 def audio_programs():
-    """正在發出聲音的程式:[(pid, 名稱)]。pid 是同一個程式最上層的那個(瀏覽器會開很多子程式,一起抓)。
+    """可以單獨抓聲音的程式:[(pid, 名稱)],正在播放的排前面、名稱後面標「播放中」。
+    除了正在播放的,也列出出過聲音(現在安靜)的程式和開著視窗的程式:選了之後它一出聲就抓得到
+    (沒有聲音的程式本來就抓不到東西,不會出錯)。pid 是同一個程式最上層的那個(瀏覽器會開很多子程式,一起抓)。
     要在背景執行緒呼叫。"""
     _init_thread()
     enumerator = comtypes.CoCreateInstance(CLSID_ENUMERATOR, IMMDeviceEnumerator, CLSCTX_ALL)
@@ -388,13 +412,23 @@ def audio_programs():
     sessions = manager.GetSessionEnumerator()
     processes = _processes()
     own = os.getpid()
-    found = {}
+    candidates = {}                                     # pid → 是否正在播放
     for index in range(sessions.GetCount()):
         control = sessions.GetSession(index).QueryInterface(IAudioSessionControl2)
         pid = control.GetProcessId()
-        if not pid or pid == own or control.GetState() != SESSION_ACTIVE:
+        state = control.GetState()
+        if pid and state != SESSION_EXPIRED:
+            candidates[pid] = candidates.get(pid, False) or state == SESSION_ACTIVE
+    try:
+        for pid in _window_pids():
+            candidates.setdefault(pid, False)
+    except OSError:
+        pass
+    found = {}
+    for pid, playing in candidates.items():
+        if pid == own or pid not in processes:
             continue
-        exe = processes.get(pid, (0, ""))[1].lower()
+        exe = processes[pid][1].lower()
         root = pid
         seen = set()
         while root in processes and root not in seen:           # 往上找同一個執行檔的最上層
@@ -404,8 +438,13 @@ def audio_programs():
                 root = parent
             else:
                 break
-        if root == own:
+        if root == own or exe in HIDDEN_PROGRAMS:
+            continue
+        key = exe or str(pid)
+        if key in found:
+            found[key] = (found[key][0], found[key][1], found[key][2] or playing)
             continue
         path = _exe_path(root) or _exe_path(pid)
-        found.setdefault(exe or str(pid), (root, _description(path) if path else exe or str(pid)))
-    return sorted(found.values(), key=lambda item: item[1].lower())
+        found[key] = (root, _description(path) if path else exe or str(pid), playing)
+    ordered = sorted(found.values(), key=lambda item: (not item[2], item[1].lower()))
+    return [(pid, f"{name}（播放中）" if playing else name) for pid, name, playing in ordered]
