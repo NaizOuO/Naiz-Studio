@@ -43,10 +43,11 @@ SPACE_MARGIN = 100 * 1024 * 1024
 
 
 def _check_space(dep, folder, total):
-    """下載檔和解出來的檔案會同時存在,至少要有兩倍大小再多留一點;不夠就在下載前停下來。"""
+    """壓縮檔和解出來的檔案會同時存在,至少要有兩倍大小再多留一點(單一檔案只要一份);不夠就在下載前停下來。"""
     if not total:
         return
-    need = total + max(total, dep.install_size) + SPACE_MARGIN
+    single = not dep.folder and not dep.installer and list(dep.files.values()) == [None]
+    need = total + (0 if single else max(total, dep.install_size)) + SPACE_MARGIN     # 單一檔案下載完直接改名
     free = shutil.disk_usage(folder).free
     if free < need:
         raise DiskSpaceError(f"磁碟空間不足：下載 {dep.name} 約需要 {human_size(need)}，"
@@ -121,6 +122,14 @@ class Dependency:
 
     def path(self, filename=None):
         return self.base_dir / (filename or next(iter(self.files)))
+
+    def place(self) -> str:
+        """下載後放在哪個資料夾(相對於程式資料夾),顯示給使用者看,例如「models\\llm」。"""
+        folder = self.base_dir / self.folder if self.folder else self.path().parent
+        try:
+            return str(folder.relative_to(paths.APP_DIR))
+        except ValueError:
+            return str(folder)
 
     def installed(self) -> bool:
         return all((self.base_dir / name).is_file() and (self.base_dir / name).stat().st_size > 0
@@ -318,7 +327,9 @@ def _extract_files(dep: Dependency, download):
             destination = base / target
             destination.parent.mkdir(parents=True, exist_ok=True)
             partial = destination.with_name(destination.name + ".part")
-            if member_suffix is None:
+            if member_suffix is None and len(dep.files) == 1:
+                download.replace(partial)           # 單一大檔(例如十幾 GB 的模型)直接改名,不用再複製一份
+            elif member_suffix is None:
                 shutil.copyfile(download, partial)
             else:
                 opener = next((open_ for name, open_ in entries if name.endswith(member_suffix)), None)

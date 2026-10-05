@@ -492,7 +492,7 @@ class Engine:
                 self.on_update()
                 if not ollama.running():
                     raise RuntimeError("Ollama 沒有在執行，請先打開 Ollama")
-                ollama.preload(s.translator)
+                ollama.preload(s.translator, cancel=self._stop.is_set)     # 按停止時內建引擎不用等載入完
             if self._stop.is_set():
                 return
             threading.Thread(target=self._translate_loop, daemon=True).start()

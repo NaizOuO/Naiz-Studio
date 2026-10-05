@@ -88,8 +88,8 @@
   也可以改用門檻比對，自己調門檻（設定檔存在 `setting\subtitle_speakers`）。需要下載約 51 MB 的元件
 - 收音靈敏度：電腦音量開得很小時自動放大，也可以固定放大倍數
 - 字幕紀錄自動存在 `output\subtitles`，可以選存成 SRT、TXT、兩者，或不存檔
-- 辨識模型四種（快速、輕量、推薦、最準確），翻譯用本地的 [Ollama](https://ollama.com)；程式會依電腦配備先選好建議的組合，所有選項都可以自己換
-- 翻譯模型在「翻譯模型」視窗裡管理：每個模型都寫出說明、大小和需要的顯示卡記憶體，可以下載、選用、刪除；有給高階電腦用的大模型（需要約 20 GB 以上的顯示卡記憶體），配備不夠時下載前會先提醒
+- 辨識模型四種（快速、輕量、推薦、最準確）；翻譯在本地執行，已安裝 [Ollama](https://ollama.com) 就用 Ollama，沒有的話用內建的翻譯引擎（llama.cpp），模型從網路下載。程式會依電腦配備先選好建議的組合，所有選項都可以自己換
+- 翻譯模型在「翻譯模型」視窗裡管理：每個模型都寫出說明、大小和需要的顯示卡記憶體，可以下載、選用、刪除；有給高階電腦用的大模型（需要約 20 GB 以上的顯示卡記憶體），配備不夠時下載前會先提醒。用內建翻譯引擎時，第一次下載會連同引擎（約 32 MB）一起下載，下載前會先說明
 - 全部在本地運算，聲音不會上傳；字幕只能從 Naiz Studio 停止，關掉 Naiz Studio 字幕也會一起關
 - 「獨佔全螢幕」的遊戲蓋不上任何視窗，請在遊戲設定改成「無邊框視窗」
 
@@ -139,7 +139,7 @@ python naiz_studio.py
 - **文件轉檔**：有裝 Office 就直接可用；沒有的話需要下載 LibreOffice。掃描檔文字辨識需要下載 Tesseract，一頁約 3 秒
 - **影音轉檔**：需要下載 FFmpeg。NVIDIA 顯示卡實測可以加速（RTX 5060 Ti 轉 30 秒 1080p 影片約 2 秒）；AMD、Intel 顯示卡程式會自動偵測，但還沒有實測
 - **錄音轉逐字稿**：需要下載語音辨識元件，速度取決於顯示卡
-- **即時字幕**：需要下載語音辨識元件；翻譯需要另外安裝免費的 Ollama。依電腦配備的建議：
+- **即時字幕**：需要下載語音辨識元件；翻譯模型在「翻譯模型」視窗下載（有 Ollama 時透過 Ollama 下載）。依電腦配備的建議：
 
 | 電腦 | 辨識模型 | 翻譯模型 | 實測 |
 |---|---|---|---|
@@ -285,7 +285,7 @@ TOOLS = [HelloTool]
 | `output\documents\` | 文件轉檔的結果 |
 | `output\media\` | 影音轉檔的結果 |
 | `output\transcripts\` | 逐字稿 |
-| `bin\`、`models\` | 下載的元件 |
+| `bin\`、`models\` | 下載的元件；內建翻譯引擎的模型在 `models\llm` |
 | `mods\` | 擴充模組，一個模組一個資料夾 |
 | `mods_data\` | 擴充模組自己存的設定與資料 |
 | `setting\config.json` | 設定（背景、各功能的選項等） |
@@ -337,7 +337,10 @@ TOOLS = [HelloTool]
 | [comtypes](https://github.com/enthought/comtypes) | 即時字幕擷取電腦播放的聲音 | MIT |
 | [fugashi](https://github.com/polm/fugashi)（[MeCab](https://taku910.github.io/mecab/)） | 即時字幕的日文斷詞（振假名） | MIT / BSD-3-Clause |
 | [IPADIC](https://pypi.org/project/ipadic/)（奈良先端科學技術大學院大學） | 即時字幕振假名用的日文讀音字典 | IPADIC 授權（允許自由使用與散布，須保留版權聲明） |
-| [Ollama](https://github.com/ollama/ollama)（使用者自行安裝） | 即時字幕的本地翻譯；翻譯模型由 Ollama 下載，各自依原本的授權（Qwen3 為 Apache-2.0，TranslateGemma 為 Gemma 使用條款） | MIT |
+| [Ollama](https://github.com/ollama/ollama)（使用者自行安裝） | 即時字幕的本地翻譯（有安裝時使用）；翻譯模型由 Ollama 下載 | MIT |
+| [llama.cpp](https://github.com/ggml-org/llama.cpp) | 即時字幕的內建翻譯引擎（沒有 Ollama 時使用） | MIT |
+| [Qwen3](https://huggingface.co/Qwen)（Qwen 官方的 GGUF 檔） | 翻譯模型 | Apache-2.0 |
+| [TranslateGemma](https://huggingface.co/google/translategemma-4b-it)（[mradermacher](https://huggingface.co/mradermacher) 轉換的 GGUF 檔） | 翻譯模型 | [Gemma 使用條款](https://ai.google.dev/gemma/terms) |
 | [Noto 字型](https://github.com/notofonts/noto-cjk)（[Google Fonts](https://github.com/google/fonts)） | 字型包：Noto Sans / Serif TC、SC，Noto Sans Mono | OFL-1.1 |
 | [霞鶩文楷 TC](https://github.com/lxgw/LxgwWenkaiTC) | 字型包：楷體 | OFL-1.1 |
 | [Carlito](https://github.com/googlefonts/carlito) | 字型包：英文（Calibri 字寬） | OFL-1.1 |

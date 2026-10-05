@@ -1,4 +1,6 @@
-"""字幕翻譯(v1.18.0:本地 Ollama)。邊翻邊把字傳回來,字幕上的翻譯會一個字一個字長出來。
+"""字幕翻譯(本地執行,不會上傳)。邊翻邊把字傳回來,字幕上的翻譯會一個字一個字長出來。
+有安裝 Ollama 就用 Ollama(v1.18.0);沒有的話用內建的 llama.cpp 引擎(v1.18.4,見 llm.py),模型從網路下載。
+這裡的函式會自己判斷用哪一個,呼叫的地方不用分。
 
 實測(RTX 5060 Ti;只用處理器時是 20 執行緒的 CPU):
 - qwen3:8b(預設)每句 0.2～0.4 秒;qwen3:14b 品質最好 0.4～0.8 秒
@@ -18,9 +20,9 @@ from pathlib import Path
 
 from core import transcribe
 
+from . import llm
 from .glossary import relevant as names_in
 
-DOWNLOAD_PAGE = "https://ollama.com/download"
 DEFAULT_MODEL = "qwen3:8b"
 # 目標語言:(代號, 名稱, 給模型看的名稱, TranslateGemma 的語言代號)
 TARGETS = [("zh-TW", "台灣繁體中文", "Traditional Chinese (Taiwan)", "zh-TW"),
@@ -62,6 +64,32 @@ _EXPLAIN = re.compile(r"\s*[（(]\s*[A-Za-z][^）)]{0,40}?(是|指|表示)[^）)
 _PAIRS = {"「": "」", "『": "』", "\"": "\"", "“": "”", "'": "'"}
 
 
+def suggested():
+    """建議清單;用內建引擎時大小換成實際下載的模型檔大小(和 Ollama 的不同)。"""
+    if not builtin():
+        return list(SUGGESTED)
+    return [(name, llm.size_text(llm.CATALOG[name][1]) if name in llm.CATALOG else size, vram, note)
+            for name, size, vram, note in SUGGESTED]
+
+
+_detected = [-1e9, False]       # (上次檢查的時間, 是否用內建引擎)
+
+
+def builtin():
+    """沒有安裝 Ollama 時用內建引擎。開發測試時設環境變數 NAIZ_NO_OLLAMA=1 可以當作沒有 Ollama。"""
+    if os.environ.get("NAIZ_NO_OLLAMA"):
+        return True
+    now = time.monotonic()
+    if now - _detected[0] > 5:
+        _detected[:] = [now, app_path() is None and not _ollama_running()]
+    return _detected[1]
+
+
+def missing(name):
+    """用這個模型前還要下載的元件(只有內建引擎會有:引擎本身、模型檔)。"""
+    return llm.missing(name) if builtin() else []
+
+
 def host():
     """Ollama 的位址;使用者改過 OLLAMA_HOST 時照著用。"""
     value = os.environ.get("OLLAMA_HOST", "").strip() or "127.0.0.1:11434"
@@ -91,6 +119,11 @@ def _post(path, payload, timeout=30):
 
 
 def running():
+    """翻譯可以用了嗎:用 Ollama 時要它有在執行;內建引擎要用時才啟動,一直算可以用。"""
+    return True if builtin() else _ollama_running()
+
+
+def _ollama_running():
     try:
         _get("/api/version", timeout=1.5)
         return True
@@ -119,6 +152,8 @@ def launch():
 
 def models():
     """已安裝的模型:[(名稱, 大小 bytes)],翻譯不能用的(例如向量模型)不列。"""
+    if builtin():
+        return llm.models()
     result = []
     for model in _get("/api/tags").get("models", []):
         name = model.get("name", "")
@@ -129,7 +164,9 @@ def models():
 
 
 def pull(name, progress=None, cancel=None):
-    """用 Ollama 下載模型;progress(已下載, 全部)。"""
+    """下載模型(內建引擎第一次還會下載引擎);progress(已下載, 全部)。"""
+    if builtin():
+        return llm.pull(name, progress, cancel)
     with _post("/api/pull", {"model": name, "stream": True}, timeout=60) as response:
         for line in response:
             if cancel is not None and cancel.is_set():
@@ -144,14 +181,20 @@ def pull(name, progress=None, cancel=None):
     return True
 
 
-def preload(name):
-    """先把模型載入顯示卡(第一次 3～45 秒),開始字幕後才不會卡一下。"""
+def preload(name, cancel=None):
+    """先把模型載入顯示卡(第一次 3～45 秒),開始字幕後才不會卡一下。cancel():內建引擎載入中可以中途停止。"""
+    if builtin():
+        llm.preload(name, cancel)
+        return
     with _post("/api/generate", {"model": name, "keep_alive": "30m", "prompt": ""}, timeout=300) as response:
         response.read()
 
 
 def delete(name):
-    """刪掉 Ollama 裡的模型(空出硬碟空間)。"""
+    """刪掉模型(空出硬碟空間)。"""
+    if builtin():
+        llm.delete(name)
+        return
     request = urllib.request.Request(host() + "/api/delete", data=json.dumps({"model": name}).encode(),
                                      headers={"Content-Type": "application/json"}, method="DELETE")
     with urllib.request.urlopen(request, timeout=30) as response:
@@ -160,6 +203,9 @@ def delete(name):
 
 def unload(name):
     """停止字幕時把模型從顯示卡移掉,讓出記憶體給遊戲。"""
+    if builtin():
+        llm.unload(name)
+        return
     try:
         with _post("/api/generate", {"model": name, "keep_alive": 0}, timeout=10) as response:
             response.read()
@@ -268,6 +314,16 @@ def translate(model, text, source, target, context=(), on_text=None, cancel=None
         messages.append({"role": "assistant", "content": prefix})
     # 最多輸出的長度:翻譯不會比原文長太多,限制住才不會一路寫解釋、寫好幾種翻法
     limit = 48 + len(text) * 3
+
+    def finish(output):
+        return _apply_names(clean(_continuation(prefix, output)[0], target, text), names)
+
+    def show(output):
+        if on_text and "<think>" not in output:
+            on_text(finish(output))
+
+    if builtin():
+        return finish(llm.chat(model, messages, limit, on_delta=show, cancel=cancel))
     payload = {"model": model, "stream": True, "think": False, "keep_alive": "30m",
                "options": {"temperature": 0.2, "num_predict": limit}, "messages": messages}
     output = ""
@@ -279,8 +335,7 @@ def translate(model, text, source, target, context=(), on_text=None, cancel=None
             if data.get("error"):
                 raise RuntimeError(data["error"])
             output += data.get("message", {}).get("content", "")
-            if on_text and "<think>" not in output:
-                on_text(_apply_names(clean(_continuation(prefix, output)[0], target, text), names))
+            show(output)
             if data.get("done"):
                 break
-    return _apply_names(clean(_continuation(prefix, output)[0], target, text), names)
+    return finish(output)

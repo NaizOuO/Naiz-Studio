@@ -1,5 +1,6 @@
 """翻譯模型的管理視窗:每個模型一列,寫清楚說明、大小、需要的配備和建議/不建議的原因;
-可以在這裡選用、下載(配備不夠時先提醒)、刪除(按兩次才刪)。從即時字幕的「翻譯模型」打開。"""
+可以在這裡選用、下載(配備不夠時先提醒;用內建引擎時先說明要下載什麼)、刪除(按兩次才刪)。
+從即時字幕的「翻譯模型」打開。"""
 
 import threading
 
@@ -54,7 +55,7 @@ class TranslatorDialog:
         """[{name, installed, size, vram, note, tags}]:建議清單(小到大)在前,自己另外下載的接在後面。"""
         page = self.page
         installed = dict(page.ollama_models)
-        catalog = {name: (size, vram, note) for name, size, vram, note in ollama.SUGGESTED}
+        catalog = {name: (size, vram, note) for name, size, vram, note in ollama.suggested()}
         names = list(catalog) + [name for name in installed if name not in catalog]
         result = []
         for name in names:
@@ -98,17 +99,35 @@ class TranslatorDialog:
 
     def download(self, row):
         warning = self._warning(row["vram"])
-        if not warning:
+        items = ollama.missing(row["name"])     # 用內建引擎時要從網路下載的東西
+        if not warning and not items:
             self._start_download(row)
             return
-        lines = [f"{row['name']}（{row['size']}）{self._need(row['vram'])}。", f"{warning}。", "",
-                 "下載後還是可以用，只是講話快的時候字幕可能跟不上；之後可以在這裡刪掉。"]
-        self.page.app.dialog.open("這台電腦的配備可能不夠", lines, [("cancel", "取消", False), ("ok", "仍要下載", True)],
+        if items:
+            # 下載前說明要下載什麼、從哪裡來,同意了才下載
+            lines = ["會從網路下載這些到本地："] + [f"・{dep.name}（{dep.size_text}）：{dep.purpose}" for dep in items]
+            places = "、".join(dict.fromkeys(dep.place() for dep in items))
+            lines += ["", f"下載到程式資料夾內的 {places}。", "翻譯在本地執行，不會上傳；之後可以在這裡刪掉。"]
+            if warning:
+                lines += ["", f"注意：{self._need(row['vram'])}；{warning}。"]
+            title, ok = "下載翻譯模型", "同意並下載"
+        else:
+            lines = [f"{row['name']}（{row['size']}）{self._need(row['vram'])}。", f"{warning}。", "",
+                     "下載後還是可以用，只是講話快的時候字幕可能跟不上；之後可以在這裡刪掉。"]
+            title, ok = "這台電腦的配備可能不夠", "仍要下載"
+        self.page.app.dialog.open(title, lines, [("cancel", "取消", False), ("ok", ok, True)],
                                   lambda key, _: key == "ok" and self._start_download(row))
+
+    def cancel_download(self, row):
+        pull = self.page.pull
+        if pull is not None and pull["name"] == row["name"]:
+            pull["cancel"].set()
+            self._say(f"已取消下載 {row['name']}", theme.TEXT_DIM)
 
     def _start_download(self, row):
         self.page._pull(row["name"])
-        self._say(f"開始下載 {row['name']}，下載完會自動選用", self.accent)
+        where = "" if ollama.builtin() else "（存在 Ollama 的模型資料夾）"
+        self._say(f"開始下載 {row['name']}{where}，下載完會自動選用", self.accent)
 
     def delete(self, row):
         page = self.page
@@ -149,7 +168,8 @@ class TranslatorDialog:
                 if rect.collidepoint(pos):
                     if action != "delete":
                         self.confirm = None
-                    getattr(self, {"use": "choose", "download": "download", "delete": "delete"}[action])(row)
+                    getattr(self, {"use": "choose", "download": "download", "delete": "delete",
+                                   "cancel": "cancel_download"}[action])(row)
                     return
         if self.btn_close.clicked(pos, True):
             self.close()
@@ -187,7 +207,7 @@ class TranslatorDialog:
         draw_text(screen, "翻譯模型", (x, y), 17, theme.TEXT, bold=True)
         draw_text(screen, f"這台電腦：{hardware.describe()}", (x + inner, y + 12), 12, theme.TEXT_DIM, right=True)
         y += 32
-        for line, color in (("模型透過電腦上的 Ollama 下載，翻譯也在本地執行，不會上傳", theme.TEXT_FAINT),
+        for line, color in (("若已有 Ollama 會以此直接下載模型，若無則會透過網路拉取的方式來取得模型", theme.TEXT_FAINT),
                             ("顯示卡記憶體不夠時，一部分會改用一般記憶體，翻譯會變慢、字幕可能跟不上", theme.TEXT_FAINT)):
             draw_text(screen, widgets.clip_text(line, 12, inner), (x, y), 12, color)
             y += 20
@@ -241,8 +261,14 @@ class TranslatorDialog:
             if pull is not None and pull["name"] == row["name"]:
                 done, total = pull["done"], pull["total"]
                 text = pull["error"] or (f"下載中 {done / total:.0%}" if total else "準備下載…")
-                draw_text(screen, widgets.clip_text(text, 12, buttons_w), (right, box.centery), 12,
-                          theme.WARN if pull["error"] else self.accent, right=True)
+                if pull["error"] or pull["cancel"].is_set():
+                    text = pull["error"] or "取消中…"
+                    draw_text(screen, widgets.clip_text(text, 12, buttons_w), (right, box.centery), 12,
+                              theme.WARN if pull["error"] else theme.TEXT_FAINT, right=True)
+                else:
+                    draw_text(screen, text, (side.right, box.centery), 12, self.accent, right=True)
+                    self._button(main, "取消下載", mouse_pos)
+                    self.hits.append((main, "cancel", row))
             elif not row["installed"]:
                 self._button(main, "下載", mouse_pos, enabled=pull is None)
                 if pull is None:

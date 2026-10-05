@@ -119,7 +119,7 @@ class SubtitlePage(Page):
         self.target.set_value(self.prefs["target"])
         self.btn_translator = Button("選擇翻譯模型", filled=False, size=13)     # 打開翻譯模型的管理視窗
         self.translator_dialog = TranslatorDialog(self)
-        self.btn_ollama = Button("前往下載 Ollama", accent=accent, filled=False, size=13)
+        self.btn_ollama = Button("打開 Ollama", accent=accent, filled=False, size=13)
         self.mode = SegmentedControl(MODES, accent=accent)
         self.mode.index = [k for k, _ in MODES].index(self.prefs["mode"])
         self.size = Slider(20, 60, self.prefs["size"], step=2, accent=accent)
@@ -158,7 +158,8 @@ class SubtitlePage(Page):
         self.overlay = Overlay(on_moved=self._moved)
         self.adjusting = False
         self.notice = ("", theme.TEXT_DIM)
-        self.ollama_state = "checking"      # checking / missing / stopped / running
+        # 翻譯引擎的狀態:checking / stopped(有 Ollama 但沒開)/ running(Ollama 有開,或沒有 Ollama 時用內建引擎)
+        self.ollama_state = "checking"
         self.ollama_models = []
         self._ollama_checked = 0.0
         self._ollama_busy = False
@@ -184,8 +185,13 @@ class SubtitlePage(Page):
         self.prefs["x"], self.prefs["y"] = x, y
         self._save()
 
+    def _display_mode(self):
+        """實際的顯示方式:翻譯關掉時一定只顯示原文(選的「只顯示翻譯」「原文和翻譯」先記著,打開翻譯再用)。"""
+        return self.prefs["mode"] if self.prefs["translate"] else "original"
+
     def _style(self):
         style = {key: self.prefs[key] for key in STYLE}
+        style["mode"] = self._display_mode()
         backup = fonts.CATALOG.fallback()             # 缺字時補字:和 PDF 編輯器一樣(Noto Sans TC 或電腦內建的中文字型)
         if backup is not None:
             style["fallback_path"], style["fallback_index"] = str(backup.path), backup.index
@@ -203,7 +209,7 @@ class SubtitlePage(Page):
         def work():
             try:
                 if not ollama.running():
-                    self.ollama_state = "missing" if ollama.app_path() is None else "stopped"
+                    self.ollama_state = "stopped"
                     self.ollama_models = []
                 else:
                     self.ollama_models = ollama.models()
@@ -344,7 +350,7 @@ class SubtitlePage(Page):
 
     def _translate_ready(self):
         if self.ollama_state != "running":
-            self.notice = ("翻譯需要 Ollama：請先安裝並打開 Ollama", theme.WARN)
+            self.notice = ("Ollama 沒有在執行：請先打開 Ollama", theme.WARN)
         elif self.prefs["translator"] not in [name for name, _ in self.ollama_models]:
             self.notice = ("請先選好翻譯模型（按設定區的「翻譯模型」選擇或下載）", theme.WARN)
         else:
@@ -367,10 +373,14 @@ class SubtitlePage(Page):
             return
         if prefs["translate"]:
             if self.ollama_state != "running":
-                self.notice = ("翻譯需要 Ollama：請先安裝並打開 Ollama，或把「翻譯」關掉只顯示原文", theme.WARN)
+                self.notice = ("Ollama 沒有在執行：請先打開 Ollama，或把「翻譯」關掉只顯示原文", theme.WARN)
                 return
             if prefs["translator"] not in [name for name, _ in self.ollama_models]:
                 self.notice = ("請先選好翻譯模型（按設定區的「翻譯模型」選擇或下載）", theme.WARN)
+                return
+            missing = ollama.missing(prefs["translator"])       # 內建引擎的執行檔被刪掉時
+            if missing:
+                self.app.consent.open("即時字幕的翻譯", missing, on_done=self.start)
                 return
         settings = Settings(source=prefs["source"], pid=int(self.program_pick.value or 0) or None,
                             model=prefs["model"], language=prefs["language"], translate=prefs["translate"],
@@ -726,15 +736,17 @@ class SubtitlePage(Page):
         y += 8
 
         y = self._heading("字幕樣式", x, y)
-        self.mode.draw(screen, pygame.Rect(x, y, inner, 30), mouse_pos)
-        y += 38
+        mode = self._display_mode()
+        if prefs["translate"]:
+            self.mode.draw(screen, pygame.Rect(x, y, inner, 30), mouse_pos)     # 沒翻譯就只有原文,不用選
+            y += 38
         draw_text(screen, "日文標讀音（振假名）", (x, y + 3), 13, theme.TEXT)
         self.furigana_on.value = prefs["furigana"]
         self.furigana_on.draw(screen, (x + inner - 42, y + 2), mouse_pos)
         y += 26
         if not prefs["furigana"]:
             note, color = "原文是日文時，在漢字上方用小字標出讀音", theme.TEXT_FAINT
-        elif prefs["mode"] == "translation":
+        elif mode == "translation":
             note, color = "目前只顯示翻譯，看不到原文的讀音；改成「原文和翻譯」或「只顯示原文」", theme.WARN
         else:
             note, color = "讀音由字典判斷，少數要看上下文的詞可能標錯（例如「辛い」）", theme.TEXT_FAINT
@@ -754,21 +766,21 @@ class SubtitlePage(Page):
             draw_text(screen, text, (x + inner - 40, y + 12), 13, theme.TEXT_DIM, right=True)
             slider.draw(screen, pygame.Rect(x + 80, y + 9, inner - 170, 14), mouse_pos)
             # 原文和翻譯一起顯示時,原文共用文字的顏色(稍微淡一點):色塊拉長到「原文大小」那一列,看得出是一起的
-            tall = slider is self.size and prefs["mode"] == "both"
+            tall = slider is self.size and mode == "both"
             swatch = pygame.Rect(x + inner - 30, y + 1, 30, 24 + (32 if tall else 0))
             pygame.draw.rect(screen, tuple(self.prefs[color_key]), swatch, border_radius=5)
             pygame.draw.rect(screen, self.tool.accent if swatch.collidepoint(mouse_pos) else theme.PANEL_EDGE, swatch, 2,
                              border_radius=5)
             self.swatches.append((swatch, color_key))
             y += 32
-            if slider is self.size and prefs["mode"] == "both":
+            if slider is self.size and mode == "both":
                 # 原文和翻譯一起顯示時,原文另外調大小(只顯示其中一種時用上面的「字的大小」)
                 draw_text(screen, "原文大小", (x, y + 3), 13, theme.TEXT)
                 draw_text(screen, str(int(self.size_original.value)), (x + inner - 40, y + 12), 13, theme.TEXT_DIM,
                           right=True)
                 self.size_original.draw(screen, pygame.Rect(x + 80, y + 9, inner - 170, 14), mouse_pos)
                 y += 32
-        draw_text(screen, "右邊的色塊依序是：文字（原文和翻譯共用）、外框、底色的顏色" if prefs["mode"] == "both"
+        draw_text(screen, "右邊的色塊依序是：文字（原文和翻譯共用）、外框、底色的顏色" if mode == "both"
                   else "右邊的色塊依序是：文字、外框、底色的顏色", (x, y), 11, theme.TEXT_FAINT)
         y += 24
         draw_text(screen, "畫面上", (x, y + 6), 13, theme.TEXT)
@@ -798,13 +810,10 @@ class SubtitlePage(Page):
         accent = self.tool.accent
         state = self.ollama_state
         if state == "checking":
-            draw_text(screen, "檢查 Ollama 中…", (x, y), 12, theme.TEXT_FAINT)
+            draw_text(screen, "檢查翻譯模型中…", (x, y), 12, theme.TEXT_FAINT)
             return y + 22
-        if state in ("missing", "stopped"):
-            text = ("翻譯用免費的 Ollama 在本地執行，需要先安裝" if state == "missing"
-                    else "Ollama 已安裝但沒有在執行")
-            draw_text(screen, text, (x, y + 6), 12, theme.WARN)
-            self.btn_ollama.label = "前往下載 Ollama" if state == "missing" else "打開 Ollama"
+        if state == "stopped":
+            draw_text(screen, "Ollama 已安裝但沒有在執行", (x, y + 6), 12, theme.WARN)
             self.btn_ollama.draw(screen, pygame.Rect(x + inner - 130, y, 130, 30), mouse_pos)
             return y + 40
         draw_text(screen, "翻譯模型", (x, y + 6), 13, theme.TEXT)
@@ -1118,9 +1127,7 @@ class SubtitlePage(Page):
             self.translator_dialog.open()
             return
         if self.btn_ollama.clicked(pos, True):
-            if self.ollama_state == "missing":
-                os.startfile(ollama.DOWNLOAD_PAGE)
-            elif ollama.launch():
+            if ollama.launch():
                 self.notice = ("正在打開 Ollama…", theme.TEXT_DIM)
                 self._ollama_checked = time.monotonic() - 1
             return
@@ -1139,6 +1146,8 @@ class SubtitlePage(Page):
         elif self.translate_on.clicked(pos, True):
             self._change("translate", self.translate_on.value)
             self.translate_on.value = prefs["translate"]
+            if self.overlay.alive:
+                self.overlay.style(self._style())       # 翻譯開關會改變顯示方式(關掉時只顯示原文)
         else:
             row = next((key for rect, key in self.model_rows if rect.collidepoint(pos)), None)
             if row is not None:
@@ -1200,9 +1209,12 @@ class SubtitlePage(Page):
 
         def work():
             try:
-                ollama.pull(name, lambda done, total: job.update(done=done, total=total), job["cancel"])
-                self.prefs["translator"] = name
-                self._save()
+                if ollama.pull(name, lambda done, total: job.update(done=done, total=total), job["cancel"]) is False:
+                    self.notice = (f"已取消下載 {name}", theme.TEXT_DIM)       # 沒下載完的部分已刪掉
+                    self._notice_until = time.monotonic() + 3
+                else:
+                    self.prefs["translator"] = name
+                    self._save()
                 self.pull = None
             except Exception as exc:
                 job["error"] = f"下載失敗：{exc}"[:40]

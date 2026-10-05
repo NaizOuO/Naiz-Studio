@@ -131,7 +131,9 @@ class ConsentDialog:
                       12, theme.TEXT_DIM)
             y += ROW_H
 
-        draw_text(screen, "下載後放在程式資料夾內，之後不需要再下載", (x, y + 2), 12, theme.TEXT_FAINT)
+        places = "、".join(dict.fromkeys(dep.place() for dep in self.items))
+        draw_text(screen, widgets.clip_text(f"下載到程式資料夾內的 {places}，之後不需要再下載", 12, inner),
+                  (x, y + 2), 12, theme.TEXT_FAINT)
         y += 28
 
         if self.phase == "downloading":
