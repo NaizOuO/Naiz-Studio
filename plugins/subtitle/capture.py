@@ -38,6 +38,10 @@ E_CAPTURE, E_CONSOLE = 1, 0
 SESSION_ACTIVE = 1
 SESSION_EXPIRED = 2
 # 開著視窗但不會出聲音、列出來只會讓清單變長的系統程式
+# 通話軟體:沒人講話時不會出聲(不在「出過聲音」的清單裡),開著就列出來,選了之後有人講話就抓得到
+CALL_PROGRAMS = {"discord.exe", "discordptb.exe", "discordcanary.exe", "line.exe", "linecall.exe", "teams.exe",
+                 "ms-teams.exe", "zoom.exe", "skype.exe", "slack.exe", "telegram.exe", "whatsapp.exe",
+                 "kakaotalk.exe", "ts3client_win64.exe", "mumble.exe", "messenger.exe"}
 HIDDEN_PROGRAMS = {"explorer.exe", "textinputhost.exe", "applicationframehost.exe", "systemsettings.exe",
                    "shellexperiencehost.exe", "searchhost.exe", "startmenuexperiencehost.exe", "lockapp.exe"}
 
@@ -384,7 +388,7 @@ def _description(path):
 def audio_programs():
     """可以單獨抓聲音的程式:[(pid, 名稱)],正在播放的排前面、名稱後面標「播放中」。
     除了正在播放的,也列出出過聲音、現在安靜的程式(例如影片暫停中的瀏覽器),選了之後它一出聲就抓得到;
-    只開著視窗、從沒出過聲音的程式不列(記事本、相片這類,列出來只會讓清單太長)。
+    只開著視窗、從沒出過聲音的程式不列(記事本、相片這類,列出來只會讓清單太長);通話軟體例外,開著就列。
     pid 是同一個程式最上層的那個(瀏覽器會開很多子程式,一起抓)。要在背景執行緒呼叫。"""
     _init_thread()
     enumerator = comtypes.CoCreateInstance(CLSID_ENUMERATOR, IMMDeviceEnumerator, CLSCTX_ALL)
@@ -401,6 +405,9 @@ def audio_programs():
         state = control.GetState()
         if pid and state != SESSION_EXPIRED:
             candidates[pid] = candidates.get(pid, False) or state == SESSION_ACTIVE
+    for pid, (_, exe) in processes.items():
+        if exe.lower() in CALL_PROGRAMS:
+            candidates.setdefault(pid, False)           # 通話軟體:還沒出過聲音也列出來
     found = {}
     for pid, playing in candidates.items():
         if pid == own or pid not in processes:

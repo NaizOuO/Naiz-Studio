@@ -107,21 +107,63 @@ def windows(voice):
     return out
 
 
+class Extractor:
+    """聲音特徵:模型載入一次,之後每段聲音直接算(即時字幕每句都要算,不能每次重新載入)。"""
+
+    def __init__(self, work_dir, threads=None):
+        self.api = api = _load()
+        model = EMBEDDING.path()
+        if not str(model).isascii():
+            # 模型在同一個程式裡由 C 介面開啟,開不了含中文的路徑,先複製到純英文的暫存資料夾
+            copy = Path(work_dir) / model.name
+            if not copy.exists() or copy.stat().st_size != model.stat().st_size:
+                Path(work_dir).mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(model, copy)
+            model = copy
+        threads = threads or max(1, min(4, os.cpu_count() or 1))
+        self._config = _Config(str(model).encode("utf-8"), threads, 0, b"cpu")
+        self.handle = api.SherpaOnnxCreateSpeakerEmbeddingExtractor(ctypes.byref(self._config))
+        if not self.handle:
+            raise RuntimeError("無法載入聲音特徵模型")
+        self.dim = api.SherpaOnnxSpeakerEmbeddingExtractorDim(self.handle)
+
+    def embed(self, samples):
+        """samples:16kHz 的 ctypes float 陣列(-1～1);回傳正規化後的聲音特徵,太短算不出來時 None。"""
+        api = self.api
+        stream = api.SherpaOnnxSpeakerEmbeddingExtractorCreateStream(self.handle)
+        try:
+            api.SherpaOnnxOnlineStreamAcceptWaveform(stream, RATE, samples, len(samples))
+            api.SherpaOnnxOnlineStreamInputFinished(stream)
+            if not api.SherpaOnnxSpeakerEmbeddingExtractorIsReady(self.handle, stream):
+                return None
+            result = api.SherpaOnnxSpeakerEmbeddingExtractorComputeEmbedding(self.handle, stream)
+            vector = result[:self.dim]
+            api.SherpaOnnxSpeakerEmbeddingExtractorDestroyEmbedding(result)
+        finally:
+            api.SherpaOnnxDestroyOnlineStream(stream)
+        norm = math.sqrt(sum(map(mul, vector, vector))) or 1.0
+        return [x / norm for x in vector]
+
+    def embed_pcm16(self, pcm):
+        """16 位元整數的聲音(即時字幕收到的格式)。"""
+        count = len(pcm) // 2
+        if count < MIN_WINDOW * RATE / 2:
+            return None
+        import numpy as np
+
+        data = np.frombuffer(bytes(pcm[:count * 2]), np.int16).astype(np.float32) / 32768.0
+        return self.embed((ctypes.c_float * count).from_buffer_copy(data.tobytes()))
+
+    def close(self):
+        if self.handle:
+            self.api.SherpaOnnxDestroySpeakerEmbeddingExtractor(self.handle)
+            self.handle = None
+
+
 def _embeddings(raw_path, wins, work_dir, cancel=None, progress=None):
-    api = _load()
-    model = EMBEDDING.path()
-    if not str(model).isascii():
-        # 模型在同一個程式裡由 C 介面開啟,開不了含中文的路徑,先複製到純英文的暫存資料夾
-        copy = Path(work_dir) / model.name
-        shutil.copyfile(model, copy)
-        model = copy
-    config = _Config(str(model).encode("utf-8"), max(1, min(4, os.cpu_count() or 1)), 0, b"cpu")
-    extractor = api.SherpaOnnxCreateSpeakerEmbeddingExtractor(ctypes.byref(config))
-    if not extractor:
-        raise RuntimeError("無法載入聲音特徵模型")
+    extractor = Extractor(work_dir)
     raw = Path(raw_path).read_bytes()
     total = len(raw) // 4
-    dim = api.SherpaOnnxSpeakerEmbeddingExtractorDim(extractor)
     vectors = []
     try:
         for index, (start, end) in enumerate(wins):
@@ -132,24 +174,11 @@ def _embeddings(raw_path, wins, work_dir, cancel=None, progress=None):
                 vectors.append(None)
                 continue
             samples = (ctypes.c_float * (b - a)).from_buffer_copy(raw, a * 4)
-            stream = api.SherpaOnnxSpeakerEmbeddingExtractorCreateStream(extractor)
-            try:
-                api.SherpaOnnxOnlineStreamAcceptWaveform(stream, RATE, samples, b - a)
-                api.SherpaOnnxOnlineStreamInputFinished(stream)
-                if api.SherpaOnnxSpeakerEmbeddingExtractorIsReady(extractor, stream):
-                    result = api.SherpaOnnxSpeakerEmbeddingExtractorComputeEmbedding(extractor, stream)
-                    vector = result[:dim]
-                    api.SherpaOnnxSpeakerEmbeddingExtractorDestroyEmbedding(result)
-                    norm = math.sqrt(sum(map(mul, vector, vector))) or 1.0
-                    vectors.append([x / norm for x in vector])
-                else:
-                    vectors.append(None)
-            finally:
-                api.SherpaOnnxDestroyOnlineStream(stream)
+            vectors.append(extractor.embed(samples))
             if progress and index % 25 == 0:
                 progress(index / max(1, len(wins)))
     finally:
-        api.SherpaOnnxDestroySpeakerEmbeddingExtractor(extractor)
+        extractor.close()
     return vectors
 
 

@@ -83,6 +83,9 @@
 - 字幕進行中也能改設定：換辨識模型、聲音來源時會短暫中斷，這段時間的聲音載入好後補上字幕；字幕紀錄會記下改了什麼
 - 一陣子沒人說話時字幕會淡出（可以設定幾秒，或一直顯示），畫面上可以留 1～3 句
 - 日文標讀音：原文是日文時，可以在漢字上方用小字標出讀音（振假名）；讀音由字典判斷，少數要看上下文的詞可能標錯
+- 判斷誰說話：不同人用不同顏色（字幕視窗和字幕紀錄都會標），預設「自動分群」會自己判斷有幾個人，最近 10 秒內的顏色可能會修正；
+  在字幕紀錄點一句可以複製或改那個人的顏色，TXT 紀錄會標「(藍色)」。背景有音樂或遊戲聲、多人同時講話時容易分錯；
+  也可以改用門檻比對，自己調門檻（設定檔存在 `setting\subtitle_speakers`）。需要下載約 51 MB 的元件
 - 收音靈敏度：電腦音量開得很小時自動放大，也可以固定放大倍數
 - 字幕紀錄自動存在 `output\subtitles`，可以選存成 SRT、TXT、兩者，或不存檔
 - 辨識模型四種（快速、輕量、推薦、最準確），翻譯用本地的 [Ollama](https://ollama.com)；程式會依電腦配備先選好建議的組合，所有選項都可以自己換
@@ -173,7 +176,7 @@ python naiz_studio.py
 | 辨識模型「推薦」 | 準確又快 | 約 547 MB | 約 547 MB |
 | 辨識模型「最準確」 | 錯字最少，速度較慢 | 約 2.9 GB | 約 2.9 GB |
 | 說話者分離 | 區分說話者時使用 | 約 23 MB | 約 21 MB |
-| 聲音特徵模型 | 判斷是不是同一個人 | 約 28 MB | 約 28 MB |
+| 聲音特徵模型 | 判斷是不是同一個人（逐字稿區分說話者、即時字幕判斷誰說話） | 約 28 MB | 約 28 MB |
 | Real-ESRGAN 圖片高清 | 圖片工具的 AI 放大（需要支援 Vulkan 的顯示卡） | 約 43 MB | 約 51 MB |
 | 辨識模型「輕量」 | 即時字幕：沒有獨立顯示卡也能即時辨識 | 約 252 MB | 約 252 MB |
 | 人聲偵測模型（字幕） | 即時字幕：判斷有沒有人在說話，避免冒出不存在的字幕（和 AI 去背共用執行元件） | 約 2 MB | 約 2 MB |
@@ -292,6 +295,7 @@ TOOLS = [HelloTool]
 | `setting\signatures\` | 存起來的簽名（只存在本地，不會上傳） |
 | `setting\transcript_corrections\` | 逐字稿修正錯字的設定檔，一個設定檔一個 `.json` |
 | `setting\subtitle_glossary\` | 即時字幕專有名詞的設定檔，一個設定檔一個 `.json` |
+| `setting\subtitle_speakers\` | 即時字幕判斷誰說話的區分方式設定檔，一個設定檔一個 `.json` |
 | `error.log` | 發生錯誤時的紀錄 |
 
 輸出時不會覆蓋原檔，同名時會自動加上編號。
@@ -323,7 +327,7 @@ TOOLS = [HelloTool]
 | [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | 語音辨識 | MIT |
 | [Whisper 模型](https://github.com/openai/whisper) | 語音辨識模型 | MIT |
 | [Silero VAD](https://github.com/snakers4/silero-vad) | 人聲偵測模型 | MIT |
-| [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | 說話者分離 | Apache-2.0 |
+| [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | 說話者分離、即時字幕判斷誰說話 | Apache-2.0 |
 | [3D-Speaker CAM++](https://github.com/modelscope/3D-Speaker) | 聲音特徵模型 | Apache-2.0 |
 | [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)（[ncnn-vulkan](https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan) 版） | 圖片高清（AI 放大）與模型 | BSD-3-Clause / MIT |
 | [4xNomosWebPhoto_esrgan](https://github.com/Phhofm/models/releases/tag/4xNomosWebPhoto_esrgan)（Philip Hofmann） | 高清的「照片（自然）」模型（轉成 ncnn 格式，放在本專案的[下載元件](https://github.com/NaizOuO/Naiz-Studio/releases/tag/components) Release） | CC BY 4.0 |

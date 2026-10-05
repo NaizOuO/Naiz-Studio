@@ -4,9 +4,10 @@
 注意:
 - 模型用「工作目錄 + 純英文檔名」傳入(whisper.cpp 開不了含中文的路徑)
 - 伺服器的輸出一定要丟掉或讀掉:管線塞滿後伺服器會卡住、不再回應
-- -ac 768:每次只處理 15 秒內的聲音(預設當成 30 秒),短片段快約三分之一
+- -ac 768(只看 15 秒的聲音特徵)只在沒有顯示卡時用:實測中文錯字多 20～55%、日英文差不多;有顯示卡時每次只慢約 0.06 秒
 """
 
+import http.client
 import io
 import json
 import os
@@ -36,7 +37,9 @@ def _repair(text):
     return re.sub(r"[，\s]+$", "", re.sub(r"，\s*([，。？！、])", r"\1", text))
 
 RATE = 16000
-MAX_SECONDS = 15                # -ac 768 對應的長度;送進去的聲音不超過這個
+MAX_SECONDS = 15                # 送進去的聲音不超過這個(只用處理器時 -ac 768 對應的長度)
+RETRIES = 3                     # 連不上伺服器時再試幾次
+IDLE = 4.0                      # 同一條連線閒置這麼久就換新的(伺服器 5 秒沒用會關掉)
 SMALL = deps.Dependency(
     id="whisper-model-small",
     name="辨識模型（輕量）",
@@ -98,6 +101,8 @@ class Server:
         self.port = None
         self.proc = None
         self._lock = threading.Lock()
+        self._conn = None               # 和伺服器的連線(重複使用:每次開新連線偶爾會被 Windows 擋,WinError 10013)
+        self._used = 0.0
         # 上一次辨識的細節:segments [(開始秒, 結束秒, 文字)](Whisper 大多一句一段)、
         # confidence 平均對數機率(真的台詞約 -0.1～-0.3,對著配樂、音效亂猜的約 -0.9)
         self.last = {"segments": [], "confidence": 0.0, "languages": {}}
@@ -109,7 +114,9 @@ class Server:
         self.port = _free_port()
         threads = max(1, min(8, (os.cpu_count() or 4) - 2))
         args = [exe, "-m", MODEL_FILES[self.model_key].path().name, "--host", "127.0.0.1", "--port", self.port,
-                "-ac", "768", "-l", "auto", "-nt", "-t", threads]
+                "-l", "auto", "-nt", "-t", threads]
+        if not gpu():
+            args[5:5] = ["-ac", "768"]          # 只用處理器時:看短一點的聲音特徵,快約三分之一
         self.proc = deps.popen([str(a) for a in args], cwd=paths.MODELS_DIR,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         transcribe._active.add(self.proc)          # 關閉 Naiz Studio 時一併結束
@@ -129,10 +136,42 @@ class Server:
         raise RuntimeError("語音辨識程式載入太久，請換小一點的模型再試")
 
     def stop(self):
+        self._disconnect()
         if self.proc is not None:
             deps.kill_tree(self.proc)
             transcribe._active.discard(self.proc)
             self.proc = None
+
+    def _post(self, body, headers):
+        """送一次辨識。同一條連線重複使用;連線被伺服器關掉(閒置、用滿次數)就換新的重送,
+        連不上(Windows 暫時不給連線,例如 WinError 10013)時伺服器還在就稍等再試,不然整個字幕會停掉。"""
+        for attempt in range(RETRIES + 1):
+            if self._conn is not None and time.monotonic() - self._used > IDLE:
+                self._disconnect()
+            if self._conn is None:
+                self._conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=60)
+            try:
+                self._conn.request("POST", "/inference", body=body, headers=headers)
+                response = self._conn.getresponse()
+                data = response.read()
+                self._used = time.monotonic()
+                if (response.getheader("Connection") or "").lower() == "close":
+                    self._disconnect()
+                if response.status != 200:
+                    raise RuntimeError(f"語音辨識程式回應錯誤（{response.status}）")
+                return json.loads(data)
+            except (http.client.HTTPException, OSError):
+                self._disconnect()
+                if attempt == RETRIES or not self.alive:
+                    raise
+                if attempt:
+                    time.sleep(0.5 * attempt)       # 第一次馬上重送(多半只是舊連線被關了)
+        return {}
+
+    def _disconnect(self):
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
 
     @property
     def alive(self):
@@ -151,11 +190,8 @@ class Server:
                         for key, value in fields.items())
         body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n"
                  "Content-Type: audio/wav\r\n\r\n").encode() + _wav(pcm) + f"\r\n--{boundary}--\r\n".encode()
-        request = urllib.request.Request(f"http://127.0.0.1:{self.port}/inference", data=body,
-                                         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
         with self._lock:                            # 一次辨識一段
-            with urllib.request.urlopen(request, timeout=60) as response:
-                result = json.load(response)
+            result = self._post(body, {"Content-Type": f"multipart/form-data; boundary={boundary}"})
         segments = result.get("segments") or []
         for segment in segments:
             segment["text"] = _repair(segment.get("text", ""))
@@ -164,9 +200,18 @@ class Server:
         silence = max((segment.get("no_speech_prob", 0) for segment in segments), default=0)
         weights = [max(1, len(segment.get("tokens") or [])) for segment in segments]
         confidence = sum(w * segment.get("avg_logprob", 0) for w, segment in zip(weights, segments)) / max(1, sum(weights))
-        self.last = {"segments": [(float(segment.get("start", 0)), float(segment.get("end", 0)),
+        # Whisper 偶爾把時間標到聲音結束之後(12 秒的聲音標到 30 秒):截到實際長度內,切句時才不會錯亂
+        duration = len(pcm) / 2 / RATE
+
+        def clamp(value):
+            return min(max(0.0, float(value or 0)), duration)
+
+        self.last = {"segments": [(clamp(segment.get("start")), clamp(segment.get("end")),
                                    segment.get("text", "").strip()) for segment in segments],
                      "confidence": confidence,
+                     # 每個字(英文是每個單字)的時間:一句裡換人時用來切開
+                     "words": [(clamp(word.get("start")), clamp(word.get("end")), word.get("word", ""))
+                               for segment in segments for word in (segment.get("words") or [])],
                      "languages": {WHISPER_NAMES.get(code, code): p
                                    for code, p in (result.get("language_probabilities") or {}).items()}}
         return text, detected, silence

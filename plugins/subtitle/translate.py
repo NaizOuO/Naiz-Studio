@@ -11,6 +11,7 @@ import json
 import os
 import re
 import subprocess
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -50,11 +51,14 @@ SUGGESTED = [
     ("qwen3:32b", "20 GB", 24, "最大最準確，但也最慢；講話快的時候字幕可能跟不上"),
 ]
 HIGH_END = 16       # 需要這麼多顯示卡記憶體以上的模型標「需要高階電腦」
+DENIED_RETRIES = 30  # Windows 偶爾不給開新的本地連線(WinError 10013,實測 3～18 秒):每秒再試一次,最多約 30 秒
 _THINK = re.compile(r"<think>.*?(</think>|$)", re.S)
 # 模型多給的「其他翻法」從這裡開始整段不要(translategemma:12b 常在後面加「或者：」)
 _ALTERNATIVE = re.compile(r"\n\s*(?:或者|或是|也可以|另一種|又或|(?:Or|Alternatively|Another option)\s*[:：,，]).*",
                           re.S | re.I)
 _NOTE = re.compile(r"[（(]\s*(註|注|直譯|意思|意譯|Note|Literally)[^）)]*[）)]", re.I)
+# 模型自己解釋沒翻的外文字:「（ definitely 是個強調詞，用來加強前面的說法…）」
+_EXPLAIN = re.compile(r"\s*[（(]\s*[A-Za-z][^）)]{0,40}?(是|指|表示)[^）)]*(詞|用法|意思|說法|語氣)[^）)]*[）)]")
 _PAIRS = {"「": "」", "『": "』", "\"": "\"", "“": "”", "'": "'"}
 
 
@@ -74,7 +78,16 @@ def _get(path, timeout=3):
 def _post(path, payload, timeout=30):
     request = urllib.request.Request(host() + path, data=json.dumps(payload).encode(),
                                      headers={"Content-Type": "application/json"})
-    return urllib.request.urlopen(request, timeout=timeout)
+    for attempt in range(DENIED_RETRIES + 1):
+        try:
+            return urllib.request.urlopen(request, timeout=timeout)
+        except urllib.error.URLError as exc:
+            # 實測每 5～20 分鐘會有 3～18 秒所有新的本地連線都被擋(不只 Ollama):稍等再送,
+            # 不然那幾秒的句子會翻譯失敗。Ollama 沒開(連線被拒)等其他錯誤照舊馬上回報
+            denied = isinstance(exc.reason, PermissionError) and not isinstance(exc, urllib.error.HTTPError)
+            if not denied or attempt == DENIED_RETRIES:
+                raise
+            time.sleep(1.0)
 
 
 def running():
@@ -204,7 +217,7 @@ def clean(text, target, source=""):
     text = re.sub(r"^(翻譯|譯文|Translation)\s*[:：]\s*", "", text)
     text = _ALTERNATIVE.sub("", text)
     if "(" not in source and "（" not in source:
-        text = _NOTE.sub("", text)
+        text = _EXPLAIN.sub("", _NOTE.sub("", text))
     rows = [row.strip() for row in text.splitlines() if row.strip()]
     if "(" not in source and "（" not in source:
         # 整行都是括號補充(例如「（神奈川縣）」)的不要

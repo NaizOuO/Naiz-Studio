@@ -125,14 +125,16 @@ class Overlay:
         self.send({"type": "style", **style})
 
     def lines(self, items):
-        """items:[(原文, 翻譯, 是否定稿, 講完幾秒了[, 原文的振假名])];還在講的那句「講完幾秒了」是 None。
-        振假名是 [(原文片段, 讀音)],沒有就不傳。"""
+        """items:[(原文, 翻譯, 是否定稿, 講完幾秒了[, 原文的振假名[, 說話者的顏色]])];
+        還在講的那句「講完幾秒了」是 None。振假名是 [(原文片段, 讀音)];沒有的就不傳。"""
         lines = []
         for item in items:
             o, t, f, i = item[:4]
             line = {"o": o, "t": t, "f": f, "i": i}
             if len(item) > 4 and item[4]:
                 line["r"] = [list(segment) for segment in item[4]]
+            if len(item) > 5 and item[5]:
+                line["c"] = list(item[5])          # 判斷誰說話:這個人的顏色
             lines.append(line)
         self.send({"type": "lines", "lines": lines})
 
@@ -399,19 +401,19 @@ class Painter:
             if mode == "translation" and not item.get("t") and item.get("o"):
                 rows += [(row, small, dim, o_style) for row in self._original_rows(item, o_style, small, inner)]
             if rows:
-                blocks.append((rows, float(item.get("a", 1.0))))
+                blocks.append((rows, float(item.get("a", 1.0)), item.get("c")))
         if not blocks and not adjusting:
             return None
         gap, pad_x, pad_y = 10, 20, 10
         heights = [sum(self._row_height(content, size) for content, size, _, _ in rows) + pad_y * 2
-                   for rows, _ in blocks]
+                   for rows, _, _ in blocks]
         height = max(sum(heights) + gap * max(0, len(blocks) - 1), big * 2)
         image = Image.new("RGBA", (band_width, height + 4), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
         bg = tuple(style.get("bg") or (12, 14, 18)) + (int(255 * style.get("opacity", 60) / 100),)
         align = style.get("align", "center")
         y = 0
-        for (rows, alpha), block_h in zip(blocks, heights):
+        for (rows, alpha, speaker), block_h in zip(blocks, heights):
             widths = [self._row_width(content, row_style, size) + outline * 2 for content, size, _, row_style in rows]
             block_w = int(max(widths)) + pad_x * 2
             left = {"left": 0, "right": band_width - block_w}.get(align, (band_width - block_w) // 2)
@@ -420,6 +422,13 @@ class Painter:
             pen = ImageDraw.Draw(layer)
             if bg[3]:
                 pen.rounded_rectangle((0, 0, block_w - 1, block_h - 1), radius=12, fill=bg)
+            if speaker:
+                # 判斷誰說話:在底色和字之間蓋一層半透明的顏色(每句各自一塊,不會重疊混色)
+                tint = Image.new("RGBA", layer.size, (0, 0, 0, 0))
+                ImageDraw.Draw(tint).rounded_rectangle((0, 0, block_w - 1, block_h - 1), radius=12,
+                                                       fill=tuple(speaker[:3]) + (85,))
+                layer.alpha_composite(tint)
+                pen = ImageDraw.Draw(layer)
             row_y = pad_y
             for (content, size, fill, row_style), row_w in zip(rows, widths):
                 x = {"left": pad_x, "right": block_w - pad_x - row_w}.get(align, (block_w - row_w) / 2)

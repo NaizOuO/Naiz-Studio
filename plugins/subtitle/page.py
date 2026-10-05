@@ -8,7 +8,8 @@ import time
 
 import pygame
 
-from core import paths, theme, widgets
+from core import diarize, paths, theme, widgets
+from core.contextmenu import ContextMenu
 from core.plugins import Page
 from core.scroll import ScrollView
 from core.widgets import Button, Dropdown, SegmentedControl, Slider, Toggle, draw_text, rounded_panel
@@ -16,11 +17,12 @@ from core.widgets import Button, Dropdown, SegmentedControl, Slider, Toggle, dra
 from ..editor import fonts
 from ..editor.font_picker import FontPicker
 from ..editor.palette import ColorPalette
-from . import asr, furigana, glossary, hardware
+from . import asr, furigana, glossary, hardware, speaker_profiles, speakers
 from .translator_dialog import TranslatorDialog
 from . import translate as ollama
 from .engine import Engine, Settings
 from .glossary_dialog import GlossaryDialog
+from .speaker_dialog import SpeakerDialog
 from .overlay import ALIGNS, MODES, STYLE, Overlay
 
 SOURCES = [("system", "電腦播放的聲音"), ("app", "單一程式"), ("mic", "麥克風")]
@@ -86,7 +88,7 @@ class SubtitlePage(Page):
         saved = app.config.get(CONFIG_KEY) if isinstance(app.config.get(CONFIG_KEY), dict) else {}
         self.prefs = {"source": "system", "language": "auto", "model": model, "translate": True,
                       "translator": translator, "target": "zh-TW", "partial": partial, "gain": "auto",
-                      "output": "both", **STYLE}
+                      "output": "both", "speakers": False, **STYLE}
         self.prefs.update({k: v for k, v in saved.items() if k in self.prefs})
 
         self.source = SegmentedControl(SOURCES, accent=accent)
@@ -105,6 +107,14 @@ class SubtitlePage(Page):
         self.model_rows = []                # 這一幀畫出來的辨識模型:[(範圍, 代號)]
         self.translate_on = Toggle(self.prefs["translate"], accent=accent)
         self.furigana_on = Toggle(self.prefs["furigana"], accent=accent)
+        self.speakers_on = Toggle(self.prefs["speakers"], accent=accent)
+        # 判斷誰說話的區分方式(設定檔,""是自動)
+        self.speaker_data = speaker_profiles.load(app.config)
+        self.speaker_pick = Dropdown([(speaker_profiles.GENERAL, speaker_profiles.GENERAL)], accent=accent, size=13)
+        self.btn_speaker_edit = Button("編輯", filled=False, size=12)
+        self.speaker_dialog = SpeakerDialog(lambda: self.screen, accent, self._speaker_profiles_changed)
+        self.speaker_colors = {}            # 使用者改過的顏色:{第幾個人: RGB}(這次字幕有效)
+        self.menu = ContextMenu(accent)     # 字幕紀錄的右鍵選單
         self.target = Dropdown([(k, n) for k, n, _, _ in ollama.TARGETS], accent=accent, size=13)
         self.target.set_value(self.prefs["target"])
         self.btn_translator = Button("選擇翻譯模型", filled=False, size=13)     # 打開翻譯模型的管理視窗
@@ -221,6 +231,35 @@ class SubtitlePage(Page):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _speaker_options(self):
+        return [(name, name, speaker_profiles.METHOD_NAMES[value["method"]])
+                for name, value in self.speaker_data["profiles"].items()]
+
+    def _speaker_choice(self):
+        """目前要用的區分方式:(名稱, 內容)。"""
+        return speaker_profiles.resolve(self.speaker_data)
+
+    def _speaker_profiles_changed(self, data):
+        """區分方式的設定檔改了:存檔;字幕進行中的話下一句開始用新的。"""
+        self.speaker_data = data
+        try:
+            self.app.save_setting(speaker_profiles.KEY, speaker_profiles.save(data))
+        except OSError as exc:
+            self.notice = (f"區分方式的設定檔存不了：{exc}", theme.WARN)
+            self._notice_until = time.monotonic() + 5
+        self._sync_speaker_mode()
+
+    def _sync_speaker_mode(self):
+        """字幕進行中:選的設定檔、聲音來源(自動時)變了,或設定檔的數值改了,就換引擎用的區分方式並記一行。"""
+        engine = self.engine
+        if not (self.running and engine is not None and self.prefs["speakers"]):
+            return
+        name, value = self._speaker_choice()
+        mode = speaker_profiles.mode(value)
+        if engine.settings.speaker_mode != mode:
+            engine.settings.speaker_mode = mode
+            engine.notice(f"判斷誰說話的區分方式改用「{name}」（下一句開始套用）")
+
     def _names_options(self):
         return [(glossary.NONE, "不使用")] + [(name, name, f"{len(terms)} 個")
                                             for name, terms in self.names["profiles"].items()]
@@ -246,7 +285,7 @@ class SubtitlePage(Page):
             return dict(asr.LANGUAGES).get(value, value)
         if key == "target":
             return ollama.TARGET_NAMES.get(value, value)
-        if key == "translate":
+        if key in ("translate", "speakers"):
             return "開" if value else "關"
         if key == "gain":
             return dict(GAINS).get(value, value)
@@ -272,7 +311,7 @@ class SubtitlePage(Page):
         if not self.running or engine is None:
             return
         titles = {"source": "聲音來源", "model": "辨識模型", "language": "原文語言", "translate": "翻譯",
-                  "target": "翻成", "translator": "翻譯模型", "gain": "收音靈敏度"}
+                  "target": "翻成", "translator": "翻譯模型", "gain": "收音靈敏度", "speakers": "判斷誰說話"}
         changes = {key: value}
         if key == "source":
             if value == "app":
@@ -337,8 +376,12 @@ class SubtitlePage(Page):
                             model=prefs["model"], language=prefs["language"], translate=prefs["translate"],
                             translator=prefs["translator"], target=prefs["target"], partial=prefs["partial"],
                             step=0.3 if asr.gpu() else 1.5, glossary=glossary.terms(self.names),
-                            gain=prefs["gain"])
+                            gain=prefs["gain"], speakers=prefs["speakers"],
+                            speaker_mode=speaker_profiles.mode(self._speaker_choice()[1]))
+        self.speaker_colors = {}            # 每次開始字幕重新認人,上次改的顏色不沿用
         self.engine = Engine(settings, on_update=self._changed)
+        if prefs["speakers"]:
+            self.engine.notice(f"判斷誰說話：用「{self._speaker_choice()[0]}」")      # 字幕紀錄記一行用哪個區分方式
         self.engine.start()
         base, number = time.strftime("字幕 %Y-%m-%d %H%M%S"), 2
         while (output_dir() / f"{base}.txt").exists() or (output_dir() / f"{base}.srt").exists():
@@ -374,7 +417,10 @@ class SubtitlePage(Page):
     def _save_transcript(self, force=False):
         """每多一句定稿就存一次(當機也不會全部不見):output\\subtitles\\字幕 日期 時間.txt / .srt。"""
         lines = self._transcript_lines()
-        if self.session is None or not lines or (not force and len(lines) == self.session["saved"]) \
+        # 句數、每句是誰、顏色有變才重存(判斷誰說話是定稿後才算好,改顏色也要重存)
+        marks = tuple(self.color_of(line.speaker) for line in lines) if self.prefs["speakers"] else ()
+        signature = (len(lines), marks)
+        if self.session is None or not lines or (not force and signature == self.session["saved"]) \
                 or self.prefs["output"] == "off":
             return
         stamp = time.strftime("%Y-%m-%d %H:%M")
@@ -388,7 +434,9 @@ class SubtitlePage(Page):
             number += 1
             translated = "" if line.same else line.translation
             original = line.translation if line.same and line.translation else line.original
-            text.append(f"[{_clock(line.start)}] {original}")
+            color = self.color_of(line.speaker) if self.prefs["speakers"] else None
+            who = f"({speakers.color_name(color)}) " if color else ""
+            text.append(f"[{_clock(line.start)}] {who}{original}")
             if translated:
                 text.append(f"        {translated}")
             body = "\n".join(part for part in (translated, original) if part)
@@ -401,7 +449,7 @@ class SubtitlePage(Page):
                 (folder / f"{self.session['base']}.txt").write_text("\n".join(text) + "\n", encoding="utf-8")
             if output in ("both", "srt"):
                 (folder / f"{self.session['base']}.srt").write_text("\n".join(srt), encoding="utf-8")
-            self.session["saved"] = len(lines)
+            self.session["saved"] = signature
         except OSError as exc:
             self.notice = (f"字幕紀錄存不了：{exc}", theme.WARN)
 
@@ -432,7 +480,7 @@ class SubtitlePage(Page):
     # ------------------------------------------------------------ 每一幀
 
     def deactivate(self):
-        for dropdown in (self.program_pick, self.language, self.names_pick, self.target):
+        for dropdown in (self.program_pick, self.language, self.names_pick, self.speaker_pick, self.target):
             dropdown.close()
         self.settings_view.reset()
         self.lines_view.reset()
@@ -445,6 +493,7 @@ class SubtitlePage(Page):
         self.lines_view.update(mouse)
         if not self.running:
             self._refresh_ollama()
+        self._sync_speaker_mode()
         self.background()
 
     def background(self):
@@ -456,11 +505,12 @@ class SubtitlePage(Page):
             items = []
             for line, idle in engine.recent(int(self.prefs["count"])):
                 age = idle if line.final else None
+                color = self.color_of(line.speaker) if self.prefs["speakers"] else None
                 if line.same:
-                    items.append(("", line.translation or line.original, line.final, age))
+                    items.append(("", line.translation or line.original, line.final, age, (), color))
                 else:
                     ruby = furigana.annotate(line.original) if self.prefs["furigana"] else ()
-                    items.append((line.original, line.translation, line.final, age, ruby))
+                    items.append((line.original, line.translation, line.final, age, ruby, color))
             self.overlay.lines(items)
         if engine is not None and self.session is not None and time.monotonic() - self._saved_at > 1:
             self._saved_at = time.monotonic()
@@ -481,14 +531,16 @@ class SubtitlePage(Page):
                          mouse_pos)
         self._draw_footer(pygame.Rect(rect.x + margin, rect.bottom - footer_h - margin, rect.width - margin * 2,
                                       footer_h), mouse_pos)
-        for dropdown in (self.program_pick, self.language, self.names_pick, self.target):
+        for dropdown in (self.program_pick, self.language, self.names_pick, self.speaker_pick, self.target):
             dropdown.draw_menu(self.screen, mouse_pos)
         self.palette.draw(self.screen, mouse_pos)
+        self.menu.draw(self.screen, mouse_pos)
 
     def _controls(self):
-        buttons = [self.btn_refresh, self.btn_ollama, self.btn_font, self.btn_names, self.btn_translator]
+        buttons = [self.btn_refresh, self.btn_ollama, self.btn_font, self.btn_names, self.btn_translator,
+                   self.btn_speaker_edit]
         return buttons, [self.source, self.gain, self.mode, self.align, self.count, self.fade, self.output], \
-            [self.program_pick, self.language, self.names_pick, self.target], \
+            [self.program_pick, self.language, self.names_pick, self.speaker_pick, self.target], \
             [self.size, self.size_original, self.outline, self.opacity]
 
     def _draw_settings(self, rect, mouse_pos):
@@ -500,7 +552,7 @@ class SubtitlePage(Page):
         # 先把所有設定移到畫面外;這一幀真的畫出來的才會回到原位
         # (否則切換來源、關掉翻譯後,看不見的選單還留在原位,點別的地方會打開它)
         buttons, segments, dropdowns, sliders = self._controls()
-        for control in buttons + dropdowns + sliders + [self.translate_on, self.furigana_on]:
+        for control in buttons + dropdowns + sliders + [self.translate_on, self.furigana_on, self.speakers_on]:
             control.rect = HIDDEN.copy()
         for control in segments:
             control.rects = []
@@ -518,7 +570,7 @@ class SubtitlePage(Page):
             return rect.clip(area) if rect.colliderect(area) else HIDDEN.copy()
 
         buttons, segments, dropdowns, sliders = self._controls()
-        for control in buttons + sliders + [self.translate_on, self.furigana_on]:
+        for control in buttons + sliders + [self.translate_on, self.furigana_on, self.speakers_on]:
             control.rect = cut(control.rect)
         for control in segments:
             control.rects = [cut(rect) for rect in control.rects]
@@ -602,6 +654,37 @@ class SubtitlePage(Page):
         y += 36
         draw_text(screen, widgets.clip_text("人名、招式名等固定的翻法，辨識時也比較不會聽錯；字幕進行中也能改", 12, inner),
                   (x, y), 12, theme.TEXT_FAINT)
+        y += 28
+        draw_text(screen, "判斷誰說話", (x, y + 3), 14, theme.TEXT, bold=True)
+        self.speakers_on.value = prefs["speakers"]
+        self.speakers_on.draw(screen, (x + inner - 42, y + 2), mouse_pos)
+        y += 28
+        error = self.engine.speaker_error if self.engine is not None else ""
+        if prefs["speakers"] and not error:
+            draw_text(screen, "區分方式", (x + 12, y + 6), 13, theme.TEXT)
+            self._set_options(self.speaker_pick, self._speaker_options(), self.speaker_data["active"])
+            if not self.speaker_pick.is_open:
+                self.speaker_pick.set_value(self.speaker_data["active"])
+            self.btn_speaker_edit.draw(screen, pygame.Rect(x + inner - 170 - 64, y, 56, 30), mouse_pos)
+            self.speaker_pick.draw(screen, pygame.Rect(x + inner - 170, y, 170, 30), mouse_pos)
+            y += 36
+            name, value = self._speaker_choice()
+            method = speaker_profiles.METHOD_NAMES[value["method"]]
+            if value["method"] == "cluster":
+                choice = "自己判斷有幾個人，最近 10 秒內的顏色可能會修正"
+            else:
+                choice = f"{method}：同一人門檻 {value['same']:.2f}、換人門檻 {value['split']:.2f}"
+            draw_text(screen, widgets.clip_text(choice, 12, inner - 12), (x + 12, y), 12, theme.TEXT_FAINT)
+            y += 22
+        if error:
+            note, color = error, theme.WARN
+        elif prefs["speakers"]:
+            note, color = "不同人用不同顏色；字幕紀錄裡點一句可以複製或改那個人的顏色", theme.TEXT_FAINT
+        else:
+            missing = [dep for dep in diarize.DEPS if not dep.installed()]
+            note = "不同人說話時用不同顏色標示" + ("（需要下載約 51 MB 的元件）" if missing else "")
+            color = theme.TEXT_FAINT
+        draw_text(screen, widgets.clip_text(note, 12, inner), (x, y), 12, color)
         y += 28
 
         y = self._heading("辨識模型", x, y, "把聲音轉成文字")
@@ -805,11 +888,22 @@ class SubtitlePage(Page):
         for line, original, translated, height in blocks:
             if y + height >= area.y and y <= area.bottom:
                 row_rect = pygame.Rect(area.x + 6, y - 3, area.width - 20, height)
+                color = self.color_of(line.speaker) if self.prefs["speakers"] and not line.notice else None
+                if color:
+                    # 判斷誰說話:淡淡的底色 + 左邊一條,同一個人同一個顏色
+                    rounded_panel(screen, row_rect, color, radius=6, alpha=36)
+                    pygame.draw.rect(screen, color, (row_rect.x, row_rect.y + 4, 3, row_rect.height - 8),
+                                     border_radius=2)
                 if line.final and not line.notice:
                     self.line_rects.append((row_rect.clip(area), line))
                     if row_rect.collidepoint(mouse_pos) and area.collidepoint(mouse_pos):
-                        rounded_panel(screen, row_rect, theme.PANEL_LIGHT, radius=6, alpha=160)
-                        draw_text(screen, "點一下複製", (row_rect.right - 8, y + 2), 11, theme.TEXT_FAINT, right=True)
+                        if color:
+                            pygame.draw.rect(screen, color, row_rect, 1, border_radius=6)     # 外框:點了會改這個人
+                            hint = "點一下：複製或改這個人的顏色"
+                        else:
+                            rounded_panel(screen, row_rect, theme.PANEL_LIGHT, radius=6, alpha=160)
+                            hint = "點一下複製"
+                        draw_text(screen, hint, (row_rect.right - 8, y + 9), 11, theme.TEXT_FAINT, right=True)
                 dim = self.tool.accent if line.notice else (theme.TEXT_FAINT if line.final else theme.TEXT_DIM)
                 draw_text(screen, _clock(line.start), (area.x + 16, y + 2), 12, theme.TEXT_FAINT)
                 row_y = y
@@ -871,11 +965,14 @@ class SubtitlePage(Page):
             self.overlay.style(self._style())
 
     def modal_open(self):
-        return self.font_picker.is_open or self.names_dialog.is_open or self.translator_dialog.is_open
+        return self.font_picker.is_open or self.names_dialog.is_open or self.translator_dialog.is_open \
+            or self.speaker_dialog.is_open
 
     def draw_modal(self, mouse_pos):
         if self.translator_dialog.is_open:
             self.translator_dialog.draw(mouse_pos)
+        elif self.speaker_dialog.is_open:
+            self.speaker_dialog.draw(mouse_pos)
         elif self.names_dialog.is_open:
             self.names_dialog.update()
             self.names_dialog.draw(mouse_pos)
@@ -885,16 +982,25 @@ class SubtitlePage(Page):
     def handle_modal_event(self, event, mouse_pos):
         if self.translator_dialog.is_open:
             self.translator_dialog.handle_event(event, mouse_pos)
+        elif self.speaker_dialog.is_open:
+            self.speaker_dialog.handle_event(event, mouse_pos)
         elif self.names_dialog.is_open:
             self.names_dialog.handle_event(event, mouse_pos)
         else:
             self.font_picker.handle_event(event, mouse_pos)
 
     def handle_event(self, event, mouse_pos):
+        if self.menu.handle_event(event, mouse_pos):
+            return
         if self.palette.handle_event(event, mouse_pos):
             return
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 3 and self.lines_area.collidepoint(mouse_pos):
+            hit = next(((rect, line) for rect, line in self.line_rects if rect.collidepoint(mouse_pos)), None)
+            if hit is not None:
+                self._line_menu(*hit, mouse_pos)
+            return
         pairs = ((self.program_pick, None), (self.language, "language"), (self.names_pick, "names"),
-                 (self.target, "target"))
+                 (self.speaker_pick, "speaker_profile"), (self.target, "target"))
         opened = [pair for pair in pairs if pair[0].is_open]
         # 有選單開著時只交給它(點在外面就只是收起來),不會同時打開另一個
         for dropdown, key in opened or pairs:
@@ -903,6 +1009,11 @@ class SubtitlePage(Page):
                 if key == "names" and dropdown.value != before:
                     self.names["active"] = dropdown.value       # 進行中也能換,馬上生效
                     self._names_changed(self.names)
+                    return
+                if key == "speaker_profile":
+                    if dropdown.value != before:
+                        self.speaker_data["active"] = dropdown.value    # 進行中也能換,下一句開始套用
+                        self._speaker_profiles_changed(self.speaker_data)
                     return
                 if key is None and dropdown.value != before:
                     self._change_program(int(dropdown.value or 0) or None)     # 單一程式:換程式
@@ -953,9 +1064,13 @@ class SubtitlePage(Page):
             os.startfile(output_dir())
             return
         if self.lines_area.collidepoint(pos):
-            line = next((line for rect, line in self.line_rects if rect.collidepoint(pos)), None)
-            if line is not None:
-                self._copy([line], "這一句")
+            hit = next(((rect, line) for rect, line in self.line_rects if rect.collidepoint(pos)), None)
+            if hit is not None:
+                rect, line = hit
+                if self.prefs["speakers"] and line.speaker is not None:
+                    self._line_menu(rect, line, pos)    # 開了判斷誰說話:點一句打開選單(複製、改顏色)
+                else:
+                    self._copy([line], "這一句")
             return
         in_settings = self.settings_area.collidepoint(pos)
         if not in_settings:
@@ -982,6 +1097,11 @@ class SubtitlePage(Page):
             return
         if self.align.clicked(pos, True):
             self._set_style("align", self.align.value)
+            return
+        if self.btn_speaker_edit.clicked(pos, True):
+            # 重新讀資料夾(別人給的設定檔放進去就看得到);第一次編輯時建立預設的設定檔
+            self.speaker_data = speaker_profiles.load(self.app.config, create=True)
+            self.speaker_dialog.open(self.speaker_data)
             return
         if self.btn_names.clicked(pos, True):
             self.names = glossary.load(self.app.config)     # 重新讀資料夾:別人給的設定檔放進去就看得到
@@ -1010,6 +1130,9 @@ class SubtitlePage(Page):
             self._change("source", self.source.value)
         elif self.btn_refresh.clicked(pos, True):
             self._refresh_programs()
+        elif self.speakers_on.clicked(pos, True):
+            self.speakers_on.value = prefs["speakers"]
+            self._set_speakers(not prefs["speakers"])
         elif self.furigana_on.clicked(pos, True):
             self.furigana_on.value = prefs["furigana"]
             self._set_furigana(not prefs["furigana"])
@@ -1024,6 +1147,35 @@ class SubtitlePage(Page):
                     self.app.consent.open("辨識模型", missing, on_done=lambda: self._change("model", row))
                 else:
                     self._change("model", row)
+
+    def _set_speakers(self, on):
+        """打開時元件還沒下載:先詢問,下載好才打開。字幕進行中也能開關(下一句開始判斷)。"""
+        if on and any(not dep.installed() for dep in diarize.DEPS):
+            self.app.consent.open("判斷誰說話", diarize.DEPS, on_done=lambda: self._set_speakers(True))
+            return
+        self._change("speakers", on)
+        self._dirty = True
+
+    def color_of(self, speaker):
+        """第幾個人的顏色(使用者改過的優先);判斷不了的句子沒有顏色。"""
+        if speaker is None:
+            return None
+        return tuple(self.speaker_colors.get(speaker, speakers.COLORS[speaker % len(speakers.COLORS)][1]))
+
+    def _line_menu(self, rect, line, pos):
+        """字幕紀錄裡一句的選單(左鍵、右鍵都是這個):複製這一句、改這個人的顏色。"""
+        can_color = self.prefs["speakers"] and line.speaker is not None
+        self.menu.open(pos, [("複製這一句", "", True, lambda: self._copy([line], "這一句")),
+                             ("改這個人的顏色", "", can_color, lambda: self._recolor(line, rect))])
+
+    def _recolor(self, line, anchor):
+        """改這個人的顏色:同一個人的每一句(字幕視窗、字幕紀錄、存檔)一起換。"""
+        def pick(color, speaker=line.speaker):
+            if color is not None:
+                self.speaker_colors[speaker] = tuple(color)
+                self._dirty = True
+                self._save_transcript(force=True)
+        self.palette.open(anchor, self.color_of(line.speaker), pick)
 
     def _set_furigana(self, on):
         """打開時字典還沒下載:先詢問,下載好才打開。"""
