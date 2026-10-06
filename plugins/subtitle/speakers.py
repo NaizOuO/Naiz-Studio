@@ -38,6 +38,18 @@ MOST = 6                # 最多分幾群
 HISTORY = 300           # 最多拿最近幾句來分群(太多會算太久)
 FIRST_SAME = 0.6        # 句子還少(不到 4 句)不能分群時,先用門檻比對
 MAX_CUTS = 3            # 一句最多切幾刀
+# v1.18.5 很少講話的人被併進別人:分完群後每群再試著拆成兩半,兩半的中心不夠像(低於 APART)、各至少 APART_LEAST 句就拆開
+# (實測 AMI 會議:乾淨 86%→91%、通話 64%→70%,講最少的人從 0 句分對變 6/8;Discord 與單人素材不變)
+APART = 0.60
+APART_LEAST = 3
+# v1.18.5 A 講完 B 馬上接(同一句):每 HAND_STEP 秒試一個切點,切點兩邊整段各算聲音特徵,和已經認得的每個人比,
+# 兩邊最像的是不同人、都至少像 HAND_LEAST、而且比第二像的人多 HAND_MARGIN 才切。
+# 實測 Discord 22 句多人句:舊做法(1.5 秒小段互比)切開 5 句、單人句誤切 4/112;這個做法切開 14 句、誤切 6/112
+HAND_STEP = 0.25
+HAND_EDGE = 0.8         # 切點離頭尾至少這麼多秒(太短的一邊聲音特徵不可靠)
+HAND_LEAST = 0.5
+HAND_MARGIN = 0.15
+HAND_TRIES = 12         # 一句最多試幾個切點(長句放寬間隔)
 
 
 def _dot(a, b):
@@ -147,9 +159,16 @@ class Clusterer:
             score = _silhouette(sim, labels, k)
             if best is None or score > best[0] + 0.02:
                 best = (score, labels)
-        if best[0] < SINGLE:
-            return [0] * n
-        return _merge_close(x, [int(v) for v in best[1]])
+        labels = [0] * n if best[0] < SINGLE else _merge_close(x, [int(v) for v in best[1]])
+        return _split_apart(x, labels)
+
+    def centers(self):
+        """已經認得的人:{編號: 平均聲音特徵},只算有 2 句以上的人(一句的不可靠)。"""
+        groups = {}
+        for vector, label in zip(self.vectors, self.labels):
+            if label is not None:
+                groups.setdefault(label, []).append(vector)
+        return {label: _unit(np.sum(vectors, 0)) for label, vectors in groups.items() if len(vectors) >= 2}
 
     def _stable(self, fresh):
         """新的分群編號對到上一次的編號(重疊最多的優先),對不到的給新編號。"""
@@ -168,6 +187,53 @@ class Clusterer:
                 next_id += 1
             result.append(min(mapping[new], MAX_SPEAKERS - 1))
         return result
+
+
+def _unit(vector):
+    vector = np.asarray(vector, dtype=np.float32)
+    return vector / (np.linalg.norm(vector) or 1.0)
+
+
+def _split_apart(x, labels):
+    """每群再試著拆成兩半:兩半的中心低於 APART、各至少 APART_LEAST 句就拆開(很少講話的人才不會一直被併在別人那群)。"""
+    labels = list(labels)
+    changed = True
+    while changed and len(set(labels)) < MOST:
+        changed = False
+        for group in sorted(set(labels)):
+            members = [i for i, label in enumerate(labels) if label == group]
+            if len(members) < APART_LEAST * 2:
+                continue
+            sub = x[members]
+            halves = max((_kmeans(sub, 2, seed) for seed in range(3)), key=lambda r: r[1])[0]
+            parts = [sub[halves == h] for h in (0, 1)]
+            if min(len(part) for part in parts) < APART_LEAST:
+                continue
+            if float(_unit(parts[0].sum(0)) @ _unit(parts[1].sum(0))) < APART:
+                new = max(labels) + 1
+                for i, half in zip(members, halves):
+                    if half == 1:
+                        labels[i] = new
+                changed = True
+                break
+    order = {g: i for i, g in enumerate(dict.fromkeys(labels))}
+    return [order[label] for label in labels]
+
+
+def handoff(left, right, centers):
+    """一個切點兩邊的聲音特徵(left、right)各自和已認得的人比:兩邊最像的是不同人、都夠像、也明顯比第二像的人像,
+    回傳把握(兩邊「比第二像的人多多少」較小的那個,越大越確定);不是換人的地方回傳 None。centers 至少要有兩個人。"""
+    if left is None or right is None or len(centers) < 2:
+        return None
+    sides, margins = [], []
+    for vector in (left, right):
+        vector = _unit(vector)
+        ranked = sorted(((float(vector @ c), label) for label, c in centers.items()), reverse=True)
+        if ranked[0][0] < HAND_LEAST or ranked[0][0] - ranked[1][0] < HAND_MARGIN:
+            return None
+        sides.append(ranked[0][1])
+        margins.append(ranked[0][0] - ranked[1][0])
+    return min(margins) if sides[0] != sides[1] else None
 
 
 def _merge_close(x, labels):

@@ -848,6 +848,8 @@ class Engine:
         parts = [ZH_PROMPT] if language == "zh" else []
         if s.verbatim and language in SPOKEN_PROMPTS:
             parts.append(SPOKEN_PROMPTS[language])
+        if s.model in asr.NO_PUNCTUATION:
+            parts = []          # 中文(台灣)本來就繁體、不會照提示加標點;實測不給提示錯字略少(專有名詞照給)
         terms = names.prompt(s.glossary)
         if terms:
             parts.append(terms)
@@ -1104,13 +1106,15 @@ class Engine:
     def _split_speakers(self, extractor, line, audio, split=voices.SPLIT):
         """一句裡換人(快速對話中間沒停頓,被當成一句):每 0.75 秒取 1.5 秒算聲音特徵,前後差很多的地方切開,
         切在最近的字與字之間。回傳 [(那一行, 那段聲音)];沒換人就是原本那一行。"""
-        size, hop = int(voices.WINDOW * RATE) * 2, int(voices.HOP * RATE) * 2
-        count = (len(audio) - size) // hop + 1 if len(audio) >= size else 0
-        if count < voices.SIDE * 2:
-            return [(line, audio)]
-        vectors = [extractor.embed_pcm16(audio[i * hop:i * hop + size]) for i in range(count)]
-        cuts = voices.change_points(vectors, split)
-        times = [line.start + k * voices.HOP + (voices.WINDOW - voices.HOP) / 2 for k in cuts]
+        times = self._handoff(extractor, line, audio)
+        if times is None:
+            size, hop = int(voices.WINDOW * RATE) * 2, int(voices.HOP * RATE) * 2
+            count = (len(audio) - size) // hop + 1 if len(audio) >= size else 0
+            if count < voices.SIDE * 2:
+                return [(line, audio)]
+            vectors = [extractor.embed_pcm16(audio[i * hop:i * hop + size]) for i in range(count)]
+            cuts = voices.change_points(vectors, split)
+            times = [line.start + k * voices.HOP + (voices.WINDOW - voices.HOP) / 2 for k in cuts]
         pieces = split_text(line.original, line.words, line.start, line.end, times, line.language in SPACED)
         if len(pieces) < 2 or line not in self.lines:
             return [(line, audio)]          # 不用切,或這行已經被拿掉了(重複的碎片):切出來的新行會變成孤兒
@@ -1129,6 +1133,29 @@ class Engine:
             sound = audio[int((start - line.start) * RATE) * 2:int((end - line.start) * RATE) * 2]
             parts.append((part, sound))
         return parts
+
+    def _handoff(self, extractor, line, audio):
+        """自動分群已經認得兩個人以上時,用「切點兩邊各像誰」找換人的地方(短短一句接話也找得到):
+        回傳 [切開的時間] 或 [](沒換人);還沒認得兩個人(或不是自動分群)回傳 None,改用舊的找法。"""
+        mode = self.settings.speaker_mode
+        if mode.get("method") != "cluster":
+            return None
+        centers = self.clusterer.centers()
+        if len(centers) < 2:
+            return None
+        seconds = len(audio) / 2 / RATE
+        # 長句試的間隔放寬,最多試 HAND_TRIES 次(每次算兩段聲音特徵,太多次翻譯會等太久)
+        step = max(voices.HAND_STEP, (seconds - 2 * voices.HAND_EDGE) / voices.HAND_TRIES)
+        longest = int(voices.LONGEST * RATE) * 2
+        moment, best = voices.HAND_EDGE, None
+        while moment <= seconds - voices.HAND_EDGE:
+            cut = int(moment * RATE) * 2
+            sure = voices.handoff(extractor.embed_pcm16(audio[max(0, cut - longest):cut]),
+                                  extractor.embed_pcm16(audio[cut:cut + longest]), centers)
+            if sure is not None and (best is None or sure > best[0]):
+                best = (sure, moment)           # 好幾個地方都像換人:切在最確定的那裡
+            moment += step
+        return [line.start + best[1]] if best else []
 
     # ------------------------------------------------------------ 翻譯
 

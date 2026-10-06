@@ -88,7 +88,7 @@
   也可以改用門檻比對，自己調門檻（設定檔存在 `setting\subtitle_speakers`）。需要下載約 51 MB 的元件
 - 收音靈敏度：電腦音量開得很小時自動放大，也可以固定放大倍數
 - 字幕紀錄自動存在 `output\subtitles`，可以選存成 SRT、TXT、兩者，或不存檔
-- 辨識模型四種（快速、輕量、推薦、最準確）；翻譯在本地執行，已安裝 [Ollama](https://ollama.com) 就用 Ollama，沒有的話用內建的翻譯引擎（llama.cpp），模型從網路下載。程式會依電腦配備先選好建議的組合，所有選項都可以自己換
+- 辨識模型五種（快速、輕量、推薦、最準確、中文（台灣））；「中文（台灣）」是聯發科的 Breeze ASR 25，台灣口語、中英混用錯字較少，從官方下載後在本地轉換格式（下載約 3.1 GB，轉換後約 1.1 GB），需要顯示卡；翻譯在本地執行，已安裝 [Ollama](https://ollama.com) 就用 Ollama，沒有的話用內建的翻譯引擎（llama.cpp），模型從網路下載。程式會依電腦配備先選好建議的組合，所有選項都可以自己換
 - 翻譯模型在「翻譯模型」視窗裡管理：每個模型都寫出說明、大小和需要的顯示卡記憶體，可以下載、選用、刪除；有給高階電腦用的大模型（需要約 20 GB 以上的顯示卡記憶體），配備不夠時下載前會先提醒。用內建翻譯引擎時，第一次下載會連同引擎（約 32 MB）一起下載，下載前會先說明
 - 全部在本地運算，聲音不會上傳；字幕只能從 Naiz Studio 停止，關掉 Naiz Studio 字幕也會一起關
 - 「獨佔全螢幕」的遊戲蓋不上任何視窗，請在遊戲設定改成「無邊框視窗」
@@ -326,6 +326,7 @@ TOOLS = [HelloTool]
 | [tessdata_best](https://github.com/tesseract-ocr/tessdata_best) | 文字辨識的語言資料 | Apache-2.0 |
 | [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | 語音辨識 | MIT |
 | [Whisper 模型](https://github.com/openai/whisper) | 語音辨識模型 | MIT |
+| [Breeze ASR 25](https://huggingface.co/MediaTek-Research/Breeze-ASR-25)（聯發科） | 即時字幕「中文（台灣）」辨識模型 | Apache-2.0 |
 | [Silero VAD](https://github.com/snakers4/silero-vad) | 人聲偵測模型 | MIT |
 | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | 說話者分離、即時字幕判斷誰說話 | Apache-2.0 |
 | [3D-Speaker CAM++](https://github.com/modelscope/3D-Speaker) | 聲音特徵模型 | Apache-2.0 |

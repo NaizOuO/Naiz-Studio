@@ -563,6 +563,8 @@ class App:
             self.update_prompted = True
             self.ask_update(first=True)
         job = self.update_job
+        if job is not None and job.state == "cancelled":
+            self.update_job = None          # 取消了:標題旁回到「有新版本」,想更新時再點
         if job is not None and job.state == "ready" and not getattr(job, "announced", False):
             job.announced = True
             self.dialog.open("新版本已經下載好", [f"已經換成 {self.update_info['tag']}，重新開啟程式就是新版。"],
@@ -625,6 +627,10 @@ class App:
                     return f"下載更新 {int(job.progress * 100)}%", theme.ACCENT
                 left = "不到 1 分鐘" if left < 60 else f"約 {int(left // 60) + 1} 分鐘"
                 return f"下載更新 {int(job.progress * 100)}%，還要{left}", theme.ACCENT
+            if job.state == "installing":
+                return "正在換成新版…", theme.ACCENT
+            if job.state == "cancelled":
+                return None
             if job.state == "ready":
                 return "重新開啟以完成更新", theme.ACCENT
             return "更新失敗，點這裡到網頁下載", theme.WARN
@@ -634,12 +640,24 @@ class App:
 
     def click_badge(self):
         job = self.update_job
-        if job is not None and job.state == "ready":
+        if job is not None and job.state == "downloading":
+            self.ask_cancel_update()
+        elif job is not None and job.state == "ready":
             self.restart_for_update()
         elif job is not None and job.state == "failed":
             self.open_release_page()
         elif job is None and self.update_info:
             self.ask_update()
+
+    def ask_cancel_update(self):
+        lines = [f"正在下載 {self.update_info['tag']}（{int(self.update_job.progress * 100)}%）。",
+                 "取消後之後還可以再更新；直接關閉程式也沒關係，下載到一半的檔案下次開啟時會自動清掉。"]
+
+        def choice(key, _):
+            job = self.update_job
+            if key == "stop" and job is not None:
+                job.stop()
+        self.dialog.open("更新下載中", lines, [("stop", "取消更新", False), ("keep", "繼續下載", True)], choice)
 
     def go_home(self):
         self.current = None
@@ -798,6 +816,8 @@ class App:
                 self.draw_frame(mouse_pos)
                 pygame.display.flip()
             self.clock.tick(rate or 5)
+        if self.update_job is not None:
+            self.update_job.wait_installed()     # 正在換成新版的那幾秒:做完再結束,不會留下壞掉的程式
         pygame.quit()
         if self.relaunch:
             import subprocess

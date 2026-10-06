@@ -16,7 +16,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import paths
@@ -113,6 +113,11 @@ class Dependency:
     installer: str = ""         # "msi"/"nsis":下載的是 Windows 安裝檔,只解出檔案,不會真的安裝到系統
     install_size: int = 0       # 解開後大約多大(位元組);沒填就以下載大小推估
     keep: tuple = ()            # 安裝檔裡只留這些檔案(安裝後的相對路徑);沒填就全部留下
+    # 要先下載好幾個檔案、再在本地做出 files 的(例如官方模型轉成 whisper.cpp 格式):
+    # parts = ((檔名, 網址, 大小, SHA-256), ...) 下載到暫存資料夾;build(暫存資料夾, 目標檔, progress, cancel) 做出目標檔。
+    # 下載好的部分會留著,中途取消或失敗時下次不用重下載;做好後暫存資料夾刪掉
+    parts: tuple = ()
+    build: object = None
 
     @property
     def base_dir(self):
@@ -467,7 +472,43 @@ def _download(dep, download, base, progress, cancel):
     return digest
 
 
+def _install_built(dep: Dependency, progress=None, cancel=None):
+    """parts + build 的元件:先下載每個部分(各自驗證),再在本地做出目標檔。
+    進度:下載佔大部分,做檔案的時間另外算一小段(約全部的 5%)。"""
+    base = dep.base_dir
+    staging_name = f".{dep.id}.parts"
+    downloads = sum(size for _, _, size, _ in dep.parts)
+    total = downloads + max(1, downloads // 20)
+    done = 0
+    for name, url, size, sha256 in dep.parts:
+        part = replace(dep, id=f"{dep.id}-{name}", url=url, sha256=sha256, files={f"{staging_name}/{name}": None},
+                       parts=(), build=None, install_size=0, check_args=[])
+        if not part.installed():
+            def each(now, _total, before=done):
+                if progress:
+                    progress(before + now if now else 0, total if now else 0)
+            install(part, each, cancel)
+        done += size
+    if cancel is not None and cancel.is_set():
+        raise Cancelled()
+    target = dep.path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    def building(now, whole):
+        if progress:
+            progress(downloads + int((total - downloads) * now / max(1, whole)), total)
+
+    if dep.build(base / staging_name, target, building, (lambda: cancel.is_set()) if cancel is not None else None) is False:
+        raise Cancelled()
+    shutil.rmtree(base / staging_name, ignore_errors=True)
+    if progress:
+        progress(total, total)
+
+
 def install(dep: Dependency, progress=None, cancel=None):
+    if dep.parts:
+        _install_built(dep, progress, cancel)
+        return
     base = dep.base_dir
     base.mkdir(parents=True, exist_ok=True)
     # 先拿到官方驗證碼才開始下載;拿不到就不下載,避免裝上無法確認來源的程式

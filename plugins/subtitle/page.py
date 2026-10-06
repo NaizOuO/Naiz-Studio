@@ -713,7 +713,7 @@ class SubtitlePage(Page):
             draw_text(screen, widgets.clip_text(note, 11, inner - 20), (row.x + 10, row.y + 25), 11, theme.TEXT_FAINT)
             self.model_rows.append((row, key))
             y += 48
-        if not asr.gpu() and prefs["model"] in ("turbo", "large"):
+        if not asr.gpu() and prefs["model"] in ("turbo", "large", "breeze"):
             draw_text(screen, "沒有 NVIDIA 顯示卡時這個模型跟不上即時，建議用「輕量」", (x, y), 12, theme.WARN)
             y += 20
         elif asr.gpu():

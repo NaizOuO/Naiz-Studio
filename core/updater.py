@@ -92,21 +92,27 @@ def plan_patches(releases, current, target, full_size=0):
     return steps
 
 
-class Checker:
-    """在背景檢查一次;結果放在 result(沒有新版或連不上時是 None)。"""
+CHECK_DELAY = 3.0           # 開啟後等一下才檢查:先讓視窗開好,網路慢也不會和開啟搶時間
+CHECK_TIMEOUT = 8           # GitHub 這麼久沒回就放棄(這次不檢查,下次開啟再試)
 
-    def __init__(self, fetch=None, fetch_all=None):
+
+class Checker:
+    """在背景檢查一次;結果放在 result(沒有新版或連不上時是 None)。不會擋住程式開啟或操作。"""
+
+    def __init__(self, fetch=None, fetch_all=None, delay=CHECK_DELAY):
         self.result = None
         self.error = False              # 連不上 GitHub
         self.done = False
-        self._fetch = fetch or (lambda: _get_json(LATEST_URL))
-        self._fetch_all = fetch_all or (lambda: _get_json(RELEASES_URL))
+        self.delay = delay
+        self._fetch = fetch or (lambda: _get_json(LATEST_URL, CHECK_TIMEOUT))
+        self._fetch_all = fetch_all or (lambda: _get_json(RELEASES_URL, CHECK_TIMEOUT))
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
         return self
 
     def _run(self):
+        time.sleep(self.delay)
         try:
             self.result = parse_release(self._fetch())
         except Exception:
@@ -151,7 +157,9 @@ def refresh_icon(path):
 
 
 class Updater:
-    """背景下載更新:state 是 downloading、ready(已換好,重新開啟就是新版)或 failed;progress 0～1。"""
+    """背景下載更新:state 是 downloading、installing(正在換檔案,幾秒內完成)、ready(已換好,重新開啟就是新版)、
+    cancelled(使用者取消)或 failed;progress 0～1。下載中隨時可以取消或關閉程式(下載到一半的檔案下次開啟時清掉);
+    換檔案的那幾秒不能中斷,關閉程式時會等它做完(wait_installed)。"""
 
     def __init__(self, info, exe=None):
         self.info = info
@@ -163,6 +171,21 @@ class Updater:
         self.patch_error = ""           # 補丁套用失敗、改下載完整版的原因
         self.message = ""
         self.cancel = threading.Event()
+        self._installed = threading.Event()
+        self._installed.set()
+        self._lock = threading.Lock()       # 取消和「開始換檔案」不會同時發生
+
+    def stop(self):
+        """取消下載:馬上算取消(網路很慢時,下載的那條線可能要等一下才收到,收到後自己清掉暫存);
+        換檔案開始後就不能取消,會照常做完。"""
+        with self._lock:
+            if self.state == "downloading":
+                self.cancel.set()
+                self.state = "cancelled"
+
+    def wait_installed(self, timeout=30):
+        """關閉程式前呼叫:正在換檔案時等它做完,不會留下壞掉的 exe。"""
+        return self._installed.wait(timeout)
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -173,8 +196,14 @@ class Updater:
             self._download_and_swap()
             self.state = "ready"
         except Exception as error:
-            self.message = str(error) or type(error).__name__
-            self.state = "failed"
+            if self.cancel.is_set():
+                self.state = "cancelled"
+            else:
+                self.message = str(error) or type(error).__name__
+                self.state = "failed"
+            shutil.rmtree(paths.APP_DIR / "update", ignore_errors=True)
+        finally:
+            self._installed.set()
 
     def _download_and_swap(self):
         work = paths.APP_DIR / "update"
@@ -202,14 +231,14 @@ class Updater:
         before = sum(int(s.get("size") or 0) for s in steps[:steps.index(step)])
         digest = hashlib.sha256()
         request = urllib.request.Request(step["url"], headers={"User-Agent": "NaizStudio"})
-        with urllib.request.urlopen(request, timeout=60) as response, open(target, "wb") as out:
+        with urllib.request.urlopen(request, timeout=30) as response, open(target, "wb") as out:
             total = total or int(response.headers.get("Content-Length") or 0)
             received = 0
             started = time.monotonic()
             while True:
                 if self.cancel.is_set():
                     raise RuntimeError("已取消")
-                chunk = response.read(1 << 16)
+                chunk = response.read1(1 << 16)      # 有多少先拿多少:網路很慢時也能很快發現被取消
                 if not chunk:
                     break
                 out.write(chunk)
@@ -259,6 +288,11 @@ class Updater:
 
     def _install(self, exe_data, extra):
         """寫入新的 exe 與隨附檔案:exe 用改名的方式替換,其他檔案直接覆蓋;不安全的路徑略過。"""
+        with self._lock:
+            if self.cancel.is_set():
+                raise RuntimeError("已取消")
+            self._installed.clear()         # 從這裡開始不能中斷(關閉程式時會等)
+            self.state = "installing"
         folder = self.exe.parent
         new_exe = folder / (self.exe.name + ".new")
         new_exe.write_bytes(exe_data)

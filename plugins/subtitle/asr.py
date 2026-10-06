@@ -21,7 +21,7 @@ import urllib.request
 import uuid
 import wave
 
-from core import deps, paths, transcribe
+from core import deps, paths, transcribe, whisper_convert
 
 from . import vad
 
@@ -50,12 +50,81 @@ SMALL = deps.Dependency(
     location="models",
     sha256="49c8fb02b65e6049d5fa6c04f81f53b867b5ec9540406812c643f177317f779f",
 )
+_BREEZE = "https://huggingface.co/MediaTek-Research/Breeze-ASR-25/resolve/cffe7ccb404d025296a00758d0a33468bec3a9d0"
+
+
+def _build_breeze(folder, target, progress, cancel):
+    """官方的 Hugging Face 格式 → whisper.cpp 格式(16 位元)→ 壓縮成 q5_0(約 1.1 GB,和「推薦」模型同一種壓縮)。"""
+    full = target.with_name(target.stem + "-f16.bin")
+    try:
+        if not whisper_convert.convert(folder, full, lambda done, total: progress(done, total * 2), cancel):
+            return False
+        tool = transcribe.engine().path().with_name("whisper-quantize.exe")
+        partial = target.with_name(target.name + ".part")
+        result = deps.run([tool, full, partial, "q5_0"], capture_output=True, timeout=1800)
+        if result.returncode != 0 or not partial.is_file():
+            partial.unlink(missing_ok=True)
+            raise RuntimeError("模型轉換失敗，請重試")
+        partial.replace(target)
+        progress(1, 1)
+        return True
+    finally:
+        full.unlink(missing_ok=True)
+
+
+# 聯發科 Breeze ASR 25:台灣華語、中英混用(Whisper large-v2 微調,Apache-2.0)。官方只有 Hugging Face 格式,
+# 從官方下載後在本地轉成 whisper.cpp 格式(不用來源不明的轉檔)。
+# 實測台灣談話節目錯字率:賀瓏夜夜秀 13.0%→9.2%、博恩夜夜秀 10.1%→9.4%;速度約「推薦」的 2.3 倍時間(有顯示卡仍跟得上)。
+# 不會輸出標點:用 Whisper 的分段補上(見 punctuate)
+BREEZE = deps.Dependency(
+    id="whisper-model-breeze",
+    name="辨識模型（中文台灣）",
+    purpose="聯發科 Breeze ASR 25，從官方下載後在本地轉換，完成後只留約 1.1 GB",
+    size_text="約 3.1 GB",
+    url=f"{_BREEZE}/model.safetensors",
+    files={"ggml-breeze-asr-25-q5_0.bin": None},
+    location="models",
+    parts=(("config.json", f"{_BREEZE}/config.json", 2281,
+            "152f13a1b4535d16edd05a9168553a967e2b42d07feee59b136f0ab14e522aab"),
+           ("vocab.json", f"{_BREEZE}/vocab.json", 835550,
+            "8f680bba319e01a653d2e8a5dbc17a9157179e0576e6ce74ce0c06356c6e24f9"),
+           ("model.safetensors", f"{_BREEZE}/model.safetensors", 3086761032,
+            "c5d952b3bc03ea277209aff0ef5b5c4c055d74449ff794c02d8f4e315fdef6b6")),
+    build=_build_breeze,
+    install_size=4_300_000_000,
+)
+NO_PUNCTUATION = {"breeze"}     # 這些模型不輸出標點,要自己補
+ZH_ONLY = {"breeze"}            # 這些模型只辨識中文(中英混用的英文會照留):不管選什麼語言都當成中文
+PAUSE = 0.35                    # 分段之間停頓這麼久以上補句號,不然補逗號
+SENTENCE_CHARS = 14             # 這句(上一個句號之後)已經這麼多字:下一個分段處就補句號(不然很少停頓夠久,一行會拖到十幾秒)
+_ENDS = "，。？！、,.?!…：；"
+
+
+def punctuate(segments, words):
+    """不輸出標點的模型:每段(Whisper 的分段大多是一個短句)後面補標點。段與段之間停頓夠久、或這句已經夠長補「。」、
+    不然補「，」,「嗎」結尾補「？」;最後一段可能還沒講完,不補。words 是每個字的時間,用來量停頓。"""
+    out, since = [], 0
+    for index, (start, end, text) in enumerate(segments):
+        text = text.strip()
+        if not text or text[-1] in _ENDS or index == len(segments) - 1:
+            out.append((start, end, text))
+            continue
+        nxt = segments[index + 1]
+        last = max((w[1] for w in words if start - 0.05 <= w[0] and w[1] <= end + 0.05 and w[2].strip()), default=end)
+        first = min((w[0] for w in words if w[0] >= nxt[0] - 0.05 and w[2].strip()), default=nxt[0])
+        since += sum(ch.isalnum() for ch in text)
+        mark = "？" if text.endswith("嗎") else ("。" if first - last >= PAUSE or since >= SENTENCE_CHARS else "，")
+        if mark != "，":
+            since = 0
+        out.append((start, end, text + mark))
+    return out
 # (代號, 名稱, 模型, 說明)
 MODELS = [
     ("base", "快速", transcribe.MODELS["base"], "最省資源；錯字較多，日文、中文尤其明顯"),
     ("small", "輕量", SMALL, "沒有獨立顯示卡也能即時；比快速準"),
     ("turbo", "推薦", transcribe.MODELS["turbo"], "準確又快，有 NVIDIA 顯示卡時選這個"),
     ("large", "最準確", transcribe.MODELS["large"], "錯字最少；需要約 3.5 GB 顯示卡記憶體"),
+    ("breeze", "中文（台灣）", BREEZE, "台灣口語、中英混用錯字較少；只辨識中文，需要顯示卡"),
 ]
 MODEL_NAMES = {key: name for key, name, _, _ in MODELS}
 MODEL_FILES = {key: dep for key, _, dep, _ in MODELS}
@@ -180,6 +249,8 @@ class Server:
     def transcribe(self, pcm, language="auto", prompt=""):
         """辨識一段 16kHz 單聲道 16 位元 PCM;回傳 (文字, 語言代號, 沒有人聲的機率)。"""
         pcm = pcm[-MAX_SECONDS * RATE * 2:]
+        if self.model_key in ZH_ONLY:
+            language = "zh"
         boundary = uuid.uuid4().hex
         # 這次要時間(伺服器預設不給):用來把一口氣講的好幾句切開
         fields = {"language": language, "response_format": "verbose_json", "temperature": "0.0",
@@ -195,6 +266,11 @@ class Server:
         segments = result.get("segments") or []
         for segment in segments:
             segment["text"] = _repair(segment.get("text", ""))
+        if self.model_key in NO_PUNCTUATION and segments:
+            words = [(w.get("start", 0), w.get("end", 0), w.get("word", "")) for s in segments for w in (s.get("words") or [])]
+            marked = punctuate([(s.get("start"), s.get("end"), s["text"]) for s in segments], words)
+            for segment, (_, _, text) in zip(segments, marked):
+                segment["text"] = text
         text = "".join(segment.get("text", "") for segment in segments).strip() or _repair(result.get("text", "")).strip()
         detected = WHISPER_NAMES.get(result.get("detected_language") or result.get("language") or "", language)
         silence = max((segment.get("no_speech_prob", 0) for segment in segments), default=0)
