@@ -17,7 +17,8 @@ from core.widgets import Button, Dropdown, SegmentedControl, Slider, Toggle, dra
 from ..editor import fonts
 from ..editor.font_picker import FontPicker
 from ..editor.palette import ColorPalette
-from . import asr, furigana, glossary, hardware, speaker_profiles, speakers
+from . import asr, filters, furigana, glossary, hardware, speaker_profiles, speakers, web
+from .filter_dialog import FilterDialog
 from .translator_dialog import TranslatorDialog
 from . import translate as ollama
 from .engine import Engine, Settings
@@ -88,7 +89,8 @@ class SubtitlePage(Page):
         saved = app.config.get(CONFIG_KEY) if isinstance(app.config.get(CONFIG_KEY), dict) else {}
         self.prefs = {"source": "system", "language": "auto", "model": model, "translate": True,
                       "translator": translator, "target": "zh-TW", "partial": partial, "gain": "auto",
-                      "output": "both", "speakers": False, **STYLE}
+                      "output": "both", "speakers": False, "web": False, "web_layout": "subtitle",
+                      "overlay": True, "sections": [], "obs_scale": 100, "obs_lines": 12, "obs_css": "", **STYLE}
         self.prefs.update({k: v for k, v in saved.items() if k in self.prefs})
 
         self.source = SegmentedControl(SOURCES, accent=accent)
@@ -104,6 +106,28 @@ class SubtitlePage(Page):
         self.names_pick = Dropdown([(glossary.NONE, "不使用")], accent=accent, size=13)
         self.btn_names = Button("編輯", filled=False, size=12)
         self.names_dialog = GlossaryDialog(lambda: self.screen, accent, self._names_changed)
+        # 直播:敏感詞過濾(只遮字幕視窗和 OBS 上的字)、OBS 瀏覽器來源
+        self.filter_data = filters.load(app.config)
+        self._masker = filters.masker(self.filter_data)
+        self.filter_pick = Dropdown([(filters.NONE, "不使用")], accent=accent, size=13)
+        self.btn_filter = Button("編輯", filled=False, size=12)
+        self.filter_dialog = FilterDialog(lambda: self.screen, accent, self._filter_changed)
+        self.web = web.WebSource()
+        self.web_on = Toggle(self.prefs["web"], accent=accent)
+        self.web_layout = SegmentedControl(web.LAYOUTS, accent=accent)
+        self.web_layout.index = [k for k, _ in web.LAYOUTS].index(self.prefs["web_layout"])             if self.prefs["web_layout"] in dict(web.LAYOUTS) else 0
+        self.btn_web_copy = Button("複製網址", filled=False, size=12)
+        self.btn_web_preview = Button("預覽", filled=False, size=12)
+        self.obs_scale = SegmentedControl(web.SCALES, accent=accent)
+        self.obs_lines = SegmentedControl(web.LOG_COUNTS, accent=accent)
+        self.obs_css = Dropdown([(web.DEFAULT_CSS, "跟字幕視窗一樣")], accent=accent, size=13)
+        self.btn_css_folder = Button("開啟資料夾", filled=False, size=12)
+        self.overlay_on = Toggle(self.prefs["overlay"], accent=accent)      # 用 OBS 時可以關掉字幕視窗
+        self.btn_reset_position = Button("重設位置", filled=False, size=12)
+        self.section_rects = []             # [(標題列的範圍, 段落代號)]:點一下展開或收起
+        self._css_stamp = None
+        self._web_style = None
+        self._web_checked = 0.0
         self.model_rows = []                # 這一幀畫出來的辨識模型:[(範圍, 代號)]
         self.translate_on = Toggle(self.prefs["translate"], accent=accent)
         self.furigana_on = Toggle(self.prefs["furigana"], accent=accent)
@@ -168,6 +192,8 @@ class SubtitlePage(Page):
         self._pushed = 0.0
         self._programs_busy = False
         self._refresh_ollama()
+        if self.prefs["web"]:
+            self._start_web()
         atexit.register(self._on_exit)
 
     def _on_exit(self):
@@ -175,6 +201,7 @@ class SubtitlePage(Page):
         engine = self.engine
         if engine is not None and engine.settings.translate and engine.state in ("loading", "running"):
             ollama.unload(engine.settings.translator)
+        self.web.stop()
 
     # ------------------------------------------------------------ 設定
 
@@ -269,6 +296,73 @@ class SubtitlePage(Page):
     def _names_options(self):
         return [(glossary.NONE, "不使用")] + [(name, name, f"{len(terms)} 個")
                                             for name, terms in self.names["profiles"].items()]
+
+    def _filter_options(self):
+        return [(filters.NONE, "不使用")] + [(name, name, f"{len(filters.words(items))} 個詞")
+                                            for name, items in self.filter_data["profiles"].items()]
+
+    def _filter_changed(self, data):
+        """敏感詞過濾改了:存檔,字幕視窗和 OBS 上的字馬上重新遮。"""
+        self.filter_data = data
+        try:
+            self.app.save_setting(filters.KEY, filters.save(data))
+        except OSError as exc:
+            self.notice = (f"敏感詞過濾存不了：{exc}", theme.WARN)
+            self._notice_until = time.monotonic() + 5
+        self._masker = filters.masker(data)
+        self._dirty = True
+
+    def _mask(self, text):
+        return self._masker.mask(text) if self._masker is not None and text else text
+
+    def _web_lines(self, pairs):
+        """和字幕視窗收到的一樣的格式(見 overlay.Overlay.lines),多帶說話者是第幾個人(s)。"""
+        lines = []
+        for (line, _), (o, t, f, i, ruby, color) in zip(pairs, self._items(pairs)):
+            item = {"o": o, "t": t, "f": f, "i": i, "id": line.id}
+            if ruby:
+                item["r"] = [list(segment) for segment in ruby]
+            if color:
+                item["c"], item["s"] = list(color), line.speaker
+            lines.append(item)
+        return lines
+
+    def _sync_web_style(self):
+        """樣式或版面改了才推給 OBS(每次都推會讓網頁一直重畫);自訂外觀的 .css 改過也叫網頁重新讀。"""
+        prefs = self.prefs
+        settings = dict(style=self._style(), layout=prefs["web_layout"], scale=int(prefs["obs_scale"]),
+                        count=int(prefs["obs_lines"]), css=prefs["obs_css"])
+        if settings != self._web_style:
+            self._web_style = settings
+            self.web.push(**settings)
+        css = web.css_folder() / f"{prefs['obs_css']}.css" if prefs["obs_css"] else None
+        stamp = css.stat().st_mtime if css is not None and css.is_file() else None
+        if stamp != self._css_stamp:
+            self._css_stamp = stamp
+            self.web.refresh_css()
+
+    def _start_web(self):
+        if not self.web.start():
+            self.notice = (f"OBS 瀏覽器來源開不起來：{self.web.error}", theme.WARN)
+            self._notice_until = time.monotonic() + 5
+            return False
+        self._web_style = None
+        self._dirty = True
+        return True
+
+    def _items(self, pairs):
+        """要送到字幕視窗/OBS 的每一句:敏感詞先遮掉(程式裡的字幕紀錄和存檔還是原文)。"""
+        items = []
+        for line, idle in pairs:
+            age = idle if line.final else None
+            color = self.color_of(line.speaker) if self.prefs["speakers"] else None
+            original, translation = self._mask(line.original), self._mask(line.translation)
+            if line.same:
+                items.append(("", translation or original, line.final, age, (), color))
+            else:
+                ruby = furigana.annotate(original) if self.prefs["furigana"] else ()
+                items.append((original, translation, line.final, age, ruby, color))
+        return items
 
     def _names_changed(self, data):
         """專有名詞改了:存檔;字幕進行中的話馬上用新的名詞。"""
@@ -398,8 +492,9 @@ class SubtitlePage(Page):
             base = f"{time.strftime('字幕 %Y-%m-%d %H%M%S')} ({number})"
             number += 1
         self.session = {"base": base, "saved": 0}
-        self.overlay.start(self._style())
-        self.overlay.lines([])
+        if self.prefs["overlay"]:
+            self.overlay.start(self._style())
+            self.overlay.lines([])
         self.notice = ("", theme.TEXT_DIM)
         self.follow = True
 
@@ -411,6 +506,7 @@ class SubtitlePage(Page):
             self._save_transcript(force=True)
             threading.Thread(target=engine.stop, daemon=True).start()
         self.overlay.stop()
+        self.web.push(lines=[], log=[])         # OBS 上的字幕也清掉(網址留著,下次開始字幕接著用)
 
     def shutdown(self):
         """畫面出錯被丟掉前:停止字幕、關掉字幕視窗和辨識程式。"""
@@ -484,13 +580,14 @@ class SubtitlePage(Page):
         if not self.overlay.alive:
             self.overlay.start(self._style())
         self.overlay.adjust(self.adjusting)
-        if not self.adjusting and not self.running:
+        if not self.adjusting and (not self.running or not self.prefs["overlay"]):
             self.overlay.stop()
 
     # ------------------------------------------------------------ 每一幀
 
     def deactivate(self):
-        for dropdown in (self.program_pick, self.language, self.names_pick, self.speaker_pick, self.target):
+        for dropdown in (self.program_pick, self.language, self.names_pick, self.speaker_pick, self.target,
+                         self.filter_pick, self.obs_css):
             dropdown.close()
         self.settings_view.reset()
         self.lines_view.reset()
@@ -512,16 +609,14 @@ class SubtitlePage(Page):
         if engine is not None and self._dirty and time.monotonic() - self._pushed > 0.05:
             self._dirty = False
             self._pushed = time.monotonic()
-            items = []
-            for line, idle in engine.recent(int(self.prefs["count"])):
-                age = idle if line.final else None
-                color = self.color_of(line.speaker) if self.prefs["speakers"] else None
-                if line.same:
-                    items.append(("", line.translation or line.original, line.final, age, (), color))
-                else:
-                    ruby = furigana.annotate(line.original) if self.prefs["furigana"] else ()
-                    items.append((line.original, line.translation, line.final, age, ruby, color))
-            self.overlay.lines(items)
+            recent = engine.recent(int(self.prefs["count"]))
+            self.overlay.lines(self._items(recent))
+            if self.web.alive:
+                log = engine.recent(web.LOG_LINES) if self.prefs["web_layout"] == "log" else []
+                self.web.push(lines=self._web_lines(recent), log=self._web_lines(log))
+        if self.web.alive and time.monotonic() - self._web_checked > 0.3:
+            self._web_checked = time.monotonic()
+            self._sync_web_style()
         if engine is not None and self.session is not None and time.monotonic() - self._saved_at > 1:
             self._saved_at = time.monotonic()
             self._save_transcript()
@@ -541,16 +636,20 @@ class SubtitlePage(Page):
                          mouse_pos)
         self._draw_footer(pygame.Rect(rect.x + margin, rect.bottom - footer_h - margin, rect.width - margin * 2,
                                       footer_h), mouse_pos)
-        for dropdown in (self.program_pick, self.language, self.names_pick, self.speaker_pick, self.target):
+        for dropdown in (self.program_pick, self.language, self.names_pick, self.speaker_pick, self.target,
+                         self.filter_pick, self.obs_css):
             dropdown.draw_menu(self.screen, mouse_pos)
         self.palette.draw(self.screen, mouse_pos)
         self.menu.draw(self.screen, mouse_pos)
 
     def _controls(self):
         buttons = [self.btn_refresh, self.btn_ollama, self.btn_font, self.btn_names, self.btn_translator,
-                   self.btn_speaker_edit]
-        return buttons, [self.source, self.gain, self.mode, self.align, self.count, self.fade, self.output], \
-            [self.program_pick, self.language, self.names_pick, self.speaker_pick, self.target], \
+                   self.btn_speaker_edit, self.btn_filter, self.btn_web_copy, self.btn_web_preview,
+                   self.btn_css_folder, self.btn_reset_position]
+        return buttons, [self.source, self.gain, self.mode, self.align, self.count, self.fade, self.output,
+                         self.web_layout, self.obs_scale, self.obs_lines], \
+            [self.program_pick, self.language, self.names_pick, self.speaker_pick, self.target, self.filter_pick,
+             self.obs_css], \
             [self.size, self.size_original, self.outline, self.opacity]
 
     def _draw_settings(self, rect, mouse_pos):
@@ -562,11 +661,11 @@ class SubtitlePage(Page):
         # 先把所有設定移到畫面外;這一幀真的畫出來的才會回到原位
         # (否則切換來源、關掉翻譯後,看不見的選單還留在原位,點別的地方會打開它)
         buttons, segments, dropdowns, sliders = self._controls()
-        for control in buttons + dropdowns + sliders + [self.translate_on, self.furigana_on, self.speakers_on]:
+        for control in buttons + dropdowns + sliders + [self.translate_on, self.furigana_on, self.speakers_on, self.web_on, self.overlay_on]:
             control.rect = HIDDEN.copy()
         for control in segments:
             control.rects = []
-        self.model_rows, self.swatches = [], []
+        self.model_rows, self.swatches, self.section_rects = [], [], []
         screen.set_clip(area)
         bottom = self._setting_rows(area.x, area.y - view.scroll, area.width, mouse_pos)
         screen.set_clip(None)
@@ -580,7 +679,7 @@ class SubtitlePage(Page):
             return rect.clip(area) if rect.colliderect(area) else HIDDEN.copy()
 
         buttons, segments, dropdowns, sliders = self._controls()
-        for control in buttons + sliders + [self.translate_on, self.furigana_on, self.speakers_on]:
+        for control in buttons + sliders + [self.translate_on, self.furigana_on, self.speakers_on, self.web_on, self.overlay_on]:
             control.rect = cut(control.rect)
         for control in segments:
             control.rects = [cut(rect) for rect in control.rects]
@@ -590,12 +689,52 @@ class SubtitlePage(Page):
                 dropdown.close()
         self.model_rows = [(cut(rect), key) for rect, key in self.model_rows if rect.colliderect(area)]
         self.swatches = [(cut(rect), key) for rect, key in self.swatches if rect.colliderect(area)]
+        self.section_rects = [(cut(rect), key) for rect, key in self.section_rects if rect.colliderect(area)]
 
     @staticmethod
     def _set_options(dropdown, options, value=None):
         """選項真的變了才換(換選項會把選單收起來;每一幀都換的話選單會打不開)。"""
         if [tuple(option) for option in dropdown.options] != [tuple(option) for option in options]:
             dropdown.set_options(options, value)
+
+    def _section(self, key, title, summary, x, y, inner, mouse_pos):
+        """可以收起來的大段落:標題列點一下展開或收起,收起時在標題旁顯示目前的設定。回傳 (下一列的 y, 是否展開)。"""
+        screen = self.screen
+        opened = key in self.prefs["sections"]
+        row = pygame.Rect(x - 6, y - 4, inner + 12, 32)
+        hover = row.collidepoint(mouse_pos)
+        if hover:
+            rounded_panel(screen, row, theme.PANEL_LIGHT, radius=8, alpha=160)
+        cx, cy = x + 6, y + 12
+        arrow = [(cx - 4, cy - 3), (cx + 4, cy - 3), (cx, cy + 3)] if opened else [(cx - 2, cy - 5), (cx - 2, cy + 5), (cx + 4, cy)]
+        pygame.draw.polygon(screen, self.tool.accent if hover else theme.TEXT_DIM, arrow)
+        title_rect = draw_text(screen, title, (x + 18, y + 2), 14, theme.TEXT, bold=True)
+        if summary:
+            draw_text(screen, widgets.clip_text(summary, 12, inner - (title_rect.right - x) - 24),
+                      (title_rect.right + 12, y + 4), 12, theme.TEXT_FAINT if opened else theme.TEXT_DIM)
+        self.section_rects.append((row, key))
+        return y + 34, opened
+
+    def _toggle_section(self, key):
+        sections = list(self.prefs["sections"])
+        if key in sections:
+            sections.remove(key)
+        else:
+            sections.append(key)
+        self.prefs["sections"] = sections
+        self._save()
+
+    def _style_summary(self):
+        prefs = self.prefs
+        parts = [dict(MODES).get(self._display_mode(), ""), f"{prefs.get('font_name') or '微軟正黑體'} {int(prefs['size'])}"]
+        if not prefs["overlay"]:
+            parts.append("不顯示字幕視窗")
+        return "、".join(part for part in parts if part)
+
+    def _live_summary(self):
+        active = self.filter_data["active"]
+        parts = [f"敏感詞：{active}" if active else "不過濾敏感詞", "OBS 開著" if self.prefs["web"] else "OBS 關著"]
+        return "、".join(parts)
 
     def _heading(self, text, x, y, hint=""):
         draw_text(self.screen, text, (x, y), 14, theme.TEXT, bold=True)
@@ -609,10 +748,11 @@ class SubtitlePage(Page):
         prefs = self.prefs
         for control, key, options in ((self.source, "source", SOURCES), (self.gain, "gain", GAINS),
                                       (self.output, "output", OUTPUTS), (self.mode, "mode", MODES),
-                                      (self.align, "align", ALIGNS)):
+                                      (self.align, "align", ALIGNS), (self.web_layout, "web_layout", web.LAYOUTS),
+                                      (self.obs_scale, "obs_scale", web.SCALES), (self.obs_lines, "obs_lines", web.LOG_COUNTS)):
             keys = [k for k, _ in options]
-            if prefs[key] in keys:
-                control.index = keys.index(prefs[key])
+            if str(prefs[key]) in keys:
+                control.index = keys.index(str(prefs[key]))
         self.count.index = max(0, min(2, int(prefs["count"]) - 1))
         self.fade.index = next((i for i, (k, _) in enumerate(FADES) if int(k) == int(prefs["fade"])), 2)
         hint = "進行中也能改，會記在字幕紀錄" if self.running else ""
@@ -697,8 +837,8 @@ class SubtitlePage(Page):
         draw_text(screen, widgets.clip_text(note, 12, inner), (x, y), 12, color)
         y += 28
 
-        y = self._heading("辨識模型", x, y, "把聲音轉成文字")
-        for key, name, dep, note in asr.MODELS:
+        y, opened = self._section("model", "辨識模型", asr.MODEL_NAMES.get(prefs["model"], ""), x, y, inner, mouse_pos)
+        for key, name, dep, note in (asr.MODELS if opened else ()):
             row = pygame.Rect(x, y, inner, 44)
             chosen = key == prefs["model"]
             hover = row.collidepoint(mouse_pos)
@@ -713,7 +853,9 @@ class SubtitlePage(Page):
             draw_text(screen, widgets.clip_text(note, 11, inner - 20), (row.x + 10, row.y + 25), 11, theme.TEXT_FAINT)
             self.model_rows.append((row, key))
             y += 48
-        if not asr.gpu() and prefs["model"] in ("turbo", "large", "breeze"):
+        if not opened:
+            pass
+        elif not asr.gpu() and prefs["model"] in ("turbo", "large", "breeze"):
             draw_text(screen, "沒有 NVIDIA 顯示卡時這個模型跟不上即時，建議用「輕量」", (x, y), 12, theme.WARN)
             y += 20
         elif asr.gpu():
@@ -735,7 +877,38 @@ class SubtitlePage(Page):
             y += 22
         y += 8
 
-        y = self._heading("字幕樣式", x, y)
+        y, opened = self._section("style", "字幕樣式", self._style_summary(), x, y, inner, mouse_pos)
+        if opened:
+            y = self._style_rows(x, y, inner, mouse_pos)
+        y += 6
+        y = self._live_rows(x, y, inner, mouse_pos)
+
+        y = self._heading("字幕紀錄", x, y, "自動存在 output\\subtitles")
+        self.output.draw(screen, pygame.Rect(x, y, inner, 30), mouse_pos)
+        y += 36
+        draw_text(screen, widgets.clip_text(OUTPUT_NOTES[prefs["output"]], 12, inner), (x, y), 12, theme.TEXT_FAINT)
+        y += 22
+        return y + 8
+
+    def _style_rows(self, x, y, inner, mouse_pos):
+        """字幕樣式(展開時):字幕視窗開關、位置、顯示方式、振假名、對齊、字型、大小顏色、句數、淡出。"""
+        screen = self.screen
+        prefs = self.prefs
+        draw_text(screen, "字幕視窗", (x, y + 3), 13, theme.TEXT)
+        self.overlay_on.value = prefs["overlay"]
+        self.overlay_on.draw(screen, (x + inner - 42, y + 2), mouse_pos)
+        y += 26
+        note = "浮在所有視窗最上面顯示字幕" if prefs["overlay"] else \
+            "不顯示（只用 OBS 瀏覽器來源時，直播畫面上才不會有兩份字幕）"
+        draw_text(screen, widgets.clip_text(note, 12, inner), (x, y), 12, theme.TEXT_FAINT)
+        y += 24
+        if prefs["overlay"]:
+            draw_text(screen, "位置", (x, y + 6), 13, theme.TEXT)
+            self.btn_reset_position.draw(screen, pygame.Rect(x + inner - 90, y, 90, 30), mouse_pos)
+            y += 36
+            draw_text(screen, widgets.clip_text("用下方的「調整位置」拖曳；找不到字幕時按「重設位置」回到主螢幕下方", 12, inner),
+                      (x, y), 12, theme.TEXT_FAINT)
+            y += 26
         mode = self._display_mode()
         if prefs["translate"]:
             self.mode.draw(screen, pygame.Rect(x, y, inner, 30), mouse_pos)     # 沒翻譯就只有原文,不用選
@@ -796,14 +969,81 @@ class SubtitlePage(Page):
         for line in widgets.wrap_text(FULLSCREEN_NOTE, 12, inner, max_lines=2):
             draw_text(screen, line, (x, y), 12, theme.TEXT_FAINT)
             y += 18
-        y += 12
+        return y + 6
 
-        y = self._heading("字幕紀錄", x, y, "自動存在 output\\subtitles")
-        self.output.draw(screen, pygame.Rect(x, y, inner, 30), mouse_pos)
+    def _live_rows(self, x, y, inner, mouse_pos):
+        """直播:敏感詞過濾、OBS 瀏覽器來源。"""
+        screen = self.screen
+        accent = self.tool.accent
+        y, opened = self._section("live", "直播", self._live_summary(), x, y, inner, mouse_pos)
+        if not opened:
+            return y + 6
+        draw_text(screen, "敏感詞過濾", (x, y + 6), 13, theme.TEXT)
+        self._set_options(self.filter_pick, self._filter_options(), self.filter_data["active"])
+        if not self.filter_pick.is_open:
+            self.filter_pick.set_value(self.filter_data["active"])
+        self.btn_filter.draw(screen, pygame.Rect(x + inner - 170 - 64, y, 56, 30), mouse_pos)
+        self.filter_pick.draw(screen, pygame.Rect(x + inner - 170, y, 170, 30), mouse_pos)
         y += 36
-        draw_text(screen, widgets.clip_text(OUTPUT_NOTES[prefs["output"]], 12, inner), (x, y), 12, theme.TEXT_FAINT)
-        y += 22
-        return y + 8
+        draw_text(screen, widgets.clip_text("字幕視窗和 OBS 上的敏感詞換成「[filter]」；字幕紀錄和存檔保留原文", 12, inner),
+                  (x, y), 12, theme.TEXT_FAINT)
+        y += 28
+        draw_text(screen, "OBS 瀏覽器來源", (x, y + 3), 13, theme.TEXT)
+        self.web_on.value = self.prefs["web"]
+        self.web_on.draw(screen, (x + inner - 42, y + 2), mouse_pos)
+        y += 30
+        if not self.prefs["web"]:
+            for line in widgets.wrap_text("打開後，在 OBS 加「瀏覽器來源」貼上網址，字幕就會出現在直播畫面上（背景透明）",
+                                          12, inner, max_lines=2):
+                draw_text(screen, line, (x, y), 12, theme.TEXT_FAINT)
+                y += 18
+            return y + 10
+        if not self.web.alive:
+            draw_text(screen, widgets.clip_text(self.web.error or "還沒開始", 12, inner), (x, y), 12, theme.WARN)
+            return y + 30
+        box = pygame.Rect(x, y, inner - 148, 30)
+        rounded_panel(screen, box, theme.BG_DEEP, radius=8, alpha=220, border=theme.PANEL_EDGE)
+        draw_text(screen, self.web.url, (box.x + 12, box.centery - theme.font(13).get_height() // 2), 13, accent)
+        self.btn_web_copy.draw(screen, pygame.Rect(x + inner - 140, y, 80, 30), mouse_pos)
+        self.btn_web_preview.draw(screen, pygame.Rect(x + inner - 52, y, 52, 30), mouse_pos)
+        y += 36
+        for line in widgets.wrap_text("OBS：來源的「＋」→「瀏覽器」→ 網址貼上，寬高設成直播畫面大小（例如 1920×1080）",
+                                      12, inner, max_lines=2):
+            draw_text(screen, line, (x, y), 12, theme.TEXT_FAINT)
+            y += 18
+        y += 8
+        draw_text(screen, "版面", (x, y + 6), 13, theme.TEXT)
+        self.web_layout.draw(screen, pygame.Rect(x + 80, y, inner - 80, 28), mouse_pos)
+        y += 34
+        draw_text(screen, widgets.clip_text(web.LAYOUT_NOTES[self.prefs["web_layout"]], 12, inner), (x, y), 12,
+                  theme.TEXT_FAINT)
+        y += 24
+        if self.prefs["web_layout"] == "log":
+            draw_text(screen, "顯示", (x, y + 6), 13, theme.TEXT)
+            self.obs_lines.draw(screen, pygame.Rect(x + 80, y, inner - 80, 28), mouse_pos)
+            y += 36
+        draw_text(screen, "字的大小", (x, y + 6), 13, theme.TEXT)
+        self.obs_scale.draw(screen, pygame.Rect(x + 80, y, inner - 80, 28), mouse_pos)
+        y += 34
+        draw_text(screen, widgets.clip_text("以字幕樣式的大小為準放大縮小（OBS 畫面通常比螢幕大）", 12, inner), (x, y), 12,
+                  theme.TEXT_FAINT)
+        y += 24
+        draw_text(screen, "外觀", (x, y + 6), 13, theme.TEXT)
+        options = [(web.DEFAULT_CSS, "跟字幕視窗一樣")] + [(name, name) for name in web.css_files()]
+        current = self.prefs["obs_css"] if self.prefs["obs_css"] in dict(options) else web.DEFAULT_CSS
+        self._set_options(self.obs_css, options, current)
+        if not self.obs_css.is_open:
+            self.obs_css.set_value(current)
+        self.btn_css_folder.draw(screen, pygame.Rect(x + inner - 90, y, 90, 30), mouse_pos)
+        self.obs_css.draw(screen, pygame.Rect(x + 80, y, inner - 80 - 98, 30), mouse_pos)
+        y += 36
+        for text in ("想自己設計（字型、顏色、動畫、分人配色）：把 .css 檔放進資料夾後在這裡選，存檔後 OBS 馬上更新；"
+                     "資料夾裡有範例和可以用的名稱",
+                     "顏色、外框、底色和字幕視窗共用「字幕樣式」；也可以貼在 OBS 瀏覽器來源的「自訂 CSS」"):
+            for line in widgets.wrap_text(text, 12, inner, max_lines=2):
+                draw_text(screen, line, (x, y), 12, theme.TEXT_FAINT)
+                y += 18
+        return y + 10
 
     def _ollama_rows(self, x, y, inner, mouse_pos):
         screen = self.screen
@@ -950,6 +1190,7 @@ class SubtitlePage(Page):
         self.btn_start.draw(screen, pygame.Rect(right - 130, rect.y + 18, 130, 38), mouse_pos)
         right -= 142
         self.btn_adjust.label = "完成調整" if self.adjusting else "調整位置"
+        self.btn_adjust.enabled = self.prefs["overlay"] or self.adjusting      # 不顯示字幕視窗時沒有東西可以調
         self.btn_adjust.draw(screen, pygame.Rect(right - 110, rect.y + 18, 110, 38), mouse_pos)
         right -= 122
         lines = widgets.wrap_text(text, 13, right - rect.x - 18, max_lines=2)
@@ -975,7 +1216,7 @@ class SubtitlePage(Page):
 
     def modal_open(self):
         return self.font_picker.is_open or self.names_dialog.is_open or self.translator_dialog.is_open \
-            or self.speaker_dialog.is_open
+            or self.speaker_dialog.is_open or self.filter_dialog.is_open
 
     def draw_modal(self, mouse_pos):
         if self.translator_dialog.is_open:
@@ -985,6 +1226,9 @@ class SubtitlePage(Page):
         elif self.names_dialog.is_open:
             self.names_dialog.update()
             self.names_dialog.draw(mouse_pos)
+        elif self.filter_dialog.is_open:
+            self.filter_dialog.update()
+            self.filter_dialog.draw(mouse_pos)
         else:
             self.font_picker.draw(mouse_pos)
 
@@ -995,6 +1239,8 @@ class SubtitlePage(Page):
             self.speaker_dialog.handle_event(event, mouse_pos)
         elif self.names_dialog.is_open:
             self.names_dialog.handle_event(event, mouse_pos)
+        elif self.filter_dialog.is_open:
+            self.filter_dialog.handle_event(event, mouse_pos)
         else:
             self.font_picker.handle_event(event, mouse_pos)
 
@@ -1009,7 +1255,8 @@ class SubtitlePage(Page):
                 self._line_menu(*hit, mouse_pos)
             return
         pairs = ((self.program_pick, None), (self.language, "language"), (self.names_pick, "names"),
-                 (self.speaker_pick, "speaker_profile"), (self.target, "target"))
+                 (self.speaker_pick, "speaker_profile"), (self.target, "target"), (self.filter_pick, "filter"),
+                 (self.obs_css, "obs_css"))
         opened = [pair for pair in pairs if pair[0].is_open]
         # 有選單開著時只交給它(點在外面就只是收起來),不會同時打開另一個
         for dropdown, key in opened or pairs:
@@ -1018,6 +1265,16 @@ class SubtitlePage(Page):
                 if key == "names" and dropdown.value != before:
                     self.names["active"] = dropdown.value       # 進行中也能換,馬上生效
                     self._names_changed(self.names)
+                    return
+                if key == "obs_css":
+                    if dropdown.value != before:
+                        self.prefs["obs_css"] = dropdown.value
+                        self._save()
+                    return
+                if key == "filter":
+                    if dropdown.value != before:
+                        self.filter_data["active"] = dropdown.value     # 進行中也能換,馬上生效
+                        self._filter_changed(self.filter_data)
                     return
                 if key == "speaker_profile":
                     if dropdown.value != before:
@@ -1112,6 +1369,44 @@ class SubtitlePage(Page):
             self.speaker_data = speaker_profiles.load(self.app.config, create=True)
             self.speaker_dialog.open(self.speaker_data)
             return
+        if self.btn_filter.clicked(pos, True):
+            self.filter_data = filters.load(self.app.config)   # 重新讀資料夾:別人給的設定檔放進去就看得到
+            self.filter_dialog.open(self.filter_data)
+            return
+        hit = next((key for rect, key in self.section_rects if rect.collidepoint(pos)), None)
+        if hit is not None:
+            self._toggle_section(hit)
+            return
+        for control, key in ((self.obs_scale, "obs_scale"), (self.obs_lines, "obs_lines")):
+            if control.clicked(pos, True):
+                self.prefs[key] = int(control.value)
+                self._save()
+                self._dirty = True
+                return
+        if self.btn_css_folder.clicked(pos, True):
+            os.startfile(web.ensure_css_folder())
+            return
+        if self.btn_reset_position.clicked(pos, True):
+            self.prefs["x"] = self.prefs["y"] = None        # 回到預設位置(主螢幕下方中間)
+            self._save()
+            if self.overlay.alive:
+                self.overlay.style(self._style())
+            self.notice = ("字幕位置已經回到主螢幕下方", self.tool.accent)
+            self._notice_until = time.monotonic() + 3
+            return
+        if self.web_layout.clicked(pos, True):
+            self.prefs["web_layout"] = self.web_layout.value
+            self._save()
+            self._dirty = True
+            return
+        if self.btn_web_copy.clicked(pos, True):
+            widgets.copy_to_clipboard(self.web.url)
+            self.notice = ("已複製網址，到 OBS 新增「瀏覽器來源」貼上", self.tool.accent)
+            self._notice_until = time.monotonic() + 4
+            return
+        if self.btn_web_preview.clicked(pos, True):
+            os.startfile(self.web.url)          # 用瀏覽器看看(背景是瀏覽器的顏色,OBS 裡是透明的)
+            return
         if self.btn_names.clicked(pos, True):
             self.names = glossary.load(self.app.config)     # 重新讀資料夾:別人給的設定檔放進去就看得到
             self.names_dialog.open(self.names)
@@ -1137,6 +1432,22 @@ class SubtitlePage(Page):
             self._change("source", self.source.value)
         elif self.btn_refresh.clicked(pos, True):
             self._refresh_programs()
+        elif self.overlay_on.clicked(pos, True):
+            self.prefs["overlay"] = self.overlay_on.value = not self.prefs["overlay"]
+            self._save()
+            if self.running and self.prefs["overlay"] and not self.overlay.alive:
+                self.overlay.start(self._style())       # 字幕進行中打開:馬上出現
+                self._dirty = True
+            elif not self.prefs["overlay"] and self.overlay.alive and not self.adjusting:
+                self.overlay.stop()
+        elif self.web_on.clicked(pos, True):
+            on = not self.prefs["web"]
+            if on and not self._start_web():
+                on = False
+            elif not on:
+                self.web.stop()
+            self.prefs["web"] = self.web_on.value = on
+            self._save()
         elif self.speakers_on.clicked(pos, True):
             self.speakers_on.value = prefs["speakers"]
             self._set_speakers(not prefs["speakers"])

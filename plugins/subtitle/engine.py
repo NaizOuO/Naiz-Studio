@@ -36,6 +36,10 @@ HALLUCINATIONS = {
     "시청해주셔서 감사합니다", "시청해 주셔서 감사합니다.",
 }
 _REPEATED = re.compile(r"(.{2,12}?)\1{3,}")
+_REPEATED_LONG = re.compile(r"(.{4,30}?)\1{2,}")            # 一整句(4 字以上)連續出現 3 次以上
+_DOUBLE_MARK = re.compile(r"([，、。,.!?！？])\1+")             # 「嗯，，嗯，，」
+_SAME_WORD = re.compile(r"^(\w{1,2})(?:[\s，、。,.!?！？…]*\1){2,}[\s，、。,.!?！？…]*$")
+IDLE_SPEECH = 1.5           # 人聲偵測只抓到這麼短的聲音、結果又只是「好，好，好」「嗯，嗯」:多半是沒人說話時的幻聽
 LOCK_LANGUAGE = 3.0         # 自動判斷語言:這句講超過這麼多秒才固定語言(太短的片段常判斷錯)
 # 自動判斷語言時延續前面的語言:判成別的語言的機率要 ≥ STICKY_SURE、而且前面語言的機率 < STICKY_KEEP 才換
 # (實測:動畫喊叫判錯時最高的語言機率都 < 0.75;真的改說中文時中文機率 0.95 以上)
@@ -248,8 +252,12 @@ def plausible(text, speech_seconds):
     """辨識結果像不像真的有人說的話:很短的片段辨識成常見幻聽句就丟掉;重複的字串收斂。"""
     # 同一段重複 4 次以上:長的是幻聽(整句一直重複)只留一次;很短的是結巴(「我、我、我、我」)留兩次
     text = _REPEATED.sub(lambda m: m.group(1) * (2 if len(m.group(1)) <= 3 else 1), _TAGS.sub("", text).strip())
+    # v1.18.6 使用者回報沒人說話時冒出「我會不會再說。我會不會再說。我會不會再說。」「嗯，，嗯，，嗯，」
+    text = _DOUBLE_MARK.sub(r"\1", _REPEATED_LONG.sub(r"\1", text))
     if not text or all(not ch.isalnum() for ch in text) or ZH_PROMPT[:6] in text:
         return ""
+    if speech_seconds < IDLE_SPEECH and (_SAME_WORD.match(text) or filler_only(text, "")):
+        return ""                   # 「好，好，好」「嗯，嗯，嗯」「嗯。」:人聲很短時當成幻聽
     if speech_seconds < 2.5 and text.lower().strip(" .!。！") in {h.strip(" .!。！") for h in HALLUCINATIONS}:
         return ""
     return text

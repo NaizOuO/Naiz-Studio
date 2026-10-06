@@ -520,6 +520,8 @@ def _run(port, token, mouse=None):
     user32.UpdateLayeredWindow.argtypes = [wintypes.HWND, wintypes.HDC, ctypes.c_void_p, ctypes.c_void_p, wintypes.HDC,
                                            ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
     user32.GetAsyncKeyState.restype = ctypes.c_short
+    user32.MonitorFromPoint.restype = ctypes.c_void_p
+    user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
     gdi32.CreateDIBSection.restype = wintypes.HBITMAP
     gdi32.CreateDIBSection.argtypes = [wintypes.HDC, ctypes.c_void_p, wintypes.UINT, ctypes.POINTER(ctypes.c_void_p),
                                        wintypes.HANDLE, wintypes.DWORD]
@@ -610,9 +612,24 @@ def _run(port, token, mouse=None):
     size = (1, 1)
 
     # 位置記的是字幕區「底部中間」那一點:字變多時往上長,底部不動。預設在主螢幕下方
+    # 所有螢幕合起來的範圍:拖曳時字幕不能整個拖出去(拖出去就再也點不到、拉不回來)
+    virtual = (user32.GetSystemMetrics(76), user32.GetSystemMetrics(77),
+               user32.GetSystemMetrics(78) or screen_w, user32.GetSystemMetrics(79) or (work.bottom - work.top))
+
+    def keep_inside(point):
+        """字幕底部中間那一點留在螢幕範圍內(上方至少留 40 像素,字幕才看得到、拖得回來)。"""
+        left, top, width, height = virtual
+        return [min(max(int(point[0]), left), left + width - 1), min(max(int(point[1]), top + 40), top + height)]
+
+    def on_screen(point):
+        monitor = user32.MonitorFromPoint(wintypes.POINT(int(point[0]), int(point[1]) - 20), 0)    # 0:不在任何螢幕上
+        return bool(monitor)
+
     def default_anchor():
         if style.get("x") is not None and style.get("y") is not None:
-            return [int(style["x"]), int(style["y"])]
+            saved = [int(style["x"]), int(style["y"])]
+            if on_screen(saved):            # 記住的位置在已經拔掉的螢幕上:回到預設位置
+                return saved
         return [work.left + screen_w // 2, work.bottom - int((work.bottom - work.top) * 0.08)]
 
     def windows_mouse():
@@ -662,7 +679,7 @@ def _run(port, token, mouse=None):
             elif not pressed:
                 drag = None
             if drag is not None:
-                anchor = [x - drag[0], y - drag[1]]
+                anchor = keep_inside([x - drag[0], y - drag[1]])
         visible = fading(lines, style, time.monotonic() - received)
         key = (json.dumps(visible, ensure_ascii=False), json.dumps(style, ensure_ascii=False), adjusting,
                tuple(anchor))
