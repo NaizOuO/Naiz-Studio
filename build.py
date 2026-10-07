@@ -22,7 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 NAME = "Naiz Studio"
 # 插件是執行時才從資料夾讀入,PyInstaller 看不到它們用了哪些套件,要自己列出來
-EXTRA_IMPORTS = ["pypdfium2", "resvg_py", "pikepdf", "opencc", "pillow_heif", "vtracer", "queue", "compression.zstd",
+EXTRA_IMPORTS = ["pypdfium2", "resvg_py", "pikepdf", "opencc", "pillow_heif", "rawpy", "vtracer", "queue", "compression.zstd",
                  "comtypes", "fugashi", "shlex"]        # shlex:fugashi 的編譯模組裡用到,PyInstaller 看不到
 # 主程式沒用到、但擴充模組可能會用的內建模組;不列出來的話 exe 裡沒有,模組 import 會失敗
 STDLIB_FOR_MODS = ["sqlite3", "configparser", "tomllib", "shelve", "dbm", "wave", "sched", "csv",

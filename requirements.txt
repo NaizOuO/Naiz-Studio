@@ -6,6 +6,7 @@ opencc-python-reimplemented
 pikepdf
 Pillow
 pillow-heif
+rawpy
 pygame-ce
 pypdfium2
 python-docx

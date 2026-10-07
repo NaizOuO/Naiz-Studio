@@ -23,15 +23,22 @@ try:
     pillow_heif.register_heif_opener()
 except ImportError:  # 原始碼版沒裝這個套件時,只有 HEIC 讀不了
     pillow_heif = None
+try:
+    import rawpy     # 相機的 RAW 檔(DNG 等):用 LibRaw 解開
+except ImportError:
+    rawpy = None
 
 EXT_FORMAT = {".jpg": "jpg", ".jpeg": "jpg", ".jfif": "jpg", ".png": "png", ".webp": "webp", ".avif": "avif",
               ".heic": "heic", ".heif": "heic", ".gif": "gif", ".bmp": "bmp", ".tif": "tiff", ".tiff": "tiff",
-              ".ico": "ico", ".svg": "svg"}
+              ".ico": "ico", ".svg": "svg",
+              # 相機 RAW 檔(只能讀,不能存):手機的 DNG、Canon、Nikon、Sony、Fujifilm、Olympus、Panasonic
+              ".dng": "raw", ".cr2": "raw", ".cr3": "raw", ".nef": "raw", ".arw": "raw", ".raf": "raw",
+              ".orf": "raw", ".rw2": "raw"}
 READ_EXTS = set(EXT_FORMAT)
 SAVE_EXT = {"jpg": ".jpg", "png": ".png", "webp": ".webp", "avif": ".avif", "gif": ".gif", "bmp": ".bmp",
             "tiff": ".tif", "ico": ".ico", "svg": ".svg", "pdf": ".pdf", "heic": ".heic"}
 LABELS = {"jpg": "JPG", "png": "PNG", "webp": "WebP", "avif": "AVIF", "gif": "GIF", "bmp": "BMP", "tiff": "TIFF",
-          "ico": "ICO", "svg": "SVG", "pdf": "PDF", "heic": "HEIC"}
+          "ico": "ICO", "svg": "SVG", "pdf": "PDF", "heic": "HEIC", "raw": "RAW"}
 ANIMATED_FORMATS = {"gif", "webp"}
 ICO_SIZES = (16, 24, 32, 48, 64, 128, 256)
 SVG_MAX_SIDE = 2000   # 描邊的時間隨像素數暴增;SVG 本身可以任意放大,先縮小再描不會損失尺寸
@@ -439,11 +446,11 @@ def transparent_output(s, edit):
 
 
 def target_format(path, fmt):
-    """「原格式」時 SVG 存成 PNG(向量圖本身沒辦法壓縮),其他格式維持不變。"""
+    """「原格式」時 SVG 存成 PNG(向量圖本身沒辦法壓縮)、相機 RAW 存成 JPG(RAW 只能讀),其他格式維持不變。"""
     if fmt != "keep":
         return fmt
     source = source_format(path)
-    return "png" if source == "svg" else source
+    return {"svg": "png", "raw": "jpg"}.get(source, source)
 
 
 # ------------------------------------------------------------ 讀取
@@ -525,7 +532,32 @@ def open_image(path, svg_side=None):
         return image
     if source == "heic" and pillow_heif is None:
         raise RuntimeError("缺少讀取 HEIC 的元件")
+    if source == "raw":
+        return _open_raw(data, path)
     return _eight_bit(Image.open(io.BytesIO(data)))
+
+
+def _open_raw(data, path):
+    """相機 RAW 檔換成一般照片(8 位元 RGB,方向已經轉正)。
+    檔案裡有相機自己做好的全尺寸預覽圖時直接用它:顏色、亮度和手機相簿看到的一樣
+    (自己顯影會比較亮、比較鮮豔,實測使用者的手機 DNG 差很多);沒有或太小才自己顯影。"""
+    if rawpy is None:
+        raise RuntimeError("缺少讀取 RAW 檔的元件")
+    with rawpy.imread(io.BytesIO(data)) as raw:
+        full = max(raw.sizes.width, raw.sizes.height)
+        image = None
+        try:
+            thumb = raw.extract_thumb()
+            if thumb.format == rawpy.ThumbFormat.JPEG:
+                preview = Image.open(io.BytesIO(thumb.data))
+                if max(preview.size) >= full * 0.9:
+                    image = ImageOps.exif_transpose(preview).convert("RGB")
+        except (rawpy.LibRawError, OSError, ValueError):
+            pass
+        if image is None:
+            image = Image.fromarray(raw.postprocess(use_camera_wb=True, output_bps=8), "RGB")
+    image.format = Path(path).suffix.lstrip(".").upper()
+    return image
 
 
 def _eight_bit(image):
@@ -575,7 +607,8 @@ def probe(path, thumb_box):
         shown = ImageOps.exif_transpose(image) if frames == 1 else image
         thumb = shown.convert("RGBA")
         thumb.thumbnail(thumb_box, Image.Resampling.LANCZOS)
-    return {"format": LABELS.get(source_format(path), "?"), "size": (width, height), "frames": frames,
+    label = path.suffix.lstrip(".").upper() if source_format(path) == "raw" else LABELS.get(source_format(path), "?")
+    return {"format": label, "size": (width, height), "frames": frames,
             "thumb": (thumb.size, thumb.tobytes()) if thumb else None}
 
 
@@ -835,6 +868,8 @@ def _smallest_side(paths, s, edits):
                 if s.side:   # 限制尺寸時 SVG 會直接畫成最長邊等於設定值(小圖也會放大)
                     scale = s.side / max(size)
                     size = (max(1, round(size[0] * scale)), max(1, round(size[1] * scale)))
+            elif source_format(path) == "raw":
+                size = open_image(path).size           # 顯影時已經轉正
             else:
                 with Image.open(path) as image:
                     size = image.size

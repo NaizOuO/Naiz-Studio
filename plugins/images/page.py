@@ -377,7 +377,7 @@ class ImagePage(Page):
                                                        (frame.right - 8, frame.bottom - 8)])
         pygame.draw.circle(screen, theme.PANEL_EDGE, (cx + 16, cy - 10), 6)
         draw_text(screen, "把圖片拖曳到這個視窗", (cx, area.centery + 30), 16, theme.TEXT_DIM, center=True)
-        draw_text(screen, "支援 JPG、PNG、WebP、AVIF、HEIC、GIF、SVG、ICO、BMP、TIFF",
+        draw_text(screen, "支援 JPG、PNG、WebP、AVIF、HEIC、GIF、SVG、ICO、BMP、TIFF、相機 RAW（DNG 等）",
                   (cx, area.centery + 54), 13, theme.TEXT_FAINT, center=True)
         draw_text(screen, "可一次拖多張或整個資料夾；每張圖的「編輯」可以簡單裁切、旋轉，更多編輯請用「圖片工具」",
                   (cx, area.centery + 74), 13, theme.TEXT_FAINT, center=True)
