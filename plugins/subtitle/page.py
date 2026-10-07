@@ -21,7 +21,7 @@ from . import asr, filters, furigana, glossary, hardware, speaker_profiles, spea
 from .filter_dialog import FilterDialog
 from .translator_dialog import TranslatorDialog
 from . import translate as ollama
-from .engine import Engine, Settings
+from .engine import Engine, Pair, Settings
 from .glossary_dialog import GlossaryDialog
 from .speaker_dialog import SpeakerDialog
 from .overlay import ALIGNS, MODES, STYLE, Overlay
@@ -30,6 +30,15 @@ SOURCES = [("system", "電腦播放的聲音"), ("app", "單一程式"), ("mic",
 SOURCE_NOTES = {"system": "YouTube、B站、遊戲、Discord 等電腦正在播放的聲音都會翻譯",
                 "app": "只翻譯選的程式，例如只翻 Discord、不翻遊戲音樂",
                 "mic": "翻譯麥克風收到的聲音"}
+# 同時聽麥克風:麥克風的句子(自己說的話)一律用這個顏色,紀錄裡標「我」
+ME = "me"
+MIC_NAME = "白色"
+MIC_COLOR = (225, 225, 232)
+
+
+def prefs_mic(prefs):
+    """要不要同時聽麥克風(聲音來源本身是麥克風時就不用)。"""
+    return bool(prefs["mic_on"]) and prefs["source"] != "mic"
 # 收音靈敏度:電腦聲音開得小時字幕可能出不來,放大後再給人聲偵測和辨識
 GAINS = [("auto", "自動"), ("1", "原本音量"), ("2", "放大 2 倍"), ("4", "放大 4 倍")]
 GAIN_NOTES = {"auto": "聲音太小時自動放大，電腦音量開得小也收得到（建議）",
@@ -90,7 +99,9 @@ class SubtitlePage(Page):
         self.prefs = {"source": "system", "language": "auto", "model": model, "translate": True,
                       "translator": translator, "target": "zh-TW", "partial": partial, "gain": "auto",
                       "output": "both", "speakers": False, "web": False, "web_layout": "subtitle",
-                      "overlay": True, "sections": [], "obs_scale": 100, "obs_lines": 12, "obs_css": "", **STYLE}
+                      "overlay": True, "sections": [], "obs_scale": 100, "obs_lines": 12, "obs_css": "",
+                      # 同時聽麥克風(聲音來源不是麥克風時):原文語言、要不要翻譯、要不要顯示在 OBS 各自設定
+                      "mic_on": False, "mic_language": "auto", "mic_translate": True, "mic_obs": True, **STYLE}
         self.prefs.update({k: v for k, v in saved.items() if k in self.prefs})
 
         self.source = SegmentedControl(SOURCES, accent=accent)
@@ -102,6 +113,11 @@ class SubtitlePage(Page):
         self.gain.index = [k for k, _ in GAINS].index(self.prefs["gain"]) if self.prefs["gain"] in dict(GAINS) else 0
         self.language = Dropdown(asr.LANGUAGES, accent=accent, size=13)
         self.language.set_value(self.prefs["language"])
+        self.mic_on = Toggle(self.prefs["mic_on"], accent=accent)
+        self.mic_language = Dropdown(asr.LANGUAGES, accent=accent, size=13)
+        self.mic_language.set_value(self.prefs["mic_language"])
+        self.mic_translate_on = Toggle(self.prefs["mic_translate"], accent=accent)
+        self.mic_obs_on = Toggle(self.prefs["mic_obs"], accent=accent)
         self.names = glossary.load(app.config)          # 專有名詞表(好幾個設定檔,選一個用)
         self.names_pick = Dropdown([(glossary.NONE, "不使用")], accent=accent, size=13)
         self.btn_names = Button("編輯", filled=False, size=12)
@@ -323,7 +339,7 @@ class SubtitlePage(Page):
             if ruby:
                 item["r"] = [list(segment) for segment in ruby]
             if color:
-                item["c"], item["s"] = list(color), line.speaker
+                item["c"], item["s"] = list(color), self.line_speaker(line)
             lines.append(item)
         return lines
 
@@ -355,7 +371,7 @@ class SubtitlePage(Page):
         items = []
         for line, idle in pairs:
             age = idle if line.final else None
-            color = self.color_of(line.speaker) if self.prefs["speakers"] else None
+            color = self.line_color(line)
             original, translation = self._mask(line.original), self._mask(line.translation)
             if line.same:
                 items.append(("", translation or original, line.final, age, (), color))
@@ -373,7 +389,8 @@ class SubtitlePage(Page):
             self.notice = (f"專有名詞存不了：{exc}", theme.WARN)
             self._notice_until = time.monotonic() + 5
         if self.engine is not None:
-            self.engine.settings.glossary = glossary.terms(data)
+            for each in self._engines():
+                each.settings.glossary = glossary.terms(data)
 
     def _label(self, key, value):
         """設定值給人看的名稱(寫進字幕紀錄)。"""
@@ -381,11 +398,11 @@ class SubtitlePage(Page):
             return dict(SOURCES).get(value, value)
         if key == "model":
             return next((name for k, name, _, _ in asr.MODELS if k == value), value)
-        if key == "language":
+        if key in ("language", "mic_language"):
             return dict(asr.LANGUAGES).get(value, value)
         if key == "target":
             return ollama.TARGET_NAMES.get(value, value)
-        if key in ("translate", "speakers"):
+        if key in ("translate", "speakers", "mic_translate", "mic_on"):
             return "開" if value else "關"
         if key == "gain":
             return dict(GAINS).get(value, value)
@@ -411,8 +428,16 @@ class SubtitlePage(Page):
         if not self.running or engine is None:
             return
         titles = {"source": "聲音來源", "model": "辨識模型", "language": "原文語言", "translate": "翻譯",
-                  "target": "翻成", "translator": "翻譯模型", "gain": "收音靈敏度", "speakers": "判斷誰說話"}
+                  "target": "翻成", "translator": "翻譯模型", "gain": "收音靈敏度", "speakers": "判斷誰說話",
+                  "mic_language": "麥克風的原文語言", "mic_translate": "翻譯我說的話"}
+        if key == "mic_on":
+            self._sync_mic(key)
+            return
         changes = {key: value}
+        if key == "translate":                  # 麥克風那邊:翻譯開著、而且「翻譯我說的話」也開著才翻
+            changes["mic_translate"] = value and self.prefs["mic_translate"]
+        if key == "mic_translate":
+            changes = {"mic_translate": value and self.prefs["translate"]}
         if key == "source":
             if value == "app":
                 pid = int(self.program_pick.value or 0) or None
@@ -427,6 +452,36 @@ class SubtitlePage(Page):
         if key == "source" and value == "app":
             summary += f"（{self._label('pid', changes['pid'])}）"
         engine.reconfigure(changes, summary)
+        if key == "source":
+            self._sync_mic(key)                 # 換成麥克風:不另外同時聽;從麥克風換走:要的話加回來
+
+    def _sync_mic(self, key):
+        """字幕進行中打開/關掉「同時聽麥克風」,或聲音來源換成/換掉麥克風:加上或拿掉麥克風那邊。"""
+        engine = self.engine
+        wanted = self.prefs["mic_on"] and self.prefs["source"] != "mic"
+        if engine.mic is None and wanted:
+            engine.attach(self._mic_engine())
+            engine.notice("開始同時聽麥克風")
+        elif engine.mic is not None and not wanted:
+            engine.detach()
+            engine.notice("不再同時聽麥克風" if key == "mic_on" else "聲音來源換成麥克風，不另外同時聽麥克風")
+
+    def _mic_engine(self, settings=None):
+        """麥克風那邊的引擎:原文語言、要不要翻譯是自己的;辨識模型、翻譯模型、專有名詞和電腦聲音那邊一樣。"""
+        prefs = self.prefs
+        main = settings or self.engine.main.settings
+        mic = Settings(source="mic", model=main.model, language=prefs["mic_language"],
+                       translate=prefs["translate"] and prefs["mic_translate"], translator=main.translator,
+                       target=main.target, partial=main.partial, step=main.step, glossary=main.glossary,
+                       gain=main.gain, speakers=False, track="mic")
+        return Engine(mic, on_update=self._changed)
+
+    def _engines(self):
+        engine = self.engine
+        if engine is None:
+            return []
+        main, mic = getattr(engine, "main", engine), getattr(engine, "mic", None)
+        return [main] + ([mic] if mic is not None else [])
 
     def _change_program(self, pid):
         """單一程式模式下換程式(字幕進行中的話換過去)。"""
@@ -441,6 +496,39 @@ class SubtitlePage(Page):
         old_text = self._label("pid", old) if engine.settings.source == "app" and old \
             else self._label("source", engine.settings.source)
         engine.reconfigure({"source": "app", "pid": pid}, f"聲音來源 {old_text} → {self._label('pid', pid)}")
+
+    def _mic_rows(self, x, y, inner, mouse_pos):
+        """同時聽麥克風:開關;打開時多出麥克風的原文語言、要不要翻譯、要不要顯示在 OBS。"""
+        screen = self.screen
+        prefs = self.prefs
+        draw_text(screen, "同時聽麥克風", (x, y + 3), 13, theme.TEXT)
+        self.mic_on.value = prefs["mic_on"]
+        self.mic_on.draw(screen, (x + inner - 42, y + 2), mouse_pos)
+        y += 28
+        if not prefs["mic_on"]:
+            draw_text(screen, widgets.clip_text("自己講的話也一起變成字幕（例如和朋友通話時）", 12, inner), (x, y), 12,
+                      theme.TEXT_FAINT)
+            return y + 26
+        draw_text(screen, "麥克風的原文語言", (x + 12, y + 6), 13, theme.TEXT)
+        if not self.mic_language.is_open:
+            self.mic_language.set_value(prefs["mic_language"])
+        self.mic_language.draw(screen, pygame.Rect(x + inner - 170, y, 170, 30), mouse_pos)
+        y += 36
+        rows = [("翻譯我說的話", self.mic_translate_on, "mic_translate")] if prefs["translate"] else []
+        rows.append(("我說的話顯示在 OBS", self.mic_obs_on, "mic_obs"))
+        for label, toggle, key in rows:
+            draw_text(screen, label, (x + 12, y + 3), 13, theme.TEXT)
+            toggle.value = prefs[key]
+            toggle.draw(screen, (x + inner - 42, y + 2), mouse_pos)
+            y += 28
+        notes = [f"我說的話用「{MIC_NAME}」的顏色；用喇叭時麥克風收到的電腦聲音會自動去掉"]
+        if not asr.gpu():
+            notes.append("沒有顯示卡時兩邊輪流辨識，字幕會慢一點")
+        for note in notes:
+            for row in widgets.wrap_text(note, 12, inner - 12, max_lines=2):
+                draw_text(screen, row, (x + 12, y), 12, theme.TEXT_FAINT)
+                y += 18
+        return y + 8
 
     def _translate_ready(self):
         if self.ollama_state != "running":
@@ -483,7 +571,8 @@ class SubtitlePage(Page):
                             gain=prefs["gain"], speakers=prefs["speakers"],
                             speaker_mode=speaker_profiles.mode(self._speaker_choice()[1]))
         self.speaker_colors = {}            # 每次開始字幕重新認人,上次改的顏色不沿用
-        self.engine = Engine(settings, on_update=self._changed)
+        mic = self._mic_engine(settings) if prefs_mic(prefs) else None
+        self.engine = Pair(Engine(settings, on_update=self._changed), mic)
         if prefs["speakers"]:
             self.engine.notice(f"判斷誰說話：用「{self._speaker_choice()[0]}」")      # 字幕紀錄記一行用哪個區分方式
         self.engine.start()
@@ -524,7 +613,7 @@ class SubtitlePage(Page):
         """每多一句定稿就存一次(當機也不會全部不見):output\\subtitles\\字幕 日期 時間.txt / .srt。"""
         lines = self._transcript_lines()
         # 句數、每句是誰、顏色有變才重存(判斷誰說話是定稿後才算好,改顏色也要重存)
-        marks = tuple(self.color_of(line.speaker) for line in lines) if self.prefs["speakers"] else ()
+        marks = tuple(self.line_color(line) for line in lines)
         signature = (len(lines), marks)
         if self.session is None or not lines or (not force and signature == self.session["saved"]) \
                 or self.prefs["output"] == "off":
@@ -540,8 +629,8 @@ class SubtitlePage(Page):
             number += 1
             translated = "" if line.same else line.translation
             original = line.translation if line.same and line.translation else line.original
-            color = self.color_of(line.speaker) if self.prefs["speakers"] else None
-            who = f"({speakers.color_name(color)}) " if color else ""
+            color = self.line_color(line)
+            who = "(我) " if line.track == "mic" else f"({speakers.color_name(color)}) " if color else ""
             text.append(f"[{_clock(line.start)}] {who}{original}")
             if translated:
                 text.append(f"        {translated}")
@@ -612,8 +701,12 @@ class SubtitlePage(Page):
             recent = engine.recent(int(self.prefs["count"]))
             self.overlay.lines(self._items(recent))
             if self.web.alive:
-                log = engine.recent(web.LOG_LINES) if self.prefs["web_layout"] == "log" else []
-                self.web.push(lines=self._web_lines(recent), log=self._web_lines(log))
+                mine = self.prefs["mic_obs"]
+                if getattr(engine, "mic", None) is None:
+                    mine = True                 # 沒有同時聽麥克風
+                lines = recent if mine else engine.recent(int(self.prefs["count"]), mic=False)
+                log = (engine.recent(web.LOG_LINES) if mine else engine.recent(web.LOG_LINES, mic=False))                     if self.prefs["web_layout"] == "log" else []
+                self.web.push(lines=self._web_lines(lines), log=self._web_lines(log))
         if self.web.alive and time.monotonic() - self._web_checked > 0.3:
             self._web_checked = time.monotonic()
             self._sync_web_style()
@@ -636,8 +729,8 @@ class SubtitlePage(Page):
                          mouse_pos)
         self._draw_footer(pygame.Rect(rect.x + margin, rect.bottom - footer_h - margin, rect.width - margin * 2,
                                       footer_h), mouse_pos)
-        for dropdown in (self.program_pick, self.language, self.names_pick, self.speaker_pick, self.target,
-                         self.filter_pick, self.obs_css):
+        for dropdown in (self.program_pick, self.language, self.mic_language, self.names_pick, self.speaker_pick,
+                         self.target, self.filter_pick, self.obs_css):
             dropdown.draw_menu(self.screen, mouse_pos)
         self.palette.draw(self.screen, mouse_pos)
         self.menu.draw(self.screen, mouse_pos)
@@ -648,8 +741,8 @@ class SubtitlePage(Page):
                    self.btn_css_folder, self.btn_reset_position]
         return buttons, [self.source, self.gain, self.mode, self.align, self.count, self.fade, self.output,
                          self.web_layout, self.obs_scale, self.obs_lines], \
-            [self.program_pick, self.language, self.names_pick, self.speaker_pick, self.target, self.filter_pick,
-             self.obs_css], \
+            [self.program_pick, self.language, self.mic_language, self.names_pick, self.speaker_pick, self.target,
+             self.filter_pick, self.obs_css], \
             [self.size, self.size_original, self.outline, self.opacity]
 
     def _draw_settings(self, rect, mouse_pos):
@@ -774,6 +867,8 @@ class SubtitlePage(Page):
             self.program_pick.draw(screen, pygame.Rect(x, y, inner - 96, 30), mouse_pos)
             self.btn_refresh.draw(screen, pygame.Rect(x + inner - 88, y, 88, 30), mouse_pos)
             y += 40
+        if prefs["source"] != "mic":
+            y = self._mic_rows(x, y, inner, mouse_pos)
         draw_text(screen, "收音靈敏度", (x, y + 7), 13, theme.TEXT)
         self.gain.draw(screen, pygame.Rect(x + 90, y, inner - 90, 30), mouse_pos)
         y += 36
@@ -1137,7 +1232,7 @@ class SubtitlePage(Page):
         for line, original, translated, height in blocks:
             if y + height >= area.y and y <= area.bottom:
                 row_rect = pygame.Rect(area.x + 6, y - 3, area.width - 20, height)
-                color = self.color_of(line.speaker) if self.prefs["speakers"] and not line.notice else None
+                color = self.line_color(line)
                 if color:
                     # 判斷誰說話:淡淡的底色 + 左邊一條,同一個人同一個顏色
                     rounded_panel(screen, row_rect, color, radius=6, alpha=36)
@@ -1254,7 +1349,8 @@ class SubtitlePage(Page):
             if hit is not None:
                 self._line_menu(*hit, mouse_pos)
             return
-        pairs = ((self.program_pick, None), (self.language, "language"), (self.names_pick, "names"),
+        pairs = ((self.program_pick, None), (self.language, "language"), (self.mic_language, "mic_language"),
+                 (self.names_pick, "names"),
                  (self.speaker_pick, "speaker_profile"), (self.target, "target"), (self.filter_pick, "filter"),
                  (self.obs_css, "obs_css"))
         opened = [pair for pair in pairs if pair[0].is_open]
@@ -1333,7 +1429,7 @@ class SubtitlePage(Page):
             hit = next(((rect, line) for rect, line in self.line_rects if rect.collidepoint(pos)), None)
             if hit is not None:
                 rect, line = hit
-                if self.prefs["speakers"] and line.speaker is not None:
+                if self.line_color(line) is not None:
                     self._line_menu(rect, line, pos)    # 開了判斷誰說話:點一句打開選單(複製、改顏色)
                 else:
                     self._copy([line], "這一句")
@@ -1359,7 +1455,8 @@ class SubtitlePage(Page):
         if self.gain.clicked(pos, True):
             self._change("gain", self.gain.value)
             if self.engine is not None and self.running:
-                self.engine.settings.gain = self.prefs["gain"]
+                for each in self._engines():
+                    each.settings.gain = self.prefs["gain"]
             return
         if self.align.clicked(pos, True):
             self._set_style("align", self.align.value)
@@ -1432,6 +1529,17 @@ class SubtitlePage(Page):
             self._change("source", self.source.value)
         elif self.btn_refresh.clicked(pos, True):
             self._refresh_programs()
+        elif prefs["source"] != "mic" and self.mic_on.clicked(pos, True):
+            self.mic_on.value = prefs["mic_on"]
+            self._change("mic_on", not prefs["mic_on"])
+        elif prefs["source"] != "mic" and prefs["mic_on"] and prefs["translate"] \
+                and self.mic_translate_on.clicked(pos, True):
+            self.mic_translate_on.value = prefs["mic_translate"]
+            self._change("mic_translate", not prefs["mic_translate"])
+        elif prefs["source"] != "mic" and prefs["mic_on"] and self.mic_obs_on.clicked(pos, True):
+            self.prefs["mic_obs"] = self.mic_obs_on.value = not prefs["mic_obs"]
+            self._save()
+            self._dirty = True
         elif self.overlay_on.clicked(pos, True):
             self.prefs["overlay"] = self.overlay_on.value = not self.prefs["overlay"]
             self._save()
@@ -1477,25 +1585,39 @@ class SubtitlePage(Page):
         self._dirty = True
 
     def color_of(self, speaker):
-        """第幾個人的顏色(使用者改過的優先);判斷不了的句子沒有顏色。"""
+        """第幾個人的顏色(使用者改過的優先);判斷不了的句子沒有顏色。speaker 是 "me" 時是麥克風(自己)的顏色。"""
         if speaker is None:
             return None
+        if speaker == ME:
+            return tuple(self.speaker_colors.get(ME, MIC_COLOR))
         return tuple(self.speaker_colors.get(speaker, speakers.COLORS[speaker % len(speakers.COLORS)][1]))
+
+    def line_color(self, line):
+        """這一句的顏色:同時聽麥克風時,麥克風的句子一律是「我」的顏色;其他句子開了判斷誰說話才有顏色。"""
+        if getattr(line, "notice", False):
+            return None
+        if getattr(line, "track", "") == "mic":
+            return self.color_of(ME)
+        return self.color_of(line.speaker) if self.prefs["speakers"] else None
+
+    @staticmethod
+    def line_speaker(line):
+        return ME if getattr(line, "track", "") == "mic" else line.speaker
 
     def _line_menu(self, rect, line, pos):
         """字幕紀錄裡一句的選單(左鍵、右鍵都是這個):複製這一句、改這個人的顏色。"""
-        can_color = self.prefs["speakers"] and line.speaker is not None
+        can_color = self.line_color(line) is not None
         self.menu.open(pos, [("複製這一句", "", True, lambda: self._copy([line], "這一句")),
                              ("改這個人的顏色", "", can_color, lambda: self._recolor(line, rect))])
 
     def _recolor(self, line, anchor):
         """改這個人的顏色:同一個人的每一句(字幕視窗、字幕紀錄、存檔)一起換。"""
-        def pick(color, speaker=line.speaker):
+        def pick(color, speaker=self.line_speaker(line)):
             if color is not None:
                 self.speaker_colors[speaker] = tuple(color)
                 self._dirty = True
                 self._save_transcript(force=True)
-        self.palette.open(anchor, self.color_of(line.speaker), pick)
+        self.palette.open(anchor, self.line_color(line), pick)
 
     def _set_furigana(self, on):
         """打開時字典還沒下載:先詢問,下載好才打開。"""

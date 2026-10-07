@@ -172,9 +172,18 @@ class Server:
         self._lock = threading.Lock()
         self._conn = None               # 和伺服器的連線(重複使用:每次開新連線偶爾會被 Windows 擋,WinError 10013)
         self._used = 0.0
-        # 上一次辨識的細節:segments [(開始秒, 結束秒, 文字)](Whisper 大多一句一段)、
-        # confidence 平均對數機率(真的台詞約 -0.1～-0.3,對著配樂、音效亂猜的約 -0.9)
-        self.last = {"segments": [], "confidence": 0.0, "languages": {}}
+        self._local = threading.local()
+
+    # 上一次辨識的細節:segments [(開始秒, 結束秒, 文字)](Whisper 大多一句一段)、
+    # confidence 平均對數機率(真的台詞約 -0.1～-0.3,對著配樂、音效亂猜的約 -0.9)。
+    # 每條執行緒各自記:同時聽電腦聲音和麥克風時兩邊輪流用同一個辨識程式,不會拿到對方的結果
+    @property
+    def last(self):
+        return getattr(self._local, "last", None) or {"segments": [], "confidence": 0.0, "languages": {}}
+
+    @last.setter
+    def last(self, value):
+        self._local.last = value
 
     def start(self, cancel=None, timeout=180):
         exe = transcribe.engine().path().with_name("whisper-server.exe")

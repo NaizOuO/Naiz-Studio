@@ -37,11 +37,13 @@ CSS_GUIDE = """/* Naiz Studio 即時字幕:OBS 瀏覽器來源的自訂外觀
    可以用的名稱:
    #wrap               全部字幕的外框(.subtitle 字幕樣式 / .log 紀錄樣式)
    .block              一句(一個底色框);.partial 是還在講的句子;.speaker-0～7 是判斷誰說話的第幾個人
+                       .speaker-me 是同時聽麥克風時自己說的話
    .row                一行字;.original 原文、.translation 翻譯;.main 大字、.sub 小字
    rt                  日文讀音(振假名)
    CSS 變數(預設跟著字幕視窗的設定):
    --size 大字的大小、--size-small 小字的大小、--color 字的顏色、--dim 還在講的句子的顏色、
-   --bg 底色、--outline 外框(text-shadow)、--speaker 這個人的顏色(底色上疊的那層)、--font 字型
+   --bg 底色、--outline 外框(text-shadow)、--speaker 這個人的顏色、--speaker-bg 這個人那句的底色
+   (顏色調暗、透明度照底色深淺)、--font 字型
 */
 
 /* 例:換成圓角膠囊、字變粗、底色漸層 */
@@ -247,7 +249,7 @@ PAGE = r"""<!doctype html>
           font-family: var(--font); }
   .block { border-radius: 12px; padding: 10px 20px; max-width: 100%; box-sizing: border-box;
            background: var(--bg); text-align: var(--align); overflow-wrap: anywhere; }
-  .block.speaker { background: linear-gradient(var(--speaker), var(--speaker)), var(--bg); }
+  .block.speaker { background: var(--speaker-bg); }
   .row { line-height: 1.35; white-space: pre-wrap; color: var(--color); text-shadow: var(--outline); }
   .row.main { font-size: var(--size); }
   .row.sub { font-size: var(--size-small); color: var(--dim); }
@@ -262,6 +264,13 @@ let state = {style: {}, lines: [], log: [], layout: "subtitle"}, received = perf
 let fontKey = "", cssKey = "";
 const FADE_TIME = 0.8;
 const root = document.documentElement.style;
+let bgAlpha = 0.6;
+const SPEAKER_SHADE = 0.55;    // 說話者那句的底色:那個人的顏色調暗(和字幕視窗一樣),透明度照底色深淺
+function paintSpeaker(block) {
+  const c = block.speakerColor;
+  const value = c ? rgb(c.map(v => Math.round(v * SPEAKER_SHADE)), bgAlpha) : "";
+  if (block.style.getPropertyValue("--speaker-bg") !== value) block.style.setProperty("--speaker-bg", value);
+}
 function rgb(c, a) { c = c || [255, 255, 255]; return a === undefined ? `rgb(${c[0]},${c[1]},${c[2]})`
                                                                       : `rgba(${c[0]},${c[1]},${c[2]},${a})`; }
 function outline(width, color) {
@@ -295,7 +304,9 @@ function applyStyle() {
   root.setProperty("--size-small", Math.max(10, style.size_original || big * 0.6) * scale + "px");
   root.setProperty("--color", rgb(color));
   root.setProperty("--dim", rgb(color.map(c => Math.round(c * 0.82))));
-  root.setProperty("--bg", rgb(style.bg || [12, 14, 18], (style.opacity === undefined ? 60 : style.opacity) / 100));
+  bgAlpha = (style.opacity === undefined ? 60 : style.opacity) / 100;
+  root.setProperty("--bg", rgb(style.bg || [12, 14, 18], bgAlpha));
+  for (const block of shown.values()) paintSpeaker(block);         // 底色深淺改了:說話者的底色透明度跟著改
   root.setProperty("--outline", outline((style.outline === undefined ? 2 : style.outline) * scale, style.outline_color || [0, 0, 0]));
   root.setProperty("--align", style.align || "center");
   root.setProperty("--justify", {left: "flex-start", right: "flex-end"}[style.align] || "center");
@@ -362,8 +373,10 @@ function render() {
     const kind = "block" + (item.f === false ? " partial" : "") +
                  (item.c ? ` speaker speaker-${item.s === undefined ? 0 : item.s}` : "");
     if (block.className !== kind) block.className = kind;
-    const speaker = item.c ? rgb(item.c, 0.33) : "";
+    const speaker = item.c ? rgb(item.c) : "";
     if (block.style.getPropertyValue("--speaker") !== speaker) block.style.setProperty("--speaker", speaker);
+    block.speakerColor = item.c || null;
+    paintSpeaker(block);
     const opacity = alpha < 1 ? String(alpha) : "";
     if (block.style.opacity !== opacity) block.style.opacity = opacity;
     const content = JSON.stringify([rows, item.o, item.t, item.r || null]);

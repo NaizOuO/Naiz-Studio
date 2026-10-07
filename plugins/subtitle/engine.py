@@ -205,6 +205,7 @@ class Line:
     notice: bool = False        # 字幕紀錄裡的說明行(變更設定、重新開始),不是有人說的話
     speaker: int = None         # 判斷誰說話:第幾個人(0 起算);沒開、還沒判斷完、判斷不了時是 None
     words: list = field(default_factory=list)       # 最近一次辨識每個字的時間 [(開始秒, 結束秒, 字)](一句裡換人時切開用)
+    track: str = ""             # 哪個聲音來源:""(電腦聲音/單一程式) 或 "mic"(同時聽的麥克風)
 
 
 @dataclass
@@ -226,6 +227,7 @@ class Settings:
     # same 同一人門檻(門檻比對才用)、split 一句裡換人的門檻
     speaker_mode: dict = field(default_factory=lambda: {"method": "cluster", "same": voices.SAME, "split": 0.50})
     extra: dict = field(default_factory=dict)
+    track: str = ""             # 同時聽麥克風時,麥克風那個引擎是 "mic"(每一句會標上)
 
 
 def tidy_chinese(text, target):
@@ -413,8 +415,10 @@ class Engine:
     """start() 之後在背景執行;on_update() 在字幕內容改變時被呼叫(從背景執行緒)。"""
 
     def __init__(self, settings, on_update=None, capture_factory=None, vad_factory=None, server=None,
-                 translator=None):
+                 translator=None, clock=None, shared=False):
         self.settings = settings
+        self.shared = shared                # 麥克風那個引擎:辨識程式和翻譯模型是借用的,停止時不關、不移出
+        self.clock = clock                  # 同時聽麥克風時:電腦聲音那邊開始收音的時間(time.monotonic),兩邊的秒數對齊
         self.on_update = on_update or (lambda: None)
         self._capture_factory = capture_factory
         self._vad_factory = vad_factory
@@ -465,9 +469,9 @@ class Engine:
         self._voices.put(None)
         if self._capture is not None:
             self._capture.stop()
-        if self.server is not None:
+        if self.server is not None and not self.shared:
             self.server.stop()
-        if self.settings.translate:
+        if self.settings.translate and not self.shared:
             threading.Thread(target=ollama.unload, args=(self.settings.translator,), daemon=True).start()
         if self.state not in ("error",):
             self.state, self.message = "stopped", "已停止"
@@ -480,7 +484,7 @@ class Engine:
     def _fail(self, text):
         self.state, self.message = "error", text
         self._stop.set()
-        if self.server is not None:
+        if self.server is not None and not self.shared:
             self.server.stop()
         self.on_update()
 
@@ -511,6 +515,11 @@ class Engine:
                 from .capture import Capture
                 self._capture = Capture(s.source, self._feed, s.pid)
             self.started_at = time.monotonic()
+            if self.clock is not None:      # 比電腦聲音那邊晚開始:前面補上那段時間,兩邊的秒數一樣
+                late = max(0.0, self.started_at - self.clock)
+                with self._lock:
+                    self._offset = int(late * RATE)
+                    self._probs = [0.0] * int(late / FRAME_SECONDS)
             self._capture.start()
             if hasattr(self._capture, "started"):
                 self._capture.started.wait(5)
@@ -524,6 +533,9 @@ class Engine:
                 self._fail(str(exc) or type(exc).__name__)
 
     # ------------------------------------------------------------ 聲音
+
+    def _new_line(self, *args, **kwargs):
+        return Line(*args, track=self.settings.track, **kwargs)
 
     def _feed(self, pcm):
         pcm = self._amplify(pcm)
@@ -749,7 +761,7 @@ class Engine:
                     segments = [(first[0], first[1], trim_overlap(carry.original, first[2], spaced))] + segments[1:]
             if text:
                 if line is None:
-                    line = Line(self._next_id, sentence, end, language=language)
+                    line = self._new_line(self._next_id, sentence, end, language=language)
                     self._next_id += 1
                     self.lines.append(line)
                 line.words = [(sentence + a, sentence + b, w) for a, b, w in words]
@@ -798,7 +810,7 @@ class Engine:
                             if displayed.startswith(first_half) else ""
                         following = None
                         if rest:
-                            following = Line(self._next_id, next_start, end, original=rest, language=language)
+                            following = self._new_line(self._next_id, next_start, end, original=rest, language=language)
                             self._next_id += 1
                             self.lines.append(following)
                         sentence, line, last = next_start, following, now
@@ -956,7 +968,7 @@ class Engine:
                 target, first = line, False
                 target.end = sentence + end
             else:
-                target = Line(self._next_id, sentence + start, sentence + end, language=line.language,
+                target = self._new_line(self._next_id, sentence + start, sentence + end, language=line.language,
                               words=line.words)
                 self._next_id += 1
                 self.lines.append(target)
@@ -1034,7 +1046,7 @@ class Engine:
             text = fresh(text) if text else ""
             tail_text = fresh(tail_text) if tail_text else ""
         if text:
-            line = held if held is not None else Line(self._next_id, start, end, language=language)
+            line = held if held is not None else self._new_line(self._next_id, start, end, language=language)
             if held is None:
                 self._next_id += 1
                 self.lines.append(line)
@@ -1044,7 +1056,7 @@ class Engine:
             self._finalize(line)
             self.on_update()
         if tail_text:
-            line = held if held is not None else Line(self._next_id, resume, end, language=language)
+            line = held if held is not None else self._new_line(self._next_id, resume, end, language=language)
             if held is None:
                 self._next_id += 1
                 self.lines.append(line)
@@ -1132,7 +1144,7 @@ class Engine:
                 part = line
                 part.original, part.end = text, end
             else:
-                part = Line(next(self._split_ids), start, end, original=text, final=True, language=line.language,
+                part = self._new_line(next(self._split_ids), start, end, original=text, final=True, language=line.language,
                             words=line.words)
                 try:
                     self.lines.insert(self.lines.index(parts[-1][0]) + 1, part)
@@ -1259,7 +1271,9 @@ class Engine:
     def notice(self, text):
         """在字幕紀錄裡加一行說明(變更設定、重新開始);字幕視窗不顯示。"""
         now = self._now() if self.started_at is not None else 0.0
-        line = Line(self._next_id, now, now, original=text, final=True, notice=True)
+        if self.settings.track == "mic":
+            text = f"麥克風：{text}"
+        line = self._new_line(self._next_id, now, now, original=text, final=True, notice=True)
         self._next_id += 1
         self.lines.append(line)
         self.on_update()
@@ -1338,7 +1352,7 @@ class Engine:
         """換翻譯模型或打開翻譯:先載入新的(載好前照常用舊的設定翻),再把舊的移出顯示卡。"""
         s = self.settings
         if not s.translate or (s.translator == old and was_translating):
-            if was_translating and not s.translate:
+            if was_translating and not s.translate and not self.shared:
                 threading.Thread(target=ollama.unload, args=(old,), daemon=True).start()
             return
 
@@ -1349,8 +1363,191 @@ class Engine:
                 self.message = f"翻譯模型載入失敗：{exc}"
                 self.on_update()
                 return
-            if was_translating and old != s.translator:
+            if was_translating and old != s.translator and not self.shared:
                 ollama.unload(old)
 
         threading.Thread(target=work, daemon=True).start()
 
+
+
+# ------------------------------------------------------------ 同時聽電腦聲音和麥克風
+
+ECHO_SIMILAR = 0.5          # 麥克風的句子和電腦聲音那邊同時間的句子這麼像:是喇叭的聲音被麥克風收到(回音),不顯示
+ECHO_SECONDS = 3.0          # 兩句開始的時間差多少以內才比
+ECHO_SETTLED = 15.0         # 講完這麼久的句子不再重新判斷是不是回音
+
+
+def _bigrams(text):
+    text = re.sub(r"[^\w]", "", text.lower())
+    return {text[i:i + 2] for i in range(len(text) - 1)} or ({text} if text else set())
+
+
+def similar(a, b):
+    """兩句的相似度(相同的兩字組合佔多少),0～1。"""
+    a, b = _bigrams(a), _bigrams(b)
+    return len(a & b) / len(a | b) if a and b else 0.0
+
+
+class SharedServer:
+    """麥克風那邊用的辨識程式:就是電腦聲音那邊的那一個(一次辨識一段,兩邊輪流)。
+    電腦聲音那邊在換辨識模型時先等著(麥克風的聲音照收,載入好再補上字幕)。"""
+
+    def __init__(self, owner, stop):
+        self._owner = owner
+        self._stop = stop
+
+    def transcribe(self, *args, **kwargs):
+        while True:
+            server = self._owner.server
+            if server is not None and not self._owner._paused.is_set():
+                return server.transcribe(*args, **kwargs)
+            if self._stop.is_set() or self._owner.state in ("error", "stopped"):
+                raise RuntimeError("字幕已停止")
+            time.sleep(0.1)
+
+    @property
+    def last(self):
+        server = self._owner.server
+        return server.last if server is not None else {}
+
+    @property
+    def alive(self):
+        server = self._owner.server
+        return server is None or server.alive        # 換模型中(還沒有新的)也算在,等它載入好
+
+    def stop(self):
+        pass                                        # 不是自己的,不關
+
+    def __getattr__(self, name):
+        return getattr(self._owner.server, name)
+
+
+class Pair:
+    """同時聽兩個來源:電腦聲音(或單一程式)main + 麥克風 mic。各自收音、各自斷句,
+    辨識程式和翻譯模型共用(麥克風那邊借用 main 的);lines 依時間合在一起,麥克風的句子 track 是 "mic"。
+    喇叭的聲音被麥克風收到時(回音),麥克風那句和電腦聲音那邊同時間很像的那句重複,麥克風那句不顯示。
+    沒有開麥克風時(mic 是 None)就和 main 一樣。其他屬性(state、message、settings…)都是 main 的。"""
+
+    MIC_IDS = 20_000_000            # 麥克風那邊的句子編號從這裡開始,不會和電腦聲音那邊重複
+
+    def __init__(self, main, mic=None):
+        self.main = main
+        self.mic = None
+        self._mic_error = ""
+        self._echo = {}             # 麥克風句子的編號 → (原文, 是不是回音)
+        if mic is not None:
+            self.attach(mic)
+
+    def __getattr__(self, name):
+        return getattr(self.main, name)
+
+    def attach(self, mic):
+        """加上麥克風(字幕進行中也可以):等電腦聲音那邊開始收音後才開始,兩邊的秒數對齊。"""
+        mic.shared = True
+        mic.settings.track = "mic"
+        mic._next_id = max(mic._next_id, self.MIC_IDS)
+        mic._split_ids = itertools.count(self.MIC_IDS + 5_000_000)
+        mic.server = SharedServer(self.main, mic._stop)
+        user_update = mic.on_update
+
+        def on_update():
+            if mic.state == "error" and mic.message != self._mic_error:
+                self._mic_error = mic.message
+                self.main.notice(f"麥克風停止：{mic.message}")
+            user_update()
+
+        mic.on_update = on_update
+        self.mic = mic
+        if self.main.state not in ("idle", "error", "stopped"):
+            self._start_mic()
+
+    def detach(self):
+        """拿掉麥克風(字幕繼續)。"""
+        mic, self.mic = self.mic, None
+        if mic is not None:
+            threading.Thread(target=mic.stop, daemon=True).start()
+
+    def start(self):
+        self.main.start()
+        if self.mic is not None:
+            self._start_mic()
+
+    def _start_mic(self):
+        mic = self.mic
+
+        def wait_then_start():
+            while self.main.started_at is None:         # 電腦聲音那邊還在載入辨識模型
+                if self.main.state in ("error", "stopped") or mic._stop.is_set():
+                    return
+                time.sleep(0.05)
+            mic.clock = self.main.started_at
+            mic.start()
+
+        threading.Thread(target=wait_then_start, daemon=True).start()
+
+    def stop(self):
+        if self.mic is not None:
+            self.mic.stop()
+        self.main.stop()
+
+    @property
+    def running(self):
+        return self.main.running
+
+    def _is_echo(self, line, main_lines):
+        if not line.original or line.notice:
+            return False
+        cached = self._echo.get(line.id)
+        if cached is not None and (cached[0] == line.original
+                                   or (line.final and self.main._now() - line.end > ECHO_SETTLED)):
+            return cached[1]
+        echo = False
+        for other in reversed(main_lines):
+            if other.start < line.start - ECHO_SECONDS - 10:
+                break
+            if not other.notice and other.original and abs(other.start - line.start) <= ECHO_SECONDS \
+                    and similar(other.original, line.original) >= ECHO_SIMILAR:
+                echo = True
+                break
+        self._echo[line.id] = (line.original, echo)
+        return echo
+
+    @property
+    def lines(self):
+        if self.mic is None:
+            return self.main.lines
+        main_lines = list(self.main.lines)
+        mic_lines = [line for line in list(self.mic.lines) if not self._is_echo(line, main_lines)]
+        if not mic_lines:
+            return main_lines
+        return sorted(main_lines + mic_lines, key=lambda line: (line.start, line.track))
+
+    def recent(self, count=2, mic=True):
+        """mic=False:不要麥克風的句子(OBS 不顯示自己說的話時)。"""
+        if self.mic is None:
+            return self.main.recent(count)
+        lines = [line for line in self.lines if line.original and not line.notice and (mic or line.track != "mic")]
+        now = self.main._now() if self.main.started_at is not None else 0
+        return [(line, max(0.0, now - line.end) if line.final else 0.0) for line in lines[-count:]]
+
+    def notice(self, text):
+        self.main.notice(text)
+
+    def reconfigure(self, changes, summary):
+        """mic_ 開頭的設定給麥克風(原文語言、要不要翻譯);辨識模型、翻譯模型、翻成什麼、專有名詞兩邊一起;
+        其他給電腦聲音。"""
+        mine = {key[4:]: value for key, value in changes.items() if key.startswith("mic_")}
+        others = {key: value for key, value in changes.items() if not key.startswith("mic_")}
+        if others:
+            self.main.reconfigure(others, summary)
+        mic = self.mic
+        if mic is None:
+            return
+        for key in ("model", "translator", "target", "partial", "glossary", "gain", "step"):
+            if key in others:
+                setattr(mic.settings, key, others[key])
+        if mine:
+            for key, value in mine.items():
+                setattr(mic.settings, key, value)
+            if not others:                      # 和電腦聲音那邊一起改的(例如翻譯開關)已經記過一行
+                self.main.notice(f"變更設定：{summary}（下一句開始套用）")

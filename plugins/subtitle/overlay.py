@@ -174,6 +174,15 @@ def _script(text):
     return ""
 
 
+RAISE_EVERY = 1.0          # 每隔幾秒把字幕放回最上層
+SPEAKER_SHADE = 0.55       # 說話者的底色:那個人的顏色調暗到這個比例(白字、外框才看得清楚)
+
+
+def speaker_fill(color, alpha):
+    """說話者那句的底色(RGBA):顏色固定,透明度照「底色深淺」。"""
+    return tuple(int(c * SPEAKER_SHADE) for c in color[:3]) + (int(alpha),)
+
+
 class Painter:
     """依樣式把字幕畫成 RGBA 圖片;字型載入一次就留著。"""
 
@@ -420,15 +429,11 @@ class Painter:
             # 每一句畫在自己的一層,淡出時整層一起變透明(底色、字、外框一起淡)
             layer = Image.new("RGBA", (block_w, block_h), (0, 0, 0, 0))
             pen = ImageDraw.Draw(layer)
-            if bg[3]:
-                pen.rounded_rectangle((0, 0, block_w - 1, block_h - 1), radius=12, fill=bg)
-            if speaker:
-                # 判斷誰說話:在底色和字之間蓋一層半透明的顏色(每句各自一塊,不會重疊混色)
-                tint = Image.new("RGBA", layer.size, (0, 0, 0, 0))
-                ImageDraw.Draw(tint).rounded_rectangle((0, 0, block_w - 1, block_h - 1), radius=12,
-                                                       fill=tuple(speaker[:3]) + (85,))
-                layer.alpha_composite(tint)
-                pen = ImageDraw.Draw(layer)
+            # 判斷誰說話:這句的底色直接換成那個人的顏色(調暗讓字看得清楚),不和原本的底色疊在一起混色;
+            # 底色深淺只決定透明度,調深淺時顏色不會跟著變
+            fill = speaker_fill(speaker, bg[3]) if speaker else bg
+            if fill[3]:
+                pen.rounded_rectangle((0, 0, block_w - 1, block_h - 1), radius=12, fill=fill)
             row_y = pad_y
             for (content, size, fill, row_style), row_w in zip(rows, widths):
                 x = {"left": pad_x, "right": block_w - pad_x - row_w}.get(align, (block_w - row_w) / 2)
@@ -640,6 +645,7 @@ def _run(port, token, mouse=None):
     mouse = mouse or windows_mouse
 
     anchor = default_anchor()
+    raised = time.monotonic()
     from PIL import Image
 
     while not closed.is_set():
@@ -688,5 +694,9 @@ def _run(port, token, mouse=None):
             image = painter.paint(visible, style, band_width, adjusting) or Image.new("RGBA", (1, 1))
             size = image.size
             present(image, anchor[0] - size[0] // 2, anchor[1] - size[1])
+        if time.monotonic() - raised > RAISE_EVERY:
+            # 別的程式把自己設成最上層(例如 MediBang 第一次開啟)會蓋過字幕:定時再放回最上層(不搶焦點)
+            raised = time.monotonic()
+            user32.SetWindowPos(hwnd, wintypes.HWND(-1), 0, 0, 0, 0, 0x1 | 0x2 | 0x10)
         time.sleep(1 / 60 if drag is not None else 1 / 30)
     pygame.quit()

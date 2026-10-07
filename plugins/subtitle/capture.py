@@ -21,6 +21,11 @@ import comtypes  # noqa: E402
 from comtypes import COMMETHOD, GUID, IUnknown  # noqa: E402
 
 RATE = 16000                    # 每秒取樣數
+# Windows 替我們暫存聲音的長度(100 奈秒為單位)。每 0.02 秒就會讀走,不會增加延遲;
+# 存久一點是為了程式忙(其他執行緒卡住)時聲音不會掉。麥克風照這個給(原本 0.2 秒);
+# 單一程式、系統聲音(程式的聲音擷取)Windows 一律只給 10 毫秒,讀的執行緒被卡住超過約 0.02 秒那段就會掉,
+# 所以其他執行緒不能長時間佔著 Python(實測字幕畫面最久 12 毫秒;錄製工具截圖太頻繁時掉了三分之一)
+BUFFER = 1000 * 10000
 SOURCES = [("system", "電腦播放的聲音"), ("app", "單一程式"), ("mic", "麥克風")]
 SOURCE_NOTES = {"system": "YouTube、B站、遊戲、Discord 等，電腦正在播放的聲音都會翻譯",
                 "app": "只翻譯選的程式，例如只翻 Discord、不翻遊戲音樂",
@@ -244,7 +249,7 @@ def _loopback_client(pid, include):
     if handler.error is not None:
         raise RuntimeError("無法擷取這個程式的聲音(需要 Windows 10 2004 以後的版本)")
     client = handler.client
-    client.Initialize(0, LOOPBACK | AUTOCONVERTPCM | SRC_DEFAULT_QUALITY, 200 * 10000, 0, byref(_format()), None)
+    client.Initialize(0, LOOPBACK | AUTOCONVERTPCM | SRC_DEFAULT_QUALITY, BUFFER, 0, byref(_format()), None)
     return client
 
 
@@ -256,7 +261,7 @@ def _mic_client():
         raise RuntimeError("找不到麥克風，請確認有接上並在 Windows 設定裡啟用") from None
     pointer = device.Activate(byref(IAudioClient._iid_), CLSCTX_ALL, None)
     client = ctypes.cast(pointer, POINTER(IAudioClient))
-    client.Initialize(0, AUTOCONVERTPCM | SRC_DEFAULT_QUALITY, 200 * 10000, 0, byref(_format()), None)
+    client.Initialize(0, AUTOCONVERTPCM | SRC_DEFAULT_QUALITY, BUFFER, 0, byref(_format()), None)
     return client
 
 
