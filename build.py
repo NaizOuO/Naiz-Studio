@@ -1,10 +1,11 @@
-"""用 PyInstaller 打包成單一 exe,並整理成可以直接上傳 Release 的資料夾與 zip。
+"""用 PyInstaller 打包成資料夾版(exe + _internal),並整理成可以直接上傳 Release 的資料夾與 zip。
+(v1.19.0 起不再打包成單一 exe:單一 exe 每次開啟都要先解壓縮到暫存區,開得慢,也容易被防毒軟體擋住。)
 
 用法:python build.py v1.9.2
-產出:dist/_new/Naiz Studio/(exe、setting/images、README.md、LICENSE)與 dist/Naiz Studio v1.9.2.zip
+產出:dist/_new/Naiz Studio/(exe、_internal、setting/images、README.md、LICENSE)與 dist/Naiz Studio v1.9.2.zip
 dist/Naiz Studio/ 不會被動到:那是自己用的一份,用程式內的更新功能換成新版(順便測試更新)。
 另外會用 dist 裡上一版的 zip 做出「從上一版升級」的補丁(需要 zstd 指令),和 zip 一起上傳到 Release,
-已經安裝的人更新時只要下載補丁。
+已經安裝的人更新時只要下載補丁。上一版是單一 exe 版時不做補丁(舊版會下載完整 zip 換成資料夾版)。
 
 只重做補丁:python build.py patch v1.15.1(用 dist 裡這一版與上一版的 zip)
 打包擴充模組:python build.py mod circuit → dist/circuit-v0.1.0.zip(版本照模組 __init__.py 的 version)
@@ -13,7 +14,6 @@ dist/Naiz Studio/ 不會被動到:那是自己用的一份,用程式內的更新
 產出 setting/images/app_icon.png(視窗圖示,256)與 setting/images/app_icon.ico(16～256 各種尺寸)
 """
 
-import os
 import shutil
 import sys
 import zipfile
@@ -101,7 +101,7 @@ def version_file(version):
 
 
 def pyinstaller_args(script, name, windowed=True, workdir=None, version=None):
-    args = [str(script), "--noconfirm", "--onefile", "--name", name,
+    args = [str(script), "--noconfirm", "--onedir", "--name", name,
             "--icon", str(ROOT / "setting" / "images" / "app_icon.ico"),
             "--paths", str(ROOT),
             # 插件原始檔要放進 exe,程式才能照資料夾載入(開發者插件不在這裡,不會被打包)
@@ -150,54 +150,76 @@ def previous_release(current, folder=None):
     return max(found)[1:] if found else None
 
 
+PATCH_DIFF_MIN = 64 * 1024  # 比這小的檔案有改就整個放進補丁,比較大的放新舊差異
+
+
+def release_tree(zf, root):
+    """發布 zip 裡的程式檔案 {相對路徑: 內容}(不含資料夾與空的 mods)。"""
+    return {n[len(root):]: zf.read(n) for n in zf.namelist()
+            if n.startswith(root) and not n.endswith("/")}
+
+
 def make_patch(current, archive):
-    """做出從上一版升級到 current 的補丁:新舊 exe 的差異,加上有改過的隨附檔案。
+    """做出從上一版升級到 current 的補丁:manifest(新舊版每個檔案的 SHA-256)、
+    有改的大檔案放新舊差異(diff/…zst),小檔案或新增的檔案整個放(files/…);沒改的檔案和要刪的檔案不用放。
     上一版的 zip 在 archive 同一個資料夾找,補丁也放在那裡(平常是 dist)。"""
     import hashlib
     import json
     import subprocess
     import tempfile
 
-    from core.updater import patch_name
+    from core.updater import CONTENTS, patch_name
 
     previous = previous_release(current, Path(archive).parent)
     if previous is None:
         print(f"{Path(archive).parent} 裡沒有上一版的 zip,不做補丁")
         return None
     old_tag, old_archive = previous
+    root = f"{NAME}/"
+    with zipfile.ZipFile(old_archive) as old_zip, zipfile.ZipFile(archive) as new_zip:
+        old, new = release_tree(old_zip, root), release_tree(new_zip, root)
+    if not any(name.startswith(CONTENTS + "/") for name in old):
+        print(f"上一版 {old_tag} 是單一 exe 版,不做補丁(會下載完整 zip 換成資料夾版)")
+        return None
     zstd = shutil.which("zstd")
     if zstd is None:
         print("找不到 zstd 指令,不做補丁(已經安裝的人會下載完整版)")
         return None
-    root = f"{NAME}/"
-    with zipfile.ZipFile(old_archive) as old_zip, zipfile.ZipFile(archive) as new_zip:
-        old_exe = old_zip.read(root + f"{NAME}.exe")
-        new_exe = new_zip.read(root + f"{NAME}.exe")
-        old_names = set(old_zip.namelist())
-        changed = [n for n in new_zip.namelist() if n != root + f"{NAME}.exe" and not n.endswith("/")
-                   and (n not in old_names or old_zip.read(n) != new_zip.read(n))]
-        extra = {n[len(root):]: new_zip.read(n) for n in changed}
+    old_sha = {name: hashlib.sha256(data).hexdigest() for name, data in old.items()}
+    new_sha = {name: hashlib.sha256(data).hexdigest() for name, data in new.items()}
+    changed = [name for name in new if old_sha.get(name) != new_sha[name]]
+    diffs, files = {}, {}
     with tempfile.TemporaryDirectory() as temp:
         temp = Path(temp)
-        (temp / "old.exe").write_bytes(old_exe)
-        (temp / "new.exe").write_bytes(new_exe)
-        subprocess.run([zstd, "-q", "-f", "-19", "--long=27", f"--patch-from={temp / 'old.exe'}",
-                        str(temp / "new.exe"), "-o", str(temp / "exe.zst")], check=True)
-        diff = (temp / "exe.zst").read_bytes()
+        for name in changed:
+            data = new[name]
+            if name in old and len(data) >= PATCH_DIFF_MIN:
+                (temp / "old").write_bytes(old[name])
+                (temp / "new").write_bytes(data)
+                subprocess.run([zstd, "-q", "-f", "-19", "--long=27", f"--patch-from={temp / 'old'}",
+                                str(temp / "new"), "-o", str(temp / "diff.zst")], check=True)
+                diff = (temp / "diff.zst").read_bytes()
+                if len(diff) < len(data):
+                    diffs[name] = diff
+                    continue
+            files[name] = data
     patch = Path(archive).parent / patch_name(old_tag, current)
-    manifest = dict(from_tag=old_tag, to_tag=current, from_sha256=hashlib.sha256(old_exe).hexdigest(),
-                    to_sha256=hashlib.sha256(new_exe).hexdigest())
+    manifest = dict(format=2, from_tag=old_tag, to_tag=current, old=old_sha, new=new_sha,
+                    diff=sorted(diffs), files=sorted(files))
     with zipfile.ZipFile(patch, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("manifest.json", json.dumps(manifest, indent=1))
-        zf.writestr("exe.zst", diff, compress_type=zipfile.ZIP_STORED)
-        for relative, data in extra.items():
-            zf.writestr(f"files/{relative}", data)
+        zf.writestr("manifest.json", json.dumps(manifest, indent=1, ensure_ascii=False))
+        for name, diff in diffs.items():
+            zf.writestr(f"diff/{name}.zst", diff, compress_type=zipfile.ZIP_STORED)
+        for name, data in files.items():
+            zf.writestr(f"files/{name}", data)
     size = patch.stat().st_size
     if size > archive.stat().st_size * PATCH_MAX_RATIO:
         patch.unlink()
         print(f"補丁({size / 1024 / 1024:.1f} MB)和完整版差不多大,不做補丁")
         return None
-    print(f"補丁:{patch}(從 {old_tag},{size / 1024 / 1024:.2f} MB;隨附檔案 {len(extra)} 個有改)")
+    removed = len(set(old) - set(new))
+    print(f"補丁:{patch}(從 {old_tag},{size / 1024 / 1024:.2f} MB;{len(diffs)} 個放差異、{len(files)} 個整個放、"
+          f"{removed} 個刪除)")
     return patch
 
 
@@ -213,6 +235,7 @@ def main():
     dist = ROOT / "dist"
     release = dist / "_new" / NAME       # 不放 dist/Naiz Studio:那份留給自己用更新功能換新版
     exe = release / f"{NAME}.exe"
+    built = ROOT / "build" / "onedir"    # PyInstaller 先輸出到這裡(預設會輸出到 dist/Naiz Studio)
     if exe.exists():
         # 先確認 exe 沒有在執行,免得打包好幾分鐘後才因為檔案被佔用而失敗
         try:
@@ -221,16 +244,27 @@ def main():
         except PermissionError:
             sys.exit(f"{exe} 正在執行，請先關閉再打包")
 
-    PyInstaller.__main__.run(pyinstaller_args(ROOT / "naiz_studio.py", NAME, version=VERSION))
+    args = pyinstaller_args(ROOT / "naiz_studio.py", NAME, version=VERSION)
+    PyInstaller.__main__.run(args + ["--distpath", str(built)])
 
+    from core.updater import CONTENTS
+
+    # 發布資料夾裡可能有自己試用時產生的設定和輸出,只換掉程式的部分
+    release.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(release / CONTENTS, ignore_errors=True)
+    # __pycache__:插件原始檔資料夾裡的快取,執行時會自己產生,不放進發布檔(補丁比對時也不會因為它對不上)
+    shutil.copytree(built / NAME / CONTENTS, release / CONTENTS, ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copy2(built / NAME / exe.name, exe)
     (release / "setting" / "images").mkdir(parents=True, exist_ok=True)
-    os.replace(dist / f"{NAME}.exe", exe)
     for source, relative in release_files():
         shutil.copy2(source, release / relative)
 
     archive = dist / (f"{NAME} {version}.zip" if version else f"{NAME}.zip")
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.write(exe, Path(NAME) / exe.name)
+        for path in sorted((release / CONTENTS).rglob("*")):
+            if path.is_file():
+                zf.write(path, Path(NAME) / path.relative_to(release))
         for _, relative in release_files():
             zf.write(release / relative, Path(NAME) / relative)
         zf.writestr(f"{NAME}/mods/", "")      # 空的擴充模組資料夾,下載的模組解壓縮到這裡

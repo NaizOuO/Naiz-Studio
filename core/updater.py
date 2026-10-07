@@ -1,11 +1,13 @@
-"""檢查更新:啟動時在背景問 GitHub 最新的 Release,有新版本就通知;使用者同意後下載 zip,把 exe 換成新版。
+"""檢查更新:啟動時在背景問 GitHub 最新的 Release,有新版本就通知;使用者同意後下載,關閉程式時換成新版。
 
 只讀取公開的 Release 資訊(不送出任何資料)。擴充模組的 Release 不會標成「最新」,不會被當成主程式的新版。
-正在執行的 exe 不能覆蓋,但可以改名:舊的改成 .old,新的放到原本的名字,下次開啟就是新版,.old 在啟動時清掉。
+v1.19.0 起程式是資料夾版(exe + _internal):執行中 _internal 的檔案在使用中不能換,
+所以新版先完整放在 update/new,關閉程式後由新版的 exe 把舊的換掉(finish),舊的改名成 .old 在下次開啟時清掉。
+(v1.18.6 以前的單一 exe 版會下載完整 zip,把 exe 和 _internal 一起放好,不用另外處理。)
 
 補丁:每個 Release 除了完整 zip,還附一個「從上一版升級」的補丁(打包時由 build.py 產生)。
-補丁裡是新舊 exe 的差異(zstd 格式,用舊 exe 當參考資料解開就是新 exe)與有改過的隨附檔案。
-落後好幾版時依序套用每一版的補丁;接不起來、太多版、加起來不划算,或 exe 和官方版本對不上時,改下載完整 zip。
+補丁裡是有改過的檔案:大檔案放新舊差異(zstd 格式,用舊檔當參考資料解開就是新檔),小檔案直接放新的。
+落後好幾版時依序套用每一版的補丁;接不起來、太多版、加起來不划算,或檔案和官方版本對不上時,改下載完整 zip。
 """
 
 import hashlib
@@ -19,7 +21,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-from . import files, paths, version
+from . import paths, version
 
 REPO = "NaizOuO/Naiz-Studio"
 LATEST_URL = f"https://api.github.com/repos/{REPO}/releases/latest"
@@ -127,21 +129,64 @@ class Checker:
         self.done = True
 
 
-# ------------------------------------------------------------ 下載並換成新版
+# ------------------------------------------------------------ 下載並準備新版
+
+CONTENTS = "_internal"          # 資料夾版的程式內容(PyInstaller 的 contents directory)
+SKIP_PARTS = {"__pycache__"}    # 執行時自己產生的快取,不算程式的檔案
+FINISH_FLAG = "--finish-update"
+MARKER = "finishing.pid"        # 換成新版的程式正在做事:這時開啟的程式不要清掉 update 資料夾
+
 
 def can_self_update():
     """只有 exe 版能自己換;從原始碼執行時改成打開下載頁面。"""
     return bool(getattr(sys, "frozen", False))
 
 
-def cleanup():
-    """上次更新留下的舊 exe 與暫存(新版啟動後舊的就沒在用了)。"""
-    for old in paths.APP_DIR.glob("*.exe.old"):
-        try:
-            old.unlink()
-        except OSError:
-            pass
-    shutil.rmtree(paths.APP_DIR / "update", ignore_errors=True)
+def _process_alive(pid):
+    if sys.platform != "win32" or not pid:
+        return False
+    import ctypes
+
+    kernel = ctypes.windll.kernel32
+    handle = kernel.OpenProcess(0x1000, False, int(pid))             # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        return bool(kernel.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259     # STILL_ACTIVE
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _wait_exit(pid, timeout):
+    deadline = time.monotonic() + timeout
+    while _process_alive(pid):
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.1)
+    return True
+
+
+def _finishing(folder):
+    try:
+        return _process_alive(int((Path(folder) / "update" / MARKER).read_text()))
+    except (OSError, ValueError):
+        return False
+
+
+def cleanup(folder=None):
+    """上次更新留下的舊程式與暫存(新版啟動後舊的就沒在用了);換新版的程式還在做事時先不動。"""
+    folder = Path(folder or paths.APP_DIR)
+    if _finishing(folder):
+        return
+    for pattern in ("*.exe.old", "*.exe.new"):
+        for old in folder.glob(pattern):
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    for name in (CONTENTS + ".old", CONTENTS + ".new", "update"):
+        shutil.rmtree(folder / name, ignore_errors=True)
 
 
 def refresh_icon(path):
@@ -156,14 +201,39 @@ def refresh_icon(path):
         pass
 
 
-class Updater:
-    """背景下載更新:state 是 downloading、installing(正在換檔案,幾秒內完成)、ready(已換好,重新開啟就是新版)、
-    cancelled(使用者取消)或 failed;progress 0～1。下載中隨時可以取消或關閉程式(下載到一半的檔案下次開啟時清掉);
-    換檔案的那幾秒不能中斷,關閉程式時會等它做完(wait_installed)。"""
+def _safe(relative):
+    parts = Path(relative).parts
+    return bool(relative) and ".." not in parts and not Path(relative).is_absolute() and ":" not in relative
 
-    def __init__(self, info, exe=None):
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _launch(args, cwd):
+    import os
+    import subprocess
+
+    # 打包後的 exe 開另一個 exe 時要重設 PyInstaller 的環境變數,不然新程式會以為自己是舊程式開出來的子程式
+    env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
+    subprocess.Popen([str(a) for a in args], cwd=str(cwd), close_fds=True, env=env)
+
+
+class Updater:
+    """背景下載更新:state 是 downloading、installing(在 update 資料夾準備新版)、ready(準備好了,關閉程式時換成新版)、
+    cancelled(使用者取消)或 failed;progress 0～1。
+    執行中 _internal 裡的檔案在使用中不能換:新版先完整放在 update/new,關閉程式後由新版的 exe 把舊的換掉(finish)。
+    準備好之前隨時可以取消或關閉程式,留下的暫存下次開啟時清掉。"""
+
+    def __init__(self, info, folder=None):
         self.info = info
-        self.exe = Path(exe or sys.executable)
+        self.folder = Path(folder or paths.APP_DIR)
+        self.work = self.folder / "update"
+        self.staged = self.work / "new"
         self.state = "downloading"
         self.progress = 0.0
         self.remaining = None           # 預估還要幾秒;剛開始下載還算不準時是 None
@@ -171,21 +241,14 @@ class Updater:
         self.patch_error = ""           # 補丁套用失敗、改下載完整版的原因
         self.message = ""
         self.cancel = threading.Event()
-        self._installed = threading.Event()
-        self._installed.set()
-        self._lock = threading.Lock()       # 取消和「開始換檔案」不會同時發生
+        self._lock = threading.Lock()       # 取消和「準備好了」不會同時發生
 
     def stop(self):
-        """取消下載:馬上算取消(網路很慢時,下載的那條線可能要等一下才收到,收到後自己清掉暫存);
-        換檔案開始後就不能取消,會照常做完。"""
+        """取消:馬上算取消(網路很慢時,下載的那條線可能要等一下才收到,收到後自己清掉暫存)。準備好以後就不能取消。"""
         with self._lock:
-            if self.state == "downloading":
+            if self.state in ("downloading", "installing"):
                 self.cancel.set()
                 self.state = "cancelled"
-
-    def wait_installed(self, timeout=30):
-        """關閉程式前呼叫:正在換檔案時等它做完,不會留下壞掉的 exe。"""
-        return self._installed.wait(timeout)
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -193,37 +256,45 @@ class Updater:
 
     def _run(self):
         try:
-            self._download_and_swap()
-            self.state = "ready"
+            self._download_and_stage()
+            with self._lock:
+                self._check_cancel()
+                self.state = "ready"
         except Exception as error:
             if self.cancel.is_set():
                 self.state = "cancelled"
             else:
                 self.message = str(error) or type(error).__name__
                 self.state = "failed"
-            shutil.rmtree(paths.APP_DIR / "update", ignore_errors=True)
-        finally:
-            self._installed.set()
+            shutil.rmtree(self.work, ignore_errors=True)
 
-    def _download_and_swap(self):
-        work = paths.APP_DIR / "update"
-        work.mkdir(parents=True, exist_ok=True)
+    def _check_cancel(self):
+        if self.cancel.is_set():
+            raise RuntimeError("已取消")
+
+    def _set_state(self, state):
+        with self._lock:
+            self._check_cancel()
+            self.state = state
+
+    def _download_and_stage(self):
+        self.work.mkdir(parents=True, exist_ok=True)
         patches = self.info.get("patches")
         if patches:
             try:
-                self.apply_patches([self._download(step, work / f"patch{i}.patch", patches)
+                self.apply_patches([self._download(step, self.work / f"patch{i}.patch", patches)
                                     for i, step in enumerate(patches)])
                 self.used_patch = True
                 return
             except Exception as error:
-                if self.cancel.is_set():
-                    raise
+                self._check_cancel()
                 self.patch_error = str(error) or type(error).__name__     # 改下載完整版
                 self.progress, self.remaining = 0.0, None
+                self._set_state("downloading")
         if not self.info.get("url"):
             raise RuntimeError("這個版本沒有可以下載的 zip")
         full = dict(url=self.info["url"], size=self.info.get("size", 0), sha256=self.info.get("sha256", ""))
-        self.apply(self._download(full, work / "update.zip", [full]))
+        self.apply(self._download(full, self.work / "update.zip", [full]))
 
     def _download(self, step, target, steps):
         """下載一個檔案並核對檢查碼;進度以 steps 全部的大小計算。"""
@@ -236,8 +307,7 @@ class Updater:
             received = 0
             started = time.monotonic()
             while True:
-                if self.cancel.is_set():
-                    raise RuntimeError("已取消")
+                self._check_cancel()
                 chunk = response.read1(1 << 16)      # 有多少先拿多少:網路很慢時也能很快發現被取消
                 if not chunk:
                     break
@@ -252,29 +322,10 @@ class Updater:
             raise RuntimeError("下載的檔案不完整(檢查碼不符)")
         return target
 
-    def apply_patches(self, patch_files):
-        """依序套用補丁:每一步先確認手上的 exe 正是補丁要的那一版,解開後再確認和官方新版一模一樣。"""
-        from compression import zstd
-
-        current = self.exe.read_bytes()
-        extra = {}
-        for patch in patch_files:
-            with zipfile.ZipFile(patch) as zf:
-                manifest = json.loads(zf.read("manifest.json"))
-                if hashlib.sha256(current).hexdigest() != manifest["from_sha256"]:
-                    raise RuntimeError("目前的程式和補丁對不上")
-                current = zstd.decompress(zf.read("exe.zst"),
-                                          zstd_dict=zstd.ZstdDict(current, is_raw=True).as_prefix,
-                                          options={zstd.DecompressionParameter.window_log_max: WINDOW_LOG_MAX})
-                if hashlib.sha256(current).hexdigest() != manifest["to_sha256"]:
-                    raise RuntimeError("套用補丁後的程式和官方版本不同")
-                for name in zf.namelist():
-                    if name.startswith("files/") and not name.endswith("/"):
-                        extra[name[len("files/"):]] = zf.read(name)     # 後面版本的同名檔案蓋過前面的
-        self._install(current, extra)
-
     def apply(self, archive):
-        """從完整 zip 取出新的 exe 與隨附檔案。"""
+        """完整 zip 裡發布資料夾的檔案解壓到 update/new(不安全的路徑略過)。"""
+        self._set_state("installing")
+        shutil.rmtree(self.staged, ignore_errors=True)
         with zipfile.ZipFile(archive) as zf:
             names = zf.namelist()
             exe_name = next((n for n in names if n.lower().endswith(f"/{APP_NAME.lower()}.exe")
@@ -282,30 +333,190 @@ class Updater:
             if exe_name is None:
                 raise RuntimeError("更新檔裡沒有程式")
             root = exe_name[:-len(Path(exe_name).name)]
-            extra = {name[len(root):]: zf.read(name) for name in names
-                     if name.startswith(root) and name != exe_name and not name.endswith("/")}
-            self._install(zf.read(exe_name), extra)
+            for name in names:
+                relative = name[len(root):]
+                if not name.startswith(root) or name.endswith("/") or not _safe(relative):
+                    continue
+                self._check_cancel()
+                target = self.staged / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(name) as source, open(target, "wb") as out:
+                    shutil.copyfileobj(source, out, 1 << 20)
+        if not (self.staged / CONTENTS).is_dir():
+            raise RuntimeError("更新檔裡沒有程式內容(_internal)")
 
-    def _install(self, exe_data, extra):
-        """寫入新的 exe 與隨附檔案:exe 用改名的方式替換,其他檔案直接覆蓋;不安全的路徑略過。"""
-        with self._lock:
-            if self.cancel.is_set():
-                raise RuntimeError("已取消")
-            self._installed.clear()         # 從這裡開始不能中斷(關閉程式時會等)
-            self.state = "installing"
-        folder = self.exe.parent
-        new_exe = folder / (self.exe.name + ".new")
-        new_exe.write_bytes(exe_data)
-        for relative, data in extra.items():
-            parts = Path(relative).parts
-            if not relative or ".." in parts or Path(relative).is_absolute() or ":" in relative:
-                continue
-            target = folder / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            files.write_bytes(target, data)
-        old = folder / (self.exe.name + ".old")
-        if old.exists():
-            old.unlink()
-        self.exe.rename(old)                # 正在執行的 exe 可以改名,不能覆蓋
-        new_exe.rename(self.exe)
-        refresh_icon(self.exe)
+    def apply_patches(self, patch_files):
+        """依序套用補丁:先把目前的程式複製到 update/new,每一步改有變的檔案(差異或整個檔案)、刪掉不要的,
+        最後確認每個檔案都和官方新版一模一樣。目前的程式被改過或缺檔案時對不上,改下載完整版。"""
+        from compression import zstd
+
+        self._set_state("installing")
+        shutil.rmtree(self.staged, ignore_errors=True)
+        manifests = []
+        for patch in patch_files:
+            with zipfile.ZipFile(patch) as zf:
+                manifests.append(json.loads(zf.read("manifest.json")))
+        if any(m.get("format") != 2 for m in manifests):
+            raise RuntimeError("補丁格式不對")
+        for relative in manifests[0]["old"]:
+            source = self.folder / relative
+            if _safe(relative) and source.is_file():
+                self._check_cancel()
+                target = self.staged / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
+        for patch, manifest in zip(patch_files, manifests):
+            with zipfile.ZipFile(patch) as zf:
+                for relative in manifest["diff"]:
+                    self._check_cancel()
+                    target = self.staged / relative
+                    if not target.is_file() or file_sha256(target) != manifest["old"][relative]:
+                        raise RuntimeError(f"目前的程式和補丁對不上({relative})")
+                    data = zstd.decompress(zf.read(f"diff/{relative}.zst"),
+                                           zstd_dict=zstd.ZstdDict(target.read_bytes(), is_raw=True).as_prefix,
+                                           options={zstd.DecompressionParameter.window_log_max: WINDOW_LOG_MAX})
+                    target.write_bytes(data)
+                for relative in manifest["files"]:
+                    self._check_cancel()
+                    if not _safe(relative):
+                        continue
+                    target = self.staged / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(zf.read(f"files/{relative}"))
+            for relative in set(manifest["old"]) - set(manifest["new"]):
+                if _safe(relative):
+                    (self.staged / relative).unlink(missing_ok=True)
+        for relative, digest in manifests[-1]["new"].items():
+            self._check_cancel()
+            target = self.staged / relative
+            if not target.is_file() or file_sha256(target) != digest:
+                raise RuntimeError(f"套用補丁後和官方版本不同({relative})")
+
+    def finish(self, relaunch):
+        """關閉程式時呼叫:開 update/new 裡的新版 exe,等這個程式結束後把舊的換掉(relaunch 時換好再打開)。
+        開不起來時回傳 False(程式維持舊版,下次開啟可以再更新)。"""
+        if self.state != "ready":
+            return False
+        import os
+
+        try:
+            _launch([self.staged / f"{APP_NAME}.exe", FINISH_FLAG, self.folder, os.getpid(), int(bool(relaunch))],
+                    self.staged)
+            return True
+        except OSError:
+            return False
+
+
+# ------------------------------------------------------------ 換成新版(在 update/new 的新版 exe 裡執行)
+
+SWAP_WAIT = 30          # 舊程式關掉後,檔案還被佔用(例如字幕視窗還沒關)時最多再等這麼久
+
+
+def _retry(action, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return action()
+        except OSError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.3)
+
+
+def finish(staged, target, pid, relaunch, wait=SWAP_WAIT, launch=_launch, alert=None):
+    """把 target(安裝的資料夾)換成 staged(update/new)裡的新版:
+    1. 舊程式還在關的時候,先複製成 _internal.new、exe.new(最花時間的一步,舊版完全沒動到)
+    2. 等舊程式結束,用改名換上:_internal → _internal.old、_internal.new → _internal,exe 也一樣;換到一半失敗就改回去
+    3. 其他隨附檔案(圖示、說明、授權)直接覆蓋,清掉 .old;relaunch 時打開新版
+    失敗時程式維持舊版,用 alert 告知。回傳 True/False。"""
+    import os
+
+    staged, target = Path(staged), Path(target)
+    marker = target / "update" / MARKER
+    exe = target / f"{APP_NAME}.exe"
+    contents = target / CONTENTS
+    new_contents, old_contents = target / (CONTENTS + ".new"), target / (CONTENTS + ".old")
+    new_exe, old_exe = target / (exe.name + ".new"), target / (exe.name + ".old")
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(str(os.getpid()))
+    except OSError:
+        pass
+    ok, reason = False, ""
+    try:
+        shutil.rmtree(new_contents, ignore_errors=True)
+        shutil.copytree(staged / CONTENTS, new_contents, ignore=shutil.ignore_patterns(*SKIP_PARTS))
+        shutil.copyfile(staged / exe.name, new_exe)
+        if not _wait_exit(pid, wait + 30):
+            raise RuntimeError("舊的程式一直沒有關閉")
+        shutil.rmtree(old_contents, ignore_errors=True)
+        if old_contents.exists():
+            raise RuntimeError(f"{old_contents.name} 刪不掉")
+        if contents.exists():
+            _retry(lambda: contents.rename(old_contents), wait)
+        try:
+            new_contents.rename(contents)
+            if exe.exists():
+                old_exe.unlink(missing_ok=True)
+                _retry(lambda: exe.rename(old_exe), wait)
+            try:
+                new_exe.rename(exe)
+            except OSError:
+                if old_exe.exists() and not exe.exists():
+                    old_exe.rename(exe)
+                raise
+        except OSError:
+            if old_contents.exists():
+                if contents.exists():
+                    contents.rename(new_contents)
+                old_contents.rename(contents)
+            raise
+        ok = True
+        for path in staged.rglob("*"):         # 圖示、說明、授權:失敗也不影響程式
+            relative = path.relative_to(staged)
+            if path.is_file() and relative.parts[0] not in (CONTENTS, exe.name, "mods") \
+                    and not SKIP_PARTS & set(relative.parts):
+                try:
+                    (target / relative).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(path, target / relative)
+                except OSError:
+                    pass
+        shutil.rmtree(old_contents, ignore_errors=True)
+        try:
+            old_exe.unlink(missing_ok=True)
+        except OSError:
+            pass
+        refresh_icon(exe)
+    except Exception as error:
+        reason = str(error) or type(error).__name__
+        shutil.rmtree(new_contents, ignore_errors=True)
+        try:
+            new_exe.unlink(missing_ok=True)
+        except OSError:
+            pass
+    try:
+        marker.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if not ok and alert is not None:
+        alert(f"沒辦法換成新版：{reason}\n\n程式還是舊版，可以照常使用，下次開啟時可以再更新。")
+    if relaunch and exe.exists():
+        try:
+            launch([exe], target)
+        except OSError:
+            pass
+    return ok
+
+
+def finish_main(argv):
+    """exe 以「--finish-update 安裝資料夾 舊程式的pid 要不要打開(1/0)」啟動時執行。"""
+    def alert(text):
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(0, text, "Naiz Studio 更新", 0x30)
+        except Exception:
+            pass
+
+    target, pid, relaunch = Path(argv[0]), int(argv[1]), argv[2] == "1"
+    return finish(Path(sys.executable).resolve().parent, target, pid, relaunch, alert=alert)

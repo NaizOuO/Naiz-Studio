@@ -567,7 +567,8 @@ class App:
             self.update_job = None          # 取消了:標題旁回到「有新版本」,想更新時再點
         if job is not None and job.state == "ready" and not getattr(job, "announced", False):
             job.announced = True
-            self.dialog.open("新版本已經下載好", [f"已經換成 {self.update_info['tag']}，重新開啟程式就是新版。"],
+            self.dialog.open("新版本已經下載好", [f"{self.update_info['tag']} 已經準備好。",
+                                                 "按「重新開啟」馬上換成新版；選「稍後」的話，關閉程式時會自動換好。"],
                              [("later", "稍後", False), ("restart", "重新開啟", True)],
                              lambda key, _: key == "restart" and self.restart_for_update())
 
@@ -628,7 +629,7 @@ class App:
                 left = "不到 1 分鐘" if left < 60 else f"約 {int(left // 60) + 1} 分鐘"
                 return f"下載更新 {int(job.progress * 100)}%，還要{left}", theme.ACCENT
             if job.state == "installing":
-                return "正在換成新版…", theme.ACCENT
+                return "正在準備新版…", theme.ACCENT
             if job.state == "cancelled":
                 return None
             if job.state == "ready":
@@ -816,19 +817,18 @@ class App:
                 self.draw_frame(mouse_pos)
                 pygame.display.flip()
             self.clock.tick(rate or 5)
-        if self.update_job is not None:
-            self.update_job.wait_installed()     # 正在換成新版的那幾秒:做完再結束,不會留下壞掉的程式
         pygame.quit()
-        if self.relaunch:
-            import subprocess
-
-            # 打包後的 exe 由自己開新的 exe 時要重設 PyInstaller 的環境變數,
-            # 不然新程式會以為自己是舊程式解壓縮出來的子程式,跳出「parent process has different executable」
-            env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
-            subprocess.Popen([sys.executable], cwd=str(paths.APP_DIR), close_fds=True, env=env)
+        job = self.update_job
+        # 新版準備好了:關掉後由新版把舊的換掉(按「重新開啟」的話換好再打開);開不起來就維持舊版
+        if not (job is not None and job.finish(self.relaunch)) and self.relaunch:
+            updater._launch([sys.executable], paths.APP_DIR)
 
 
 def main():
+    # 更新:update 資料夾裡的新版程式,等舊程式關掉後換上去
+    if len(sys.argv) > 4 and sys.argv[1] == updater.FINISH_FLAG:
+        updater.finish_main(sys.argv[2:])
+        return
     # 即時字幕的字幕視窗:另一個程式,只開字幕,不載入整個 Naiz Studio
     if len(sys.argv) > 3 and sys.argv[1] == "--subtitle-overlay":
         from plugins.subtitle.overlay import run as run_overlay
