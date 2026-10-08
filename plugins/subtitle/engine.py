@@ -497,7 +497,7 @@ class Engine:
             if self.server is None:
                 self.message = "載入辨識模型" + ("（第一次用顯示卡約需 30 秒）" if asr.gpu() else "")
                 self.on_update()
-                self.server = asr.Server(s.model)
+                self.server = asr.make_server(s.model, s.source, s.pid, self.notice)
                 self.server.start(cancel=self._stop)
             if s.translate:
                 self.message = "載入翻譯模型"
@@ -868,7 +868,7 @@ class Engine:
         parts = [ZH_PROMPT] if language == "zh" else []
         if s.verbatim and language in SPOKEN_PROMPTS:
             parts.append(SPOKEN_PROMPTS[language])
-        if s.model in asr.NO_PUNCTUATION:
+        if s.model in asr.NO_STYLE:
             parts = []          # 中文(台灣)本來就繁體、不會照提示加標點;實測不給提示錯字略少(專有名詞照給)
         terms = names.prompt(s.glossary)
         if terms:
@@ -1306,13 +1306,15 @@ class Engine:
                 try:
                     if restart_source:
                         self._restart_capture()
+                        if hasattr(self.server, "set_source"):      # 中文(自動):換了來源要重新看是不是在通話
+                            self.server.set_source(s.source, s.pid)
                     if restart_model:
                         self.message = "載入新的辨識模型"
                         self.on_update()
                         old, self.server = self.server, None
                         if old is not None:
                             old.stop()                  # 先關舊的,顯示卡才放得下新的
-                        server = asr.Server(s.model)
+                        server = asr.make_server(s.model, s.source, s.pid, self.notice)
                         server.start(cancel=self._stop)
                         if self._stop.is_set():
                             server.stop()               # 載入時使用者按了停止:不留下沒人管的辨識程式
@@ -1400,6 +1402,8 @@ class SharedServer:
         while True:
             server = self._owner.server
             if server is not None and not self._owner._paused.is_set():
+                if getattr(server, "auto", False):
+                    kwargs["track"] = "mic"            # 中文(自動):麥克風(使用者自己)一律用中文(台灣)
                 return server.transcribe(*args, **kwargs)
             if self._stop.is_set() or self._owner.state in ("error", "stopped"):
                 raise RuntimeError("字幕已停止")

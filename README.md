@@ -94,7 +94,11 @@
   - 自訂 OBS 外觀：把 .css 檔放進 `setting\subtitle_obs` 選用（資料夾裡有範例和可以用的名稱），字型、顏色、動畫、每個人的配色都能自己設計，存檔後馬上更新
   - 只用 OBS 時可以關掉螢幕上的字幕視窗，直播畫面才不會有兩份字幕
 - 字幕紀錄自動存在 `output\subtitles`，可以選存成 SRT、TXT、兩者，或不存檔
-- 辨識模型五種（快速、輕量、推薦、最準確、中文（台灣））；「中文（台灣）」是聯發科的 Breeze ASR 25，台灣口語、中英混用錯字較少，從官方下載後在本地轉換格式（下載約 3.1 GB，轉換後約 1.1 GB），需要顯示卡；翻譯在本地執行，已安裝 [Ollama](https://ollama.com) 就用 Ollama，沒有的話用內建的翻譯引擎（llama.cpp），模型從網路下載。程式會依電腦配備先選好建議的組合，所有選項都可以自己換
+- 辨識模型七種（快速、輕量、推薦、最準確、中文（台灣）、中文（通話）、中文（自動））：
+  - 「中文（台灣）」是聯發科的 Breeze ASR 25，台灣口語、中英混用錯字較少，從官方下載後在本地轉換格式（下載約 3.1 GB，轉換後約 1.1 GB），需要 NVIDIA 顯示卡；這個模型不會輸出標點，用中文標點模型補上
+  - 「中文（通話）」是阿里巴巴的 Qwen3-ASR（1.7B），Discord 等通話、多人聊天比較準，用內建的翻譯引擎（llama.cpp）執行，NVIDIA、AMD、Intel 顯示卡都能用
+  - 「中文（自動）」：Discord、LINE、Teams 這類通話程式正在發出聲音（或「單一程式」選的是它們）時用「中文（通話）」，其他時候用「中文（台灣）」，字幕進行中也會跟著換、並記在字幕紀錄裡；同時聽的麥克風（自己的聲音）一律用「中文（台灣）」。實測比只用其中一個準（實驗紀錄另外整理）
+  翻譯在本地執行，已安裝 [Ollama](https://ollama.com) 就用 Ollama，沒有的話用內建的翻譯引擎（llama.cpp），模型從網路下載。程式會依電腦配備先選好建議的組合，所有選項都可以自己換
 - 翻譯模型在「翻譯模型」視窗裡管理：每個模型都寫出說明、大小和需要的顯示卡記憶體，可以下載、選用、刪除；有給高階電腦用的大模型（需要約 20 GB 以上的顯示卡記憶體），配備不夠時下載前會先提醒。用內建翻譯引擎時，第一次下載會連同引擎（約 32 MB）一起下載，下載前會先說明
 - 全部在本地運算，聲音不會上傳；字幕只能從 Naiz Studio 停止，關掉 Naiz Studio 字幕也會一起關
 - 「獨佔全螢幕」的遊戲蓋不上任何視窗，請在遊戲設定改成「無邊框視窗」
@@ -193,6 +197,8 @@ python naiz_studio.py
 | 去背模型（一般） | 去背的「一般」，速度快 | 約 109 MB | 約 109 MB |
 | 去背模型（精細） | 去背的「精細」，頭髮、毛邊更準 | 約 467 MB | 約 467 MB |
 | 日文讀音字典（IPADIC） | 即時字幕：日文漢字上方標讀音（振假名） | 約 13 MB | 約 51 MB |
+| 辨識模型「中文（通話）」 | 即時字幕：Qwen3-ASR，通話、多人聊天的中文辨識 | 約 2.5 GB | 約 2.5 GB |
+| 中文標點模型 | 即時字幕：幫「中文（台灣）」補上標點 | 約 65 MB | 約 76 MB |
 
 辨識模型只需要下載用到的那一個。
 
@@ -310,6 +316,10 @@ TOOLS = [HelloTool]
 
 輸出時不會覆蓋原檔，同名時會自動加上編號。
 
+## 贊助
+
+覺得好用的話，可以到 [歐付寶贊助頁](https://payment.opay.tw/Broadcaster/Donate/2B41AE35B91845324050202E1F617E4E) 請我喝杯咖啡（首頁右上角的文字也能點）。
+
 ## 授權
 
 - **原始碼**：以 [MIT 授權](LICENSE) 釋出。可以自由使用、修改、再散佈（包含商業用途），只需要保留版權聲明與授權文字。
@@ -349,7 +359,9 @@ TOOLS = [HelloTool]
 | [fugashi](https://github.com/polm/fugashi)（[MeCab](https://taku910.github.io/mecab/)） | 即時字幕的日文斷詞（振假名） | MIT / BSD-3-Clause |
 | [IPADIC](https://pypi.org/project/ipadic/)（奈良先端科學技術大學院大學） | 即時字幕振假名用的日文讀音字典 | IPADIC 授權（允許自由使用與散布，須保留版權聲明） |
 | [Ollama](https://github.com/ollama/ollama)（使用者自行安裝） | 即時字幕的本地翻譯（有安裝時使用）；翻譯模型由 Ollama 下載 | MIT |
-| [llama.cpp](https://github.com/ggml-org/llama.cpp) | 即時字幕的內建翻譯引擎（沒有 Ollama 時使用） | MIT |
+| [llama.cpp](https://github.com/ggml-org/llama.cpp) | 即時字幕的內建翻譯引擎（沒有 Ollama 時使用）、「中文（通話）」辨識 | MIT |
+| [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR)（阿里巴巴 Qwen 團隊；[ggml-org 轉的 GGUF](https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF)） | 即時字幕「中文（通話）」辨識模型 | Apache-2.0 |
+| [CT-Transformer 中英文標點模型](https://github.com/modelscope/FunASR)（阿里巴巴 FunASR；[sherpa-onnx 轉的 int8 版](https://github.com/k2-fsa/sherpa-onnx/releases/tag/punctuation-models)） | 即時字幕「中文（台灣）」補標點 | FunASR 模型授權（可使用、修改、分享，須註明出處與作者、保留模型名稱） |
 | [Qwen3](https://huggingface.co/Qwen)（Qwen 官方的 GGUF 檔） | 翻譯模型 | Apache-2.0 |
 | [TranslateGemma](https://huggingface.co/google/translategemma-4b-it)（[mradermacher](https://huggingface.co/mradermacher) 轉換的 GGUF 檔） | 翻譯模型 | [Gemma 使用條款](https://ai.google.dev/gemma/terms) |
 | [Noto 字型](https://github.com/notofonts/noto-cjk)（[Google Fonts](https://github.com/google/fonts)） | 字型包：Noto Sans / Serif TC、SC，Noto Sans Mono | OFL-1.1 |

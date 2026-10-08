@@ -23,7 +23,7 @@ import wave
 
 from core import deps, paths, transcribe, whisper_convert
 
-from . import vad
+from . import punct, vad
 
 _BROKEN = re.compile(r"\ufffd+\s*")
 
@@ -93,8 +93,9 @@ BREEZE = deps.Dependency(
     build=_build_breeze,
     install_size=4_300_000_000,
 )
-NO_PUNCTUATION = {"breeze"}     # 這些模型不輸出標點,要自己補
-ZH_ONLY = {"breeze"}            # 這些模型只辨識中文(中英混用的英文會照留):不管選什麼語言都當成中文
+NO_PUNCTUATION = {"breeze"}     # 這些模型不輸出標點,要自己補(有標點模型時用模型補,沒有時用停頓補)
+ZH_ONLY = {"breeze", "qwen3", "zh-auto"}    # 只辨識中文(中英混用的英文會照留):不管選什麼語言都當成中文
+NO_STYLE = {"breeze", "qwen3", "zh-auto"}   # 不給「繁體、有標點、口語」的提示(實測給了反而略差;專有名詞照給)
 PAUSE = 0.35                    # 分段之間停頓這麼久以上補句號,不然補逗號
 SENTENCE_CHARS = 14             # 這句(上一個句號之後)已經這麼多字:下一個分段處就補句號(不然很少停頓夠久,一行會拖到十幾秒)
 _ENDS = "，。？！、,.?!…：；"
@@ -118,13 +119,60 @@ def punctuate(segments, words):
             since = 0
         out.append((start, end, text + mark))
     return out
+# 阿里巴巴 Qwen3-ASR 1.7B(Apache-2.0):用程式內建的 llama.cpp(翻譯引擎同一個)執行,NVIDIA/AMD/Intel 顯示卡都能用。
+# 2026-10-08 實測(使用者的 Discord 通話,使用者逐句標註):錯字率 推薦 45.4%、中文(台灣) 51.9%、Qwen3 39.1%;
+# 乾淨的談話節目、Podcast 則是中文(台灣)較準。沒有每個字的時間(一句裡不會再切開)。
+_QWEN = "https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF/resolve/36a678687ba7d07a74ca70ccb0e36902e005fb80"
+QWEN_MODEL = "Qwen3-ASR-1.7B-Q8_0.gguf"
+QWEN_MMPROJ = "mmproj-Qwen3-ASR-1.7B-Q8_0.gguf"        # 聲音編碼器
+
+
+def _build_qwen(folder, target, progress, cancel):
+    """兩個檔案都下載好、驗證過:直接搬到 models\\qwen3-asr(不複製,硬碟只要一份的空間)。"""
+    os.replace(folder / QWEN_MODEL, target)
+    os.replace(folder / QWEN_MMPROJ, target.with_name(QWEN_MMPROJ))
+    progress(1, 1)
+    return True
+
+
+QWEN = deps.Dependency(
+    id="asr-qwen3",
+    name="辨識模型（中文通話）",
+    purpose="阿里巴巴 Qwen3-ASR，Discord 等通話的中文辨識較準；用內建的翻譯引擎（llama.cpp）執行",
+    size_text="約 2.5 GB",
+    url=f"{_QWEN}/{QWEN_MODEL}",
+    files={f"qwen3-asr/{QWEN_MODEL}": None, f"qwen3-asr/{QWEN_MMPROJ}": None},
+    location="models",
+    parts=((QWEN_MODEL, f"{_QWEN}/{QWEN_MODEL}", 2165034944,
+            "58e22d0532d4eacaf034cfac17a6fed159f37c41390c710186783be439d1fc57"),
+           (QWEN_MMPROJ, f"{_QWEN}/{QWEN_MMPROJ}", 355709344,
+            "46c1d533af3f354ceb37ce855dbceff7da7fa7cf1e6a523df3b13440bd164c0d")),
+    build=_build_qwen,
+    install_size=2_520_744_288,
+)
+
+
+class _Bundle:
+    """「中文(自動)」要的兩個模型:清單上顯示合計大小、兩個都裝好才算裝好。"""
+
+    def __init__(self, parts, size_text):
+        self.parts = parts
+        self.size_text = size_text
+
+    def installed(self):
+        return all(part.installed() for part in self.parts)
+
+
 # (代號, 名稱, 模型, 說明)
 MODELS = [
     ("base", "快速", transcribe.MODELS["base"], "最省資源；錯字較多，日文、中文尤其明顯"),
     ("small", "輕量", SMALL, "沒有獨立顯示卡也能即時；比快速準"),
     ("turbo", "推薦", transcribe.MODELS["turbo"], "準確又快，有 NVIDIA 顯示卡時選這個"),
     ("large", "最準確", transcribe.MODELS["large"], "錯字最少；需要約 3.5 GB 顯示卡記憶體"),
-    ("breeze", "中文（台灣）", BREEZE, "台灣口語、中英混用錯字較少；只辨識中文，需要顯示卡"),
+    ("breeze", "中文（台灣）", BREEZE, "台灣口語、中英混用錯字較少；只辨識中文，需要 NVIDIA 顯示卡"),
+    ("qwen3", "中文（通話）", QWEN, "Discord 等通話、多人聊天較準；只辨識中文，需要顯示卡"),
+    ("zh-auto", "中文（自動）", _Bundle((BREEZE, QWEN), "約 5.6 GB"),
+     "通話時用「中文（通話）」，其他時候用「中文（台灣）」；兩個模型都要下載"),
 ]
 MODEL_NAMES = {key: name for key, name, _, _ in MODELS}
 MODEL_FILES = {key: dep for key, _, dep, _ in MODELS}
@@ -141,9 +189,23 @@ def gpu():
     return transcribe.has_nvidia()
 
 
+def model_deps(model_key):
+    """這個辨識模型要的元件(還沒算人聲偵測)。"""
+    from . import llm
+
+    whisper = [transcribe.engine()]
+    if model_key == "qwen3":
+        return [llm.ENGINE, QWEN]
+    if model_key == "zh-auto":
+        return whisper + [BREEZE, punct.PUNCT, llm.ENGINE, QWEN]
+    if model_key in NO_PUNCTUATION:
+        return whisper + [MODEL_FILES[model_key], punct.PUNCT]
+    return whisper + [MODEL_FILES[model_key]]
+
+
 def required(model_key):
-    needed = [transcribe.engine(), MODEL_FILES[model_key], *vad.DEPS]
-    return [dep for dep in needed if not dep.installed()]
+    needed = {dep.id: dep for dep in (*model_deps(model_key), *vad.DEPS)}       # 同一個元件只列一次
+    return [dep for dep in needed.values() if not dep.installed()]
 
 
 def _free_port():
@@ -277,7 +339,9 @@ class Server:
             segment["text"] = _repair(segment.get("text", ""))
         if self.model_key in NO_PUNCTUATION and segments:
             words = [(w.get("start", 0), w.get("end", 0), w.get("word", "")) for s in segments for w in (s.get("words") or [])]
-            marked = punctuate([(s.get("start"), s.get("end"), s["text"]) for s in segments], words)
+            pieces = [(s.get("start"), s.get("end"), s["text"]) for s in segments]
+            # 有標點模型就用模型補(盲測好讀很多);沒有時才用停頓猜
+            marked = punct.punctuate_segments(pieces) if punct.available() else punctuate(pieces, words)
             for segment, (_, _, text) in zip(segments, marked):
                 segment["text"] = text
         text = "".join(segment.get("text", "") for segment in segments).strip() or _repair(result.get("text", "")).strip()
@@ -300,3 +364,189 @@ class Server:
                      "languages": {WHISPER_NAMES.get(code, code): p
                                    for code, p in (result.get("language_probabilities") or {}).items()}}
         return text, detected, silence
+
+
+# ------------------------------------------------------------ Qwen3-ASR 與「中文(自動)」
+
+class QwenServer:
+    """Qwen3-ASR(llama.cpp 的 llama-server 載入模型和聲音編碼器);介面和 Server 一樣。
+    回答的開頭固定先寫好「language Chinese<asr_text>」(指定中文:不指定時偶爾把國語寫成粵語)。
+    沒有分段時間和每個字的時間:整段當一段。"""
+
+    def __init__(self, model_key="qwen3"):
+        self.model_key = model_key
+        self.port = None
+        self.proc = None
+        self._lock = threading.Lock()
+        self._local = threading.local()
+
+    @property
+    def last(self):
+        return getattr(self._local, "last", None) or {"segments": [], "confidence": 0.0, "languages": {}}
+
+    @last.setter
+    def last(self, value):
+        self._local.last = value
+
+    @property
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self, cancel=None, timeout=180):
+        from . import llm
+
+        exe = llm.ENGINE.path()
+        model = QWEN.path()
+        if not exe.is_file() or not QWEN.installed():
+            raise RuntimeError("「中文（通話）」辨識模型還沒下載完整，請重新下載")
+        self.port = _free_port()
+        args = [exe, "-m", model, "--mmproj", model.with_name(QWEN_MMPROJ), "--host", "127.0.0.1",
+                "--port", self.port, "-c", 4096, "-np", 1, "--no-webui"]
+        self.proc = deps.popen([str(a) for a in args], cwd=paths.MODELS_DIR,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        transcribe._active.add(self.proc)          # 關閉 Naiz Studio 時一併結束
+        end = time.time() + timeout
+        while time.time() < end:
+            if cancel is not None and cancel.is_set():
+                self.stop()
+                raise deps.Cancelled()
+            if self.proc.poll() is not None:
+                self.stop()
+                raise RuntimeError("「中文（通話）」辨識模型無法啟動（可能是顯示卡記憶體不夠）")
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/health", timeout=1) as response:
+                    if json.load(response).get("status") == "ok":
+                        self.transcribe(b"\x00\x00" * RATE)      # 暖身:第一次辨識比較慢
+                        return
+            except (urllib.error.URLError, OSError, ValueError):
+                pass
+            time.sleep(0.3)
+        self.stop()
+        raise RuntimeError("「中文（通話）」辨識模型載入太久")
+
+    def stop(self):
+        if self.proc is not None:
+            deps.kill_tree(self.proc)
+            transcribe._active.discard(self.proc)
+            self.proc = None
+
+    def transcribe(self, pcm, language="auto", prompt=""):
+        import base64
+
+        pcm = pcm[-MAX_SECONDS * RATE * 2:]
+        messages = [{"role": "user", "content": [{"type": "input_audio", "input_audio": {
+            "data": base64.b64encode(_wav(pcm)).decode(), "format": "wav"}}]},
+            {"role": "assistant", "content": "language Chinese<asr_text>"}]
+        body = json.dumps({"messages": messages, "temperature": 0, "max_tokens": 400}).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/chat/completions", body,
+                                         {"Content-Type": "application/json"})
+        with self._lock:                            # 一次辨識一段
+            with urllib.request.urlopen(request, timeout=60) as response:
+                answer = json.load(response)
+        content = answer["choices"][0]["message"]["content"]
+        text = (content.split("<asr_text>", 1)[1] if "<asr_text>" in content else content).strip()
+        seconds = len(pcm) / 2 / RATE
+        self.last = {"segments": [(0.0, seconds, text)] if text else [], "confidence": -0.2,
+                     "languages": {"zh": 1.0}, "words": []}
+        return text, "zh", 0.0
+
+
+AUTO_CHECK = 5.0        # 「中文(自動)」每隔幾秒看一次是不是在通話
+
+
+class AutoServer:
+    """「中文(自動)」:兩個辨識程式都常駐(切換不用等載入),
+    聲音來源是通話時用 Qwen3(中文(通話)),其他用 Breeze(中文(台灣))。
+    通話的判斷:單一程式選的是 Discord、LINE、Teams 這類通話軟體;電腦播放的聲音時,這類程式正在發出聲音;
+    麥克風(包括同時聽的麥克風,也就是使用者自己的聲音)一律用 Breeze。
+    on_switch(說明) 在字幕進行中換了模型時呼叫(字幕紀錄記一行)。"""
+
+    auto = True
+
+    def __init__(self, model_key="zh-auto", source="system", pid=None, on_switch=None, detect=None):
+        self.model_key = model_key
+        self.source, self.pid = source, pid
+        self.on_switch = on_switch
+        self._detect = detect               # 測試用:取代真的通話偵測
+        self.breeze = Server("breeze")
+        self.qwen = QwenServer("qwen3")
+        self.call = False
+        self._local = threading.local()
+        self._stop = threading.Event()
+
+    @property
+    def last(self):
+        server = getattr(self._local, "server", None) or self.breeze
+        return server.last
+
+    @property
+    def alive(self):
+        return self.breeze.alive and self.qwen.alive
+
+    def start(self, cancel=None, timeout=180):
+        self.breeze.start(cancel=cancel, timeout=timeout)
+        try:
+            self.qwen.start(cancel=cancel, timeout=timeout)
+        except BaseException:
+            self.breeze.stop()
+            raise
+        self.call = self._is_call()
+        if self.on_switch is not None:      # 字幕紀錄記一行:一開始用哪個
+            self.on_switch("中文（自動）：" + ("偵測到通話，用「中文（通話）」" if self.call else "用「中文（台灣）」"))
+        threading.Thread(target=self._watch, daemon=True).start()
+
+    def stop(self):
+        self._stop.set()
+        self.breeze.stop()
+        self.qwen.stop()
+
+    def set_source(self, source, pid):
+        self.source, self.pid = source, pid
+        self._update()
+
+    def _is_call(self):
+        if self._detect is not None:
+            return bool(self._detect(self.source, self.pid))
+        from . import capture
+
+        try:
+            if self.source == "app":
+                return capture.is_call_program(self.pid)
+            if self.source == "system":
+                return capture.call_playing()
+        except Exception:
+            return self.call
+        return False
+
+    def _update(self):
+        call = self._is_call()
+        if call != self.call:
+            self.call = call
+            if self.on_switch is not None:
+                self.on_switch("中文（自動）：" + ("偵測到通話，改用「中文（通話）」" if call
+                                                else "沒有在通話，改用「中文（台灣）」"))
+
+    def _watch(self):
+        from . import capture
+
+        capture._init_thread()              # 查程式的聲音狀態要用 COM
+        while not self._stop.wait(AUTO_CHECK):
+            self._update()
+
+    def current(self, track=""):
+        """這一段要用哪個:麥克風那邊(使用者自己)一律 Breeze。"""
+        return self.qwen if self.call and track != "mic" else self.breeze
+
+    def transcribe(self, pcm, language="auto", prompt="", track=""):
+        server = self.current(track)
+        self._local.server = server
+        return server.transcribe(pcm, language, prompt)
+
+
+def make_server(model_key, source="system", pid=None, on_switch=None):
+    """依辨識模型建立辨識程式(還沒 start)。"""
+    if model_key == "qwen3":
+        return QwenServer(model_key)
+    if model_key == "zh-auto":
+        return AutoServer(model_key, source, pid, on_switch)
+    return Server(model_key)

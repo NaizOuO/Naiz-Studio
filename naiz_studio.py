@@ -7,6 +7,7 @@ import platform
 import sys
 import time
 import traceback
+import webbrowser
 from pathlib import Path
 
 # SDL 預設會丟掉「讓視窗變成作用中」的那一下點擊。從檔案總管拖檔進來後作用中的是檔案總管,
@@ -47,6 +48,10 @@ CATEGORY_ORDER = ["文件", "影像", "影音"]
 MODS_CATEGORY = "擴充模組"      # mods 資料夾裡的工具都放這一類,排在最後
 DEV_CLICKS = 7
 DEV_WINDOW_SECONDS = 3.0
+SPONSOR_TEXT = "Good to use? Maybe u kn buy me a coffee. ～(∠·ω< )⌒☆ "
+SPONSOR_SYMBOLS = "⌒"           # 介面字型沒有的字
+SPONSOR_SYMBOL_FONT = "C:\\Windows\\Fonts\\seguisym.ttf"
+SPONSOR_URL = "https://payment.opay.tw/Broadcaster/Donate/2B41AE35B91845324050202E1F617E4E"
 IDLE_SECONDS = 1.5      # 這麼久沒有任何操作就降低畫面更新頻率
 
 
@@ -121,6 +126,7 @@ class App:
         self.update_job = None          # 正在下載或已換好的更新
         self.update_prompted = False    # 這次開啟已經跳過通知
         self.update_badge = pygame.Rect(0, 0, 0, 0)
+        self.sponsor_rect = pygame.Rect(0, 0, 0, 0)
         self.relaunch = False
         self.shortcut_job = None        # 正在建立桌面捷徑
         self.shortcut_asked = False     # 這次開啟已經檢查過要不要問
@@ -277,7 +283,46 @@ class App:
             toolbar = pygame.Rect(crumb_right + 24, 16, home.x - 12 - (crumb_right + 24), 34)
             self.guard(self.current, self.pages[self.current.id].draw_toolbar, toolbar, mouse_pos)
         else:
-            self.btn_output.draw(self.screen, pygame.Rect(width - 186, 17, 110, 32), mouse_pos)
+            output = pygame.Rect(width - 186, 17, 110, 32)
+            self.btn_output.draw(self.screen, output, mouse_pos)
+            self.draw_sponsor(output.x - 18, max(crumb_right, self.update_badge.right) + 24, mouse_pos)
+
+    def _sponsor_pieces(self):
+        """贊助文字分段:介面字型(微軟正黑體)沒有「⌒」,這個字改用 Windows 內建的 Segoe UI Symbol 畫。"""
+        symbol = SPONSOR_SYMBOL_FONT if os.path.exists(SPONSOR_SYMBOL_FONT) else None
+        if symbol is None:
+            return [(theme.font(13), SPONSOR_TEXT)]
+        if not hasattr(self, "_symbol_font"):
+            self._symbol_font = pygame.font.Font(symbol, 13)
+        pieces = []
+        for ch in SPONSOR_TEXT:
+            font = self._symbol_font if ch in SPONSOR_SYMBOLS else theme.font(13)
+            if pieces and pieces[-1][0] is font:
+                pieces[-1] = (font, pieces[-1][1] + ch)
+            else:
+                pieces.append((font, ch))
+        return pieces
+
+    def draw_sponsor(self, right, leftmost, mouse_pos):
+        """首頁標題列右邊的贊助連結:滑鼠移上去變色(看得出可以點),點了打開贊助頁;視窗太窄放不下時不顯示。"""
+        self.sponsor_rect = pygame.Rect(0, 0, 0, 0)
+        if self.current:
+            return
+        pieces = self._sponsor_pieces()
+        width = sum(font.size(text)[0] for font, text in pieces)
+        height = theme.font(13).get_height()
+        if right - width < leftmost:
+            return
+        rect = pygame.Rect(right - width, 33 - height // 2, width, height)
+        hover = rect.inflate(8, 8).collidepoint(mouse_pos)
+        x = rect.x
+        for font, text in pieces:
+            image = font.render(text, True, theme.ACCENT if hover else theme.TEXT_FAINT)
+            self.screen.blit(image, (x, rect.centery - image.get_height() // 2))
+            x += image.get_width()
+        if hover:
+            pygame.draw.line(self.screen, theme.ACCENT, (rect.x, rect.bottom), (rect.right - 1, rect.bottom))
+        self.sponsor_rect = rect.inflate(8, 8)
 
     def draw_home(self, rect, mouse_pos):
         draw_text(self.screen, "工具", (rect.x, rect.y), 24, theme.TEXT, bold=True)
@@ -732,6 +777,9 @@ class App:
                 return True
             if self.update_badge.collidepoint(mouse_pos):
                 self.click_badge()
+                return True
+            if not self.current and self.sponsor_rect.collidepoint(mouse_pos):
+                webbrowser.open(SPONSOR_URL)
                 return True
             if not self.current and self.btn_output.clicked(mouse_pos, True):
                 self.open_output_folder()

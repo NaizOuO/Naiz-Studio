@@ -950,7 +950,7 @@ class SubtitlePage(Page):
             y += 48
         if not opened:
             pass
-        elif not asr.gpu() and prefs["model"] in ("turbo", "large", "breeze"):
+        elif not asr.gpu() and prefs["model"] in ("turbo", "large", "breeze", "zh-auto"):
             draw_text(screen, "沒有 NVIDIA 顯示卡時這個模型跟不上即時，建議用「輕量」", (x, y), 12, theme.WARN)
             y += 20
         elif asr.gpu():

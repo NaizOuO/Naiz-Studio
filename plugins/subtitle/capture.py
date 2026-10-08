@@ -437,3 +437,31 @@ def audio_programs():
         found[key] = (root, _description(path) if path else exe or str(pid), playing)
     ordered = sorted(found.values(), key=lambda item: (not item[2], item[1].lower()))
     return [(pid, f"{name}（播放中）" if playing else name) for pid, name, playing in ordered]
+
+
+# ------------------------------------------------------------ 是不是在通話(「中文(自動)」選模型用)
+
+def is_call_program(pid):
+    """這個程式是不是 Discord、LINE、Teams 這類通話軟體。"""
+    if not pid:
+        return False
+    process = _processes().get(int(pid))
+    return bool(process) and process[1].lower() in CALL_PROGRAMS
+
+
+def call_playing():
+    """現在有沒有通話軟體正在發出聲音(在語音頻道裡、有人在講話時)。要在背景執行緒呼叫。"""
+    _init_thread()
+    enumerator = comtypes.CoCreateInstance(CLSID_ENUMERATOR, IMMDeviceEnumerator, CLSCTX_ALL)
+    device = enumerator.GetDefaultAudioEndpoint(0, E_CONSOLE)
+    manager = ctypes.cast(device.Activate(byref(IAudioSessionManager2._iid_), CLSCTX_ALL, None),
+                          POINTER(IAudioSessionManager2))
+    sessions = manager.GetSessionEnumerator()
+    processes = _processes()
+    for index in range(sessions.GetCount()):
+        control = sessions.GetSession(index).QueryInterface(IAudioSessionControl2)
+        pid = control.GetProcessId()
+        if pid in processes and control.GetState() == SESSION_ACTIVE \
+                and processes[pid][1].lower() in CALL_PROGRAMS:
+            return True
+    return False
