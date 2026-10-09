@@ -41,11 +41,19 @@ def ram():
         return 0
 
 
+SMALL_GPU = 6           # 顯示卡記憶體這麼多(GB)以下:辨識改用「輕量」,把空間留給翻譯模型
+
+
 def recommend():
     """(辨識模型, 翻譯模型, 講到一半就試翻, 說明)"""
     vram = gpu_memory()
     if vram == 0:
         return "small", "translategemma:4b", False, "沒有偵測到 NVIDIA 顯示卡：建議用「輕量」和翻譯專用的小模型，只翻講完的句子"
+    if vram <= SMALL_GPU:
+        # 2026-10-10 模擬 4 GB 顯示卡:「推薦」加翻譯模型放不進去,多出約 2 GB 被擠到電腦記憶體,說完約 22 秒才翻好;
+        # 「輕量」加只翻講完的句子約 4 秒(GTX 1050 4GB 實際使用者回報跟不上)
+        return ("small", "translategemma:4b", False,
+                f"顯示卡記憶體約 {vram} GB：建議「輕量」和翻譯專用的小模型，只翻講完的句子，兩個模型才放得進顯示卡")
     if vram < 10:
         return "turbo", "translategemma:4b", True, f"顯示卡記憶體約 {vram} GB：建議「推薦」和翻譯專用的小模型"
     return "turbo", "qwen3:8b", True, f"顯示卡記憶體約 {vram} GB：建議「推薦」和 qwen3:8b"

@@ -34,6 +34,7 @@ KOREAN_FONTS = [("malgun.ttf", 0)]
 # 缺字時依序找:繁中、日文、簡中、韓文、符號
 BACKUP_FONTS = [("msjh.ttc", 0), ("YuGothM.ttc", 0), ("meiryo.ttc", 0), ("msyh.ttc", 0), ("malgun.ttf", 0),
                 ("seguisym.ttf", 0)]
+ACCEPT_POLL = 1.0           # 等字幕程式連上時,每隔幾秒確認它還開著
 BAND = 0.8                  # 字幕區寬度:主螢幕寬的 80%(對齊靠左、靠右時以這個範圍為準)
 
 
@@ -66,7 +67,7 @@ class Overlay:
         self._server = socket.socket()
         self._server.bind(("127.0.0.1", 0))
         self._server.listen(1)
-        self._server.settimeout(20)
+        self._server.settimeout(ACCEPT_POLL)
         port = self._server.getsockname()[1]
         if getattr(sys, "frozen", False):
             args = [sys.executable, "--subtitle-overlay", str(port), token]
@@ -78,11 +79,19 @@ class Overlay:
         env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
         self._proc = subprocess.Popen(args, env=env, creationflags=0x08000000,
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        server = self._server
+        server, proc = self._server, self._proc
 
         def accept():
             try:
-                conn, _ = server.accept()
+                # 字幕程式還開著就一直等它連上:電腦忙的時候(同時在載入辨識模型、防毒軟體第一次掃描)
+                # 開啟可能超過 20 秒;以前等 20 秒就放棄,字幕程式之後才連上會一直收不到字、畫面上什麼都沒有
+                while True:
+                    try:
+                        conn, _ = server.accept()
+                        break
+                    except TimeoutError:
+                        if proc.poll() is not None or self._server is not server:
+                            return
                 conn.settimeout(None)
                 reader = conn.makefile("r", encoding="utf-8")
                 if reader.readline().strip() != token:            # 只接受自己開的字幕視窗
@@ -102,7 +111,7 @@ class Overlay:
             except (OSError, ValueError):
                 pass
 
-        threading.Thread(target=accept, daemon=True).start()
+        threading.Thread(target=accept, name="subtitle-overlay-accept", daemon=True).start()
 
     def send(self, message):
         kind = message.get("type")
