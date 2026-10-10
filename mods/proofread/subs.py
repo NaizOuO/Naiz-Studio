@@ -21,6 +21,10 @@ MIN_LENGTH = 0.2                        # 一條字幕最短幾秒
 _TIME = re.compile(r"(\d+):(\d{1,2}):(\d{1,2})[,.](\d{1,3})")
 _ARROW = re.compile(rf"{_TIME.pattern}\s*-->\s*{_TIME.pattern}")
 _SPEAKER = re.compile(r"^(?:說話者|说话者)\s*(\d+)\s*[:：]\s*")
+# 整句都包在同一個顏色裡才算這個人的顏色(句子中間一小段紅字不算)
+_FONT_COLOR = re.compile(r"^\s*<font[^>]*color\s*=\s*[\"']?#([0-9a-fA-F]{6})[^>]*>(?:(?!</?font).)*</font>\s*$",
+                         re.IGNORECASE | re.DOTALL)
+_LABEL = re.compile(r"^([^：:\n]{1,20})[：:]\s*")      # 有顏色的字幕句首的名字(「說話者 1：」「Naiz：」)
 _TXT_LINE = re.compile(r"^\[(\d+):(\d{2})(?::(\d{2}))?\]\s*(.*)$")
 _TXT_WHO = re.compile(r"^\((.+?)\)\s*")
 _BAD_NAME = re.compile(r"[\\/:*?\"<>|：]")
@@ -113,11 +117,35 @@ def parse_srt(content):
         # 下一條的編號被讀進來了(字幕之間沒有空行的檔案):拿掉
         if body and body[-1].isdigit() and i < len(lines) and _ARROW.search(lines[i]):
             body.pop()
+        color = _FONT_COLOR.search("\n".join(body))
         text = "\n".join(re.sub(r"</?(?:font|b|i|u)[^>]*>", "", line) for line in body)
-        cues.append({"start": start, "end": max(end, start + MIN_LENGTH), "text": text, "speaker": None})
+        cues.append({"start": start, "end": max(end, start + MIN_LENGTH), "text": text, "speaker": None,
+                     "color": tuple(int(color.group(1)[i:i + 2], 16) for i in (0, 2, 4)) if color else None})
+    # 有顏色的字幕(錄音轉逐字稿、這裡輸出的 SRT):同一個顏色是同一個人,句首的名字(含改過的)照留。
+    # 同一個顏色一半以上的句子開頭都一樣才算名字(只加顏色沒加名字時,句子本身的「注意：」不會被當成名字)
+    prefixes = {}
+    for cue in cues:
+        if cue["color"] is not None:
+            label = _LABEL.match(cue["text"])
+            prefixes.setdefault(cue["color"], []).append(label.group(1).strip() if label else "")
+    names = {}
+    for color, found in prefixes.items():
+        common = max(set(found), key=found.count)
+        names[color] = common if common and found.count(common) * 2 >= len(found) else ""
     speakers = []
     numbers = {}
     for cue in cues:
+        color = cue.pop("color")
+        if color is not None:
+            name = names[color]
+            if color not in numbers:
+                numbers[color] = len(speakers)
+                speakers.append(new_speaker(speakers, color, f"{name}：" if name else None))
+            cue["speaker"] = speakers[numbers[color]]["id"]
+            label = _LABEL.match(cue["text"])
+            if name and label and label.group(1).strip() == name:
+                cue["text"] = cue["text"][label.end():]
+            continue
         match = _SPEAKER.match(cue["text"])
         if match:
             number = int(match.group(1))
