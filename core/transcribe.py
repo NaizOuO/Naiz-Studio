@@ -4,6 +4,7 @@
     missing = [d for d in transcribe.required("turbo") if not d.installed()]  # 缺的先經同意視窗下載
     srt = transcribe.transcribe(path, "turbo", "tw", progress=..., cancel=...)
     text = transcribe.srt_to_text(srt)
+要改說話者名字、自己決定輸出格式時用 transcribe_cues(字幕條)再交給 cues_to_srt / cues_to_text。
 """
 
 import atexit
@@ -91,8 +92,13 @@ MODELS = {
     "large": _model("large", "ggml-large-v3.bin", "約 2.9 GB",
                     "64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2"),
 }
-# 每個模型計算「每個字時間」用的設定名稱
-MODEL_DTW = {"base": "base", "turbo": "large.v3.turbo", "large": "large.v3"}
+# 每個模型計算「每個字時間」用的設定名稱(輕量、中文(台灣)的模型檔在即時字幕那邊定義,一樣用 whisper.cpp)
+MODEL_DTW = {"base": "base", "small": "small", "turbo": "large.v3.turbo", "large": "large.v3", "breeze": "large.v2"}
+
+# 說話者的顏色(依第一次出現的順序):和即時字幕、字幕校對同一組,換工具時同一個人還是同一個顏色
+SPEAKER_COLORS = [("藍色", (88, 150, 255)), ("橘色", (255, 150, 70)), ("綠色", (90, 200, 120)),
+                  ("粉紅色", (240, 110, 170)), ("紫色", (165, 125, 245)), ("黃色", (235, 200, 60)),
+                  ("青色", (70, 200, 210)), ("紅色", (235, 85, 85))]
 
 # 輸出文字選項
 SCRIPT_OPTIONS = [("tw", "台灣繁體"), ("cn", "簡體"), ("none", "不轉換")]
@@ -124,7 +130,7 @@ def required(model_key, speakers=None):
     return items + diarize.DEPS if speakers is not None else items
 
 
-_SPEAKER = re.compile(r"^(說話者|说话者) (\d+):")
+_SPEAKER = re.compile(r"^(說話者|说话者) (\d+)[:：]")
 _VAD_INFO = re.compile(r"vad_segment_info: orig_start: ([\d.]+), orig_end: ([\d.]+), "
                        r"vad_start: ([\d.]+), vad_end: ([\d.]+)")
 _REPEATED = re.compile(r"(.{2,8}?)\1{2,}")
@@ -185,7 +191,8 @@ def to_original(t, points):
 
 
 def read_lines(json_path, points):
-    """讀 whisper 的完整 JSON,回傳每句 {start, end, text, words:[(原始時間, 文字)]}。"""
+    """讀 whisper 的完整 JSON,回傳每句 {start, end, text, words:[(原始時間, 文字, 機率)]}。
+    機率是 Whisper 對這個字有多少把握(0～1,精修只修沒把握的字)。"""
     data = json.loads(Path(json_path).read_text(encoding="utf-8", errors="replace"))
     lines = []
     for seg in data.get("transcription", []):
@@ -202,14 +209,15 @@ def read_lines(json_path, points):
                 continue
             dtw = token.get("t_dtw", -1)
             processed = dtw / 100 if dtw >= 0 else token["offsets"]["from"] / 1000
+            chance = float(token.get("p", 1.0))
             if words and re.match(r"[A-Za-z0-9]", piece) and re.search(r"[A-Za-z0-9]$", words[-1][1]):
                 # 英文單字會被拆成好幾塊(例如 Sil + icon),接回前一塊,切換說話者時才不會斷在字中間
-                words[-1] = (words[-1][0], words[-1][1] + piece)
+                words[-1] = (words[-1][0], words[-1][1] + piece, min(words[-1][2], chance))
                 continue
-            words.append((to_original(processed, points), piece))
-        if any("�" in piece for _, piece in words):
+            words.append((to_original(processed, points), piece, chance))
+        if any("�" in word[1] for word in words):
             # 中文字被拆成好幾塊時沒辦法逐字切,整句當成一個單位
-            words = words[:1] and [(words[0][0], text)]
+            words = words[:1] and [(words[0][0], text, min(word[2] for word in words))]
         lines.append({"start": seg["offsets"]["from"] / 1000, "end": seg["offsets"]["to"] / 1000,
                       "text": text, "words": words})
     return lines
@@ -225,7 +233,7 @@ def _speaker_at(t, segments):
 
 def _text_weight(words):
     """片段有多少內容:中文字每個算 1,英文或數字每個單字算 2。"""
-    text = "".join(piece for _, piece in words)
+    text = "".join(word[1] for word in words)
     return len(re.findall(r"[一-鿿]", text)) + 2 * len(re.findall(r"[A-Za-z0-9]+", text))
 
 
@@ -236,6 +244,51 @@ def _interval_at(t, voice, tolerance=0.15):
     return None
 
 
+# 一條字幕的長度:逐字稿是拿來放在影片上的,一條只放一句、一行放得下(中文字算 1、英數算 0.5)
+LINE_WIDTH = 16
+LINE_SECONDS = 6.0
+MIN_WIDTH = 4               # 切開後每一段至少這麼寬(不會切出只有一兩個字的字幕)
+MIN_SHOW = 0.8              # 一條字幕至少顯示幾秒(後面有空檔時)
+READ_SPEED = 15             # 每秒看得完幾個中文字(英數算半個):講太快時字幕多留一下
+GAP = 0.08                  # 相鄰兩條字幕之間至少空這麼久(約 2 格畫面)
+_STRONG = "。？！?!；;…"
+_WEAK = "，、,：:"
+
+
+def _width(words):
+    text = "".join(word[1] for word in words).strip()
+    return sum(0.5 if ch.isascii() else 1 for ch in text if not ch.isspace())
+
+
+def split_words(words, width=LINE_WIDTH, seconds=LINE_SECONDS):
+    """一句話的字 [(時間, 文字)] 切成一條一條字幕:有句號、問號就分開;太長(字數或秒數)時優先在逗號切,
+    沒有標點就切在停頓最久的地方。每一段的時間都是那段第一個字的時間,所以字幕和聲音對得上。"""
+    if len(words) < 2:
+        return [words]
+    total = _width(words)
+    candidates = []
+    for index in range(1, len(words)):
+        left, right = words[:index], words[index:]
+        if _width(left) < MIN_WIDTH or _width(right) < MIN_WIDTH:
+            continue
+        end = left[-1][1].rstrip()
+        pause = max(0.0, right[0][0] - left[-1][0])
+        strong, weak = end[-1:] in _STRONG, end[-1:] in _WEAK
+        # 分數:句號 > 逗號 > 停頓;同樣的切點越靠中間越好(兩邊長度平均)
+        balance = 1 - abs(_width(left) - total / 2) / max(1, total)
+        candidates.append((3 * strong + 2 * weak + min(pause, 1.5) + 0.5 * balance, index, strong))
+    if not candidates:
+        return [words]
+    too_long = total > width or words[-1][0] - words[0][0] > seconds
+    best = max(candidates)
+    if not too_long and not best[2]:
+        return [words]
+    if not too_long:                        # 長度沒問題:只在句號、問號處分開
+        best = max(c for c in candidates if c[2])
+    index = best[1]
+    return split_words(words[:index], width, seconds) + split_words(words[index:], width, seconds)
+
+
 def build_cues(lines, voice, segments=None):
     """把每句拆成字幕條:有說話者時在換人處切開;時間對齊到實際人聲,聲音開始才出現、結束就消失。
     voice 是依時間排序的人聲區間 [(開始秒, 結束秒)]。"""
@@ -243,7 +296,7 @@ def build_cues(lines, voice, segments=None):
     cues = []
     for line in lines:
         words = line["words"] or [(line["start"], line["text"])]
-        speakers = [_speaker_at(t, segments) for t, _ in words] if segments else [None] * len(words)
+        speakers = [_speaker_at(word[0], segments) for word in words] if segments else [None] * len(words)
         groups = []
         for word, speaker in zip(words, speakers):
             if groups and groups[-1][0] == speaker:
@@ -262,9 +315,13 @@ def build_cues(lines, voice, segments=None):
             first = merged.pop(0)
             merged[0][1][:0] = first[1]
         for speaker, group in merged:
-            text = "".join(w for _, w in group).strip()
-            if text:
-                cues.append({"start": group[0][0], "last": group[-1][0], "text": text, "speaker": speaker})
+            for piece in split_words(group):
+                text = "".join(word[1] for word in piece).strip()
+                if text:
+                    # 每個字(不算標點、空白)的把握:精修用
+                    sure = [word[2] if len(word) > 2 else 1.0 for word in piece for ch in word[1] if ch.isalnum()]
+                    cues.append({"start": piece[0][0], "last": piece[-1][0], "text": text, "speaker": speaker,
+                                 "sure": sure})
 
     for cue in cues:
         start, last = cue["start"], cue["last"]
@@ -289,9 +346,13 @@ def build_cues(lines, voice, segments=None):
 
     for previous, cue in zip(cues, cues[1:]):
         cue["start"] = max(cue["start"], previous["start"] + 0.3)
-        previous["end"] = min(previous["end"], cue["start"])
-    for cue in cues:
-        cue["end"] = max(cue["end"], cue["start"] + 0.3)
+    # 結束時間:聲音結束就消失,但講很快、很短的句子多留一下讓人看得完(不超過下一句,兩句之間留一點空白,
+    # 觀眾才看得出換了一句);開頭不動,永遠對齊聲音
+    for index, cue in enumerate(cues):
+        limit = cues[index + 1]["start"] - GAP if index + 1 < len(cues) else float("inf")
+        readable = max(MIN_SHOW, _width([(0, cue["text"])]) / READ_SPEED)
+        end = max(min(cue["end"], limit), min(cue["start"] + readable, limit))
+        cue["end"] = max(end, min(cue["start"] + 0.3, limit + GAP))
     return cues
 
 
@@ -303,16 +364,68 @@ def _srt_time(t):
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{ms:03d}"
 
 
-def cues_to_srt(cues) -> str:
-    """字幕條轉成 SRT;說話者編號照第一次出現的順序。"""
+def number_speakers(cues):
+    """說話者改成 1、2、3…(照第一次出現的順序);回傳新的字幕條,不改原本的。"""
     order = {}
+    out = []
+    for cue in cues:
+        speaker = cue.get("speaker")
+        out.append(dict(cue, speaker=None if speaker is None else order.setdefault(speaker, len(order) + 1)))
+    return out
+
+
+def speaker_color(number):
+    """第幾個說話者的 (顏色名稱, RGB);超過八個人時顏色輪流用。"""
+    return SPEAKER_COLORS[(number - 1) % len(SPEAKER_COLORS)]
+
+
+def speaker_name(number, names=None, script="tw"):
+    """說話者在輸出裡的名字:使用者改過就用改過的,不然是「說話者 N」(簡體輸出時是「说话者」)。"""
+    name = str((names or {}).get(number, "")).strip()
+    return name or f"{'说话者' if script == 'cn' else '說話者'} {number}"
+
+
+def cues_to_srt(cues, names=None, colors=True, script="tw") -> str:
+    """字幕條轉成 SRT(說話者要先用 number_speakers 編好號)。有說話者時句子前面加「說話者 1：」(或改過的名字);
+    colors 時整句用 <font color> 標上那個人的顏色(大部分播放器、字幕校對看得到)。"""
     blocks = []
     for number, cue in enumerate(cues, start=1):
         text = cue["text"]
-        if cue["speaker"] is not None:
-            text = f"說話者 {order.setdefault(cue['speaker'], len(order) + 1)}:{text}"
+        speaker = cue.get("speaker")
+        if speaker is not None:
+            text = f"{speaker_name(speaker, names, script)}：{text}"
+            if colors:
+                text = '<font color="#{:02x}{:02x}{:02x}">{}</font>'.format(*speaker_color(speaker)[1], text)
         blocks.append(f"{number}\n{_srt_time(cue['start'])} --> {_srt_time(cue['end'])}\n{text}")
     return "\n\n".join(blocks) + "\n" if blocks else ""
+
+
+def cues_to_text(cues, names=None, script="tw") -> str:
+    """純文字逐字稿:同一人連續說的話放在同一段,段落開頭是「說話者 1（藍色）：」;連續重複的句子只留一次。"""
+    lines, current = [], None
+    for cue in cues:
+        text = cue["text"].strip()
+        speaker = cue.get("speaker")
+        if speaker is not None and speaker != current:
+            if lines:
+                lines.append("")
+            color = speaker_color(speaker)[0]
+            lines.append(f"{speaker_name(speaker, names, script)}（{convert_script(color, script)}）：")
+            current = speaker
+        if text and (not lines or lines[-1] != text):
+            lines.append(text)
+    return "\n".join(lines)
+
+
+_HALF_PUNCT = {",": "，", "?": "？", "!": "！", ":": "：", ";": "；"}
+_CJK = r"[㐀-鿿豈-﫿]"
+
+
+def tidy_punctuation(text):
+    """中文的標點改全形(和即時字幕一樣):「輕量」等模型常輸出半形逗號;數字裡的「1,000」「3:30」不動。"""
+    text = re.sub(r"(?<!\d)\s*([,?!:;])\s*|([?!;])", lambda m: _HALF_PUNCT[m.group(1) or m.group(2)], text)
+    text = re.sub(rf"(?<={_CJK})\.(?!\d)", "。", text)
+    return re.sub(rf"(?<={_CJK})\s+(?={_CJK})", "，", text).strip()
 
 
 @cache
@@ -377,26 +490,14 @@ def _run(args, cancel, on_line=None, cwd=None):
     return code, log
 
 
-def transcribe(media_path, model_key="turbo", script="tw", language="zh", progress=None, cancel=None,
-               speakers=None) -> str:
-    """把影片或音訊轉成 SRT 字幕文字。progress(比例或 None, 說明文字);cancel 是 threading.Event。
-    speakers:None 不區分說話者,0 自動判斷人數,其他數字為指定人數。"""
-    report = progress or (lambda ratio, text: None)
-    cancel = cancel or threading.Event()
-    exe = engine().path()
-    model = MODELS[model_key]
-    work = Path(tempfile.mkdtemp(prefix="naiz_asr_", dir=_ascii_temp_dir()))
-    try:
-        report(None, "準備音訊")
-        wav = work / "audio.wav"
-        code, log = _run([deps.FFMPEG.path(), "-nostdin", "-y", "-i", media_path, "-vn",
-                          "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav], cancel)
-        if code != 0 or not wav.is_file():
-            raise RuntimeError("無法讀取這個檔案的聲音")
+def whisper_recognizer(model, dtw, language="zh"):
+    """用 whisper.cpp 辨識整個檔案。model 是模型(Dependency),dtw 是算每個字時間用的設定名稱。
+    回傳 recognize(wav, work, report, cancel) → (每句 read_lines 的格式, 人聲區間, 語言代號)。"""
 
+    def recognize(wav, work, report, cancel):
+        exe = engine().path()
         gpu = exe.parent.name == "whisper-cuda"
         report(None, "載入模型(第一次使用顯示卡約需 30 秒)" if gpu else "載入模型")
-
         infos = []
 
         def on_line(line):
@@ -415,15 +516,51 @@ def transcribe(media_path, model_key="turbo", script="tw", language="zh", progre
         out = work / "result"
         code, log = _run([exe, "-m", model.path().name, "-f", wav, "-l", language, "-mc", "0",
                           "--vad", "-vm", VAD.path().name, "-t", max(1, (os.cpu_count() or 4) - 1),
-                          "-dtw", MODEL_DTW[model_key], "-nfa", "-pp", "-ojf", "-of", out],
+                          "-dtw", dtw, "-nfa", "-pp", "-ojf", "-of", out],
                          cancel, on_line=on_line, cwd=paths.MODELS_DIR)
         result = out.with_suffix(".json")
         if code != 0 or not result.is_file():
             detail = next((l for l in reversed(log) if l.strip()), "")
             raise RuntimeError(f"語音辨識失敗 {detail[:120]}".strip())
-        report(1, "整理文字")
+        try:
+            found = json.loads(result.read_text(encoding="utf-8", errors="replace")).get("result", {}).get("language")
+        except ValueError:
+            found = None
         lines = read_lines(result, time_map(infos))
-        voice = [(orig_start, orig_end) for orig_start, orig_end, _, _ in infos]
+        return lines, [(orig_start, orig_end) for orig_start, orig_end, _, _ in infos], found or language
+
+    return recognize
+
+
+def transcribe(media_path, model_key="turbo", script="tw", language="zh", progress=None, cancel=None,
+               speakers=None) -> str:
+    """把影片或音訊轉成 SRT 字幕文字。progress(比例或 None, 說明文字);cancel 是 threading.Event。
+    speakers:None 不區分說話者,0 自動判斷人數,其他數字為指定人數。"""
+    cues, _ = transcribe_cues(media_path, whisper_recognizer(MODELS[model_key], MODEL_DTW[model_key], language),
+                              script, progress, cancel, speakers)
+    return cues_to_srt(cues, script=script)
+
+
+def transcribe_cues(media_path, recognize, script="tw", progress=None, cancel=None, speakers=None, prepare=None,
+                    refine=None):
+    """辨識 → 區分說話者 → 字幕條。recognize 見 whisper_recognizer(其他模型也照同樣的格式回傳);
+    prepare(每句) 在切成字幕條之前整理每個字(例如補標點:標點也是切字幕的依據)。
+    refine(字幕條, 聲音檔, report, cancel) 在最後再分析一次(精修),回傳修好的字幕條。
+    回傳 (字幕條, 語言代號);字幕條是 {start, end, text, speaker(1、2… 或 None)},中文會轉成 script 的用字。"""
+    report = progress or (lambda ratio, text: None)
+    cancel = cancel or threading.Event()
+    work = Path(tempfile.mkdtemp(prefix="naiz_asr_", dir=_ascii_temp_dir()))
+    try:
+        report(None, "準備音訊")
+        wav = work / "audio.wav"
+        code, log = _run([deps.FFMPEG.path(), "-nostdin", "-y", "-i", media_path, "-vn",
+                          "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav], cancel)
+        if code != 0 or not wav.is_file():
+            raise RuntimeError("無法讀取這個檔案的聲音")
+        lines, voice, language = recognize(wav, work, report, cancel)
+        report(1, "整理文字")
+        if prepare is not None:
+            lines = prepare(lines)
         segments = None
         if speakers is not None and voice:
             report(None, "區分說話者")
@@ -435,8 +572,12 @@ def transcribe(media_path, model_key="turbo", script="tw", language="zh", progre
                 raise RuntimeError("區分說話者失敗")
             segments = diarize.diarize(raw, voice, speakers, cancel, work_dir=work,
                                        progress=lambda r: report(r, "區分說話者"))
-        content = cues_to_srt(build_cues(lines, voice, segments))
-        # 先標說話者再轉換,「說話者」三個字才會跟著轉成簡體
-        return convert_script(content, script)
+        cues = number_speakers(build_cues(lines, voice, segments))
+        if language == "zh":            # 日文的漢字不能轉繁簡(「気」會變成「氣」)
+            for cue in cues:
+                cue["text"] = tidy_punctuation(convert_script(cue["text"], script))
+        if refine is not None and language == "zh":
+            cues = refine(cues, wav, report, cancel)
+        return cues, language
     finally:
         shutil.rmtree(work, ignore_errors=True)

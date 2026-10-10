@@ -70,8 +70,14 @@
 
 ### 錄音轉逐字稿
 - 把錄音或影片轉成字幕檔（SRT）與純文字（TXT）
-- 三種辨識模型可選，可輸出台灣繁體或簡體
-- 可區分說話者，自動判斷人數或指定人數
+- 五種辨識模型可選，和即時字幕共用已經下載的模型：
+  - 快速、輕量、推薦、最準確：可以選原文語言（自動判斷、中、英、日等）
+  - 「中文（台灣）」：台灣口語、中英混用錯字較少，用中文標點模型補上標點
+- 「更精確」開關：轉完在本地再仔細聽一次（用「中文（通話）」的 Qwen3-ASR 聽聲音判斷），修正同音錯字，時間約多 3 倍；只對中文有效，第一次使用會詢問是否下載模型（約 2.5 GB）
+- 字幕切得細：一條一句、一行放得下（約 16 個中文字、最長 6 秒），每一條的時間都照每個字的實際時間，和聲音對齊
+- 中文可輸出台灣繁體或簡體，標點統一用全形
+- 可區分說話者，自動判斷人數（只有一個人時不會被分成兩人）或指定人數；每個人一個顏色（和即時字幕、字幕校對同一組），SRT 用顏色標示，TXT 標「說話者 1（藍色）」
+- 轉完後按「說話者」可以替每個人改名字，逐字稿會重新寫出；字幕校對擴充模組讀得到顏色和名字
 - 修正錯字：自訂「辨識錯的字 → 正確的字」，之後的逐字稿會自動套用；可以存好幾個設定檔（例如一門課一個），存在 `setting\transcript_corrections` 資料夾，一個設定檔一個檔，可以直接複製給別人或放入別人給的檔案
 
 ### 即時字幕
@@ -198,7 +204,7 @@ python naiz_studio.py
 | 去背模型（一般） | 去背的「一般」，速度快 | 約 109 MB | 約 109 MB |
 | 去背模型（精細） | 去背的「精細」，頭髮、毛邊更準 | 約 467 MB | 約 467 MB |
 | 日文讀音字典（IPADIC） | 即時字幕：日文漢字上方標讀音（振假名） | 約 13 MB | 約 51 MB |
-| 辨識模型「中文（通話）」 | 即時字幕：Qwen3-ASR，通話、多人聊天的中文辨識 | 約 2.5 GB | 約 2.5 GB |
+| 辨識模型「中文（通話）」 | 即時字幕：Qwen3-ASR，通話、多人聊天的中文辨識；逐字稿「更精確」也用它 | 約 2.5 GB | 約 2.5 GB |
 | 中文標點模型 | 即時字幕：幫「中文（台灣）」補上標點 | 約 65 MB | 約 76 MB |
 
 辨識模型只需要下載用到的那一個。
@@ -341,6 +347,7 @@ TOOLS = [HelloTool]
 | [pillow-heif](https://github.com/bigcat88/pillow_heif) | HEIC 讀寫 | BSD-3-Clause（附帶 libheif、libde265 為 LGPL-3.0，x265 為 GPL-2.0 以上） |
 | [vtracer](https://github.com/visioncortex/vtracer) | 圖片轉 SVG | MIT |
 | [OpenCC](https://github.com/yichen0831/opencc-python) | 繁簡轉換 | Apache-2.0 |
+| [pypinyin](https://github.com/mozillazg/python-pinyin) | 逐字稿「更精確」判斷同音字 | MIT |
 | [FFmpeg](https://ffmpeg.org/)（[gyan.dev](https://www.gyan.dev/ffmpeg/builds/) 版本） | 影音轉檔、讀取影音 | GPL-3.0 |
 | [LibreOffice](https://www.libreoffice.org/) | 文件轉檔 | MPL-2.0 |
 | [Tesseract](https://github.com/tesseract-ocr/tesseract)（[UB Mannheim](https://github.com/UB-Mannheim/tesseract) Windows 版本） | 掃描檔文字辨識 | Apache-2.0 |
@@ -361,7 +368,7 @@ TOOLS = [HelloTool]
 | [IPADIC](https://pypi.org/project/ipadic/)（奈良先端科學技術大學院大學） | 即時字幕振假名用的日文讀音字典 | IPADIC 授權（允許自由使用與散布，須保留版權聲明） |
 | [Ollama](https://github.com/ollama/ollama)（使用者自行安裝） | 即時字幕的本地翻譯（有安裝時使用）；翻譯模型由 Ollama 下載 | MIT |
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | 即時字幕的內建翻譯引擎（沒有 Ollama 時使用）、「中文（通話）」辨識 | MIT |
-| [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR)（阿里巴巴 Qwen 團隊；[ggml-org 轉的 GGUF](https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF)） | 即時字幕「中文（通話）」辨識模型 | Apache-2.0 |
+| [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR)（阿里巴巴 Qwen 團隊；[ggml-org 轉的 GGUF](https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF)） | 即時字幕「中文（通話）」辨識模型、逐字稿「更精確」 | Apache-2.0 |
 | [CT-Transformer 中英文標點模型](https://github.com/modelscope/FunASR)（阿里巴巴 FunASR；[sherpa-onnx 轉的 int8 版](https://github.com/k2-fsa/sherpa-onnx/releases/tag/punctuation-models)） | 即時字幕「中文（台灣）」補標點 | FunASR 模型授權（可使用、修改、分享，須註明出處與作者、保留模型名稱） |
 | [Qwen3](https://huggingface.co/Qwen)（Qwen 官方的 GGUF 檔） | 翻譯模型 | Apache-2.0 |
 | [TranslateGemma](https://huggingface.co/google/translategemma-4b-it)（[mradermacher](https://huggingface.co/mradermacher) 轉換的 GGUF 檔） | 翻譯模型 | [Gemma 使用條款](https://ai.google.dev/gemma/terms) |

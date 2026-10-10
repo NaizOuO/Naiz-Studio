@@ -1,4 +1,5 @@
-"""錄音轉逐字稿:把錄音或影片拖進視窗,用本機語音辨識依序產生字幕檔與純文字逐字稿。"""
+"""錄音轉逐字稿:把錄音或影片拖進視窗,用本機語音辨識依序產生字幕檔與純文字逐字稿。
+區分說話者時每個人一個顏色(和即時字幕、字幕校對同一組),完成後可以改每個人的名字,逐字稿會重新寫出。"""
 
 import os
 import threading
@@ -10,7 +11,10 @@ from core import corrections, deps, paths, theme, transcribe, widgets
 from core.corrections_dialog import CorrectionsDialog
 from core.plugins import Page
 from core.scroll import BAR_SPACE, ScrollView
-from core.widgets import Button, ProgressBar, SegmentedControl, Toggle, draw_text, rounded_panel
+from core.widgets import Button, Dropdown, ProgressBar, SegmentedControl, Toggle, draw_text, rounded_panel
+
+from . import models, refine
+from .names_dialog import NamesDialog
 
 ROW_H = 72
 MEDIA_EXTS = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg", ".opus", ".wma", ".amr",
@@ -51,6 +55,15 @@ class Item:
         self.files = []
         self.script = "tw"
         self.cancel_event = threading.Event()
+        self.cues = []                  # 完成後留著:改說話者名字時重新寫出逐字稿
+        self.names = {}                 # {說話者編號: 名字}
+        self.base = ""
+        self.output = "both"
+        self.fixed = 0
+
+    @property
+    def speakers(self):
+        return sorted({cue["speaker"] for cue in self.cues if cue.get("speaker") is not None})
 
 
 class TranscriptPage(Page):
@@ -63,7 +76,10 @@ class TranscriptPage(Page):
         self.worker = None
         self.stop_event = threading.Event()
 
-        self.model = SegmentedControl(transcribe.MODEL_OPTIONS, index=1, accent=accent)
+        self.model = Dropdown([(key, name) for key, name, _ in models.MODELS], accent=accent)
+        self.model.set_value("turbo")
+        self.language = Dropdown(models.LANGUAGES, accent=accent)
+        self.language.set_value("zh")
         self.script = SegmentedControl(transcribe.SCRIPT_OPTIONS, accent=accent)
         self.output = SegmentedControl(OUTPUTS, accent=accent)
         self.speakers = SegmentedControl(SPEAKER_OPTIONS, accent=accent)
@@ -82,6 +98,8 @@ class TranscriptPage(Page):
                                             transcribe.convert_script)
         self.fix_toggle = Toggle(self.fix_dialog.data["enabled"], accent=accent)
         self.btn_fix = Button("編輯規則", filled=False, size=13)
+        self.names_dialog = NamesDialog(lambda: self.screen, accent)
+        self.refine_toggle = Toggle(False, accent=accent)      # 更精確:轉完在背後再分析一次(精修)
 
     # ------------------------------------------------------------ 資料
 
@@ -119,13 +137,15 @@ class TranscriptPage(Page):
             return
         model = self.model.value
         speakers = None if self.speakers.value == "off" else int(self.speakers.value)
-        missing = [dep for dep in transcribe.required(model, speakers) if not dep.installed()]
+        refining = self.refine_toggle.value and self._refine_allowed()
+        missing = [dep for dep in models.required(model, speakers, refining) if not dep.installed()]
         if missing:
             self.app.consent.open(self.tool.name, missing, on_done=self.start)
             return
         self.notice = ""
         self.stop_event.clear()
-        settings = (model, self.script.value, self.output.value, speakers)
+        language = "zh" if model in models.ZH_ONLY else self.language.value
+        settings = (model, language, self.script.value, self.output.value, speakers, refining)
         self.worker = threading.Thread(target=self._work, args=settings, daemon=True)
         self.worker.start()
 
@@ -135,7 +155,11 @@ class TranscriptPage(Page):
             if item.status == "running":
                 item.cancel_event.set()
 
-    def _work(self, model, script, output, speakers):
+    def _refine_allowed(self):
+        """精修只對中文有效:原文語言選中文或自動判斷(判斷出中文才會精修)。"""
+        return self.model.value in models.ZH_ONLY or self.language.value in ("zh", "auto")
+
+    def _work(self, model, language, script, output, speakers, refining=False):
         folder = output_dir()
         while not self.stop_event.is_set():
             with self._lock:
@@ -149,32 +173,55 @@ class TranscriptPage(Page):
                 item.ratio, item.phase = ratio, text
 
             try:
-                srt = transcribe.transcribe(item.path, model, script, progress=progress, speakers=speakers,
-                                            cancel=item.cancel_event)
-                fixed = 0
+                cues, _ = transcribe.transcribe_cues(item.path, models.recognizer(model, language), script,
+                                                     progress=progress, cancel=item.cancel_event, speakers=speakers,
+                                                     prepare=models.preparer(model),
+                                                     refine=refine.refine_file(script) if refining else None)
                 fix = corrections.load()
                 if fix["enabled"]:
-                    srt, fixed = corrections.apply_srt(srt, corrections.rules(fix),
-                                                       lambda text: transcribe.convert_script(text, script))
+                    rules = corrections.rules(fix)
+                    for cue in cues:
+                        cue["text"], count = corrections.apply(cue["text"], rules,
+                                                               lambda text: transcribe.convert_script(text, script))
+                        item.fixed += count
                 folder.mkdir(parents=True, exist_ok=True)
-                base = free_base(folder, item.path.stem)
-                files = []
-                if output in ("both", "srt"):
-                    files.append(folder / f"{base}.srt")
-                    files[-1].write_text(srt, encoding="utf-8")
-                if output in ("both", "txt"):
-                    files.append(folder / f"{base}.txt")
-                    files[-1].write_text(transcribe.srt_to_text(srt), encoding="utf-8")
-                item.files = files
-                item.message = "已儲存 " + "、".join(f.suffix[1:].upper() for f in files)
-                if fixed:
-                    item.message += f"，修正 {fixed} 處錯字"
+                item.cues, item.output = cues, output
+                item.base = free_base(folder, item.path.stem)
+                self._write(item)
                 item.status = "done"
             except deps.Cancelled:
                 item.status = "cancelled"
             except Exception as exc:
                 item.message = str(exc) or type(exc).__name__
                 item.status = "error"
+
+    def _write(self, item):
+        """寫出(或改名字後重新寫出)這份逐字稿。"""
+        folder = output_dir()
+        files = []
+        if item.output in ("both", "srt"):
+            files.append(folder / f"{item.base}.srt")
+            files[-1].write_text(transcribe.cues_to_srt(item.cues, item.names, script=item.script), encoding="utf-8")
+        if item.output in ("both", "txt"):
+            files.append(folder / f"{item.base}.txt")
+            files[-1].write_text(transcribe.cues_to_text(item.cues, item.names, item.script), encoding="utf-8")
+        item.files = files
+        item.message = "已儲存 " + "、".join(f.suffix[1:].upper() for f in files)
+        if item.speakers:
+            item.message += f"，{len(item.speakers)} 位說話者"
+        if item.fixed:
+            item.message += f"，修正 {item.fixed} 處錯字"
+
+    def _rename(self, item):
+        def save(names):
+            item.names = names
+            try:
+                self._write(item)
+                self.notice = ""
+            except OSError as exc:
+                self.notice = f"無法重新寫出逐字稿：{exc}"
+
+        self.names_dialog.open(item.path.name, item.cues, item.names, save)
 
     def deactivate(self):
         self.list_view.reset()
@@ -187,13 +234,19 @@ class TranscriptPage(Page):
             self.fix_dialog.update()
 
     def modal_open(self):
-        return self.fix_dialog.is_open
+        return self.fix_dialog.is_open or self.names_dialog.is_open
 
     def draw_modal(self, mouse_pos):
-        self.fix_dialog.draw(mouse_pos)
+        if self.names_dialog.is_open:
+            self.names_dialog.draw(mouse_pos)
+        else:
+            self.fix_dialog.draw(mouse_pos)
 
     def handle_modal_event(self, event, mouse_pos):
-        self.fix_dialog.handle_event(event, mouse_pos)
+        if self.names_dialog.is_open:
+            self.names_dialog.handle_event(event, mouse_pos)
+        else:
+            self.fix_dialog.handle_event(event, mouse_pos)
 
     # ------------------------------------------------------------ 繪製
 
@@ -208,6 +261,8 @@ class TranscriptPage(Page):
                                        rect.width - list_w - margin * 3, content_h), mouse_pos)
         self.draw_footer(pygame.Rect(rect.x + margin, rect.bottom - footer_h - margin,
                                      rect.width - margin * 2, footer_h), mouse_pos)
+        for dropdown in (self.model, self.language):        # 展開的清單蓋在最上面
+            dropdown.draw_menu(self.screen, mouse_pos)
 
     def draw_list(self, rect, mouse_pos):
         screen = self.screen
@@ -245,7 +300,8 @@ class TranscriptPage(Page):
             rounded_panel(screen, row, theme.PANEL_LIGHT if hover else theme.BG_DEEP, radius=8, alpha=200)
             color = {"done": theme.ACCENT, "error": theme.DANGER, "cancelled": theme.TEXT_FAINT}.get(item.status, accent)
             pygame.draw.rect(screen, color, (row.x + 10, row.y + 12, 3, 22), border_radius=2)
-            draw_text(screen, widgets.clip_text(item.path.name, 14, row.width - 64, bold=True), (row.x + 22, row.y + 8),
+            title_w = row.width - 64 - (78 if item.status == "done" and item.speakers else 0)
+            draw_text(screen, widgets.clip_text(item.path.name, 14, title_w, bold=True), (row.x + 22, row.y + 8),
                       14, theme.TEXT, bold=True)
 
             if item.status == "running":
@@ -262,6 +318,12 @@ class TranscriptPage(Page):
                 draw_text(screen, widgets.clip_text(text, 12, row.width - 40), (row.x + 22, row.y + 34), 12,
                           theme.TEXT_DIM if item.status == "waiting" else color)
 
+            if item.status == "done" and item.speakers:
+                names = pygame.Rect(row.right - 34 - 8 - 70, row.y + 8, 70, 26)
+                hovered = names.collidepoint(mouse_pos) and area.collidepoint(mouse_pos)
+                rounded_panel(screen, names, theme.PANEL_LIGHT if hovered else theme.PANEL, radius=6)
+                draw_text(screen, "說話者", names.center, 12, accent if hovered else theme.TEXT_DIM, center=True)
+                self.row_buttons.append(("names", item, names))
             action = pygame.Rect(row.right - 34, row.y + 8, 26, 26)
             hovered = action.collidepoint(mouse_pos)
             rounded_panel(screen, action, theme.DANGER if hovered else theme.PANEL, radius=6)
@@ -294,8 +356,24 @@ class TranscriptPage(Page):
         screen = self.screen
         locked = self.running
 
-        for title, control, notes in (("辨識模型", self.model, transcribe.MODEL_NOTES),
-                                      ("輸出文字", self.script, transcribe.SCRIPT_NOTES),
+        # 辨識模型、原文語言:選項多,用下拉選單
+        zh_only = self.model.value in models.ZH_ONLY
+        if zh_only:
+            self.language.set_value("zh")
+        self.model.enabled = not locked
+        self.language.enabled = not locked and not zh_only
+        for title, control, note in (("辨識模型", self.model, models.NOTES[self.model.value]),
+                                     ("原文語言", self.language,
+                                      "這個模型只辨識中文" if zh_only else "知道是什麼語言的話直接指定，比較快也比較不會判斷錯")):
+            draw_text(screen, title, (x, y + 6), 14, theme.TEXT_FAINT if locked else theme.TEXT)
+            control.draw(screen, pygame.Rect(right - 18 - 180, y, 180, 32), mouse_pos)
+            y += 38
+            for line in widgets.wrap_text(note, 12, inner, max_lines=2):
+                draw_text(screen, line, (x, y), 12, theme.TEXT_FAINT)
+                y += 18
+            y += 10
+
+        for title, control, notes in (("輸出文字", self.script, transcribe.SCRIPT_NOTES),
                                       ("輸出檔案", self.output, OUTPUT_NOTES),
                                       ("區分說話者", self.speakers, SPEAKER_NOTES)):
             draw_text(screen, title, (x, y), 14, theme.TEXT_FAINT if locked else theme.TEXT)
@@ -304,6 +382,22 @@ class TranscriptPage(Page):
             y += 38
             draw_text(screen, widgets.clip_text(notes[control.value], 12, inner), (x, y), 12, theme.TEXT_FAINT)
             y += 26
+
+        # 更精確(精修):轉完再仔細聽一次,修正同音錯字
+        allowed = self._refine_allowed()
+        draw_text(screen, "更精確", (x, y + 3), 14, theme.TEXT_FAINT if locked or not allowed else theme.TEXT)
+        self.refine_toggle.draw(screen, (right - 60, y + 2), mouse_pos)
+        y += 34
+        if not allowed:
+            note = "只對中文有效：原文語言選中文或自動判斷時才能用"
+        elif self.refine_toggle.value:
+            note = "轉完再仔細聽一次，修正同音錯字；時間約多 3 倍"
+        else:
+            note = "開啟後轉完會再仔細聽一次，修正同音錯字（時間約多 3 倍）"
+        for line in widgets.wrap_text(note, 12, inner, max_lines=2):
+            draw_text(screen, line, (x, y), 12, theme.TEXT_FAINT)
+            y += 18
+        y += 10
 
         # 修正錯字:總開關 + 編輯規則;規則可以在轉錄中修改,會套用到之後完成的檔案
         data = self.fix_dialog.data
@@ -328,8 +422,8 @@ class TranscriptPage(Page):
         if locked:
             draw_text(screen, "轉錄中無法變更設定", (x, y), 12, theme.WARN)
             y += 22
-        for line in ("目前辨識語言為中文", "全部在本地處理，不會上傳"):
-            draw_text(screen, line, (x, y), 12, theme.TEXT_FAINT)
+        for line in ("全部在本地處理，不會上傳", "區分說話者時每人一個顏色，完成後按「說話者」可以改名字"):
+            draw_text(screen, widgets.clip_text(line, 12, inner), (x, y), 12, theme.TEXT_FAINT)
             y += 20
         return y
 
@@ -359,6 +453,9 @@ class TranscriptPage(Page):
     # ------------------------------------------------------------ 事件
 
     def handle_event(self, event, mouse_pos):
+        for dropdown in (self.model, self.language):
+            if dropdown.enabled and dropdown.handle(event, mouse_pos):
+                return
         if self.items and self.list_view.handle_event(event, mouse_pos):
             return
         if self.settings_view.handle_event(event, mouse_pos):
@@ -374,6 +471,8 @@ class TranscriptPage(Page):
                 if rect.collidepoint(mouse_pos):
                     if action == "cancel":
                         item.cancel_event.set()
+                    elif action == "names":
+                        self._rename(item)
                     else:
                         with self._lock:
                             if item in self.items and item.status != "running":
@@ -386,6 +485,8 @@ class TranscriptPage(Page):
             return
         # 設定欄捲動後,被捲到看不見的控制項不能被點到
         in_settings = self.settings_area.collidepoint(mouse_pos)
+        if in_settings and not self.running and self._refine_allowed() and self.refine_toggle.clicked(mouse_pos, True):
+            return
         if in_settings and self.fix_toggle.clicked(mouse_pos, True):
             self.fix_dialog.data["enabled"] = self.fix_toggle.value
             corrections.save(self.fix_dialog.data)
@@ -394,7 +495,7 @@ class TranscriptPage(Page):
             self.fix_dialog.open()
             return
         if not self.running and in_settings:
-            for control in (self.model, self.script, self.output, self.speakers):
+            for control in (self.script, self.output, self.speakers):
                 if control.clicked(mouse_pos, True):
                     return
 

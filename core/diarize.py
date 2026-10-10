@@ -50,6 +50,7 @@ WHOLE, MIN_WINDOW = 2.0, 0.4     # 2 秒以內整段算一次;不到 0.4 秒太�
 MAX_AUTO = 6
 AUTO_MARGIN = 0.03               # 自動判斷人數時,分數差不到這麼多就選人數少的,避免多算
 MIN_SHARE = 0.05                 # 自動模式下,說話時間佔全部不到這個比例的群視為背景雜音
+MERGE = 0.80                     # 自動模式下,兩群的中心比這個像就合併成同一人(見 merge_close)
 
 
 class _Config(ctypes.Structure):
@@ -252,7 +253,35 @@ def cluster(vectors, speakers=0):
         labels = _best_kmeans(vectors, k)
         candidates.append((k, _silhouette(similarity, sample, labels, k), labels))
     best = max(score for _, score, _ in candidates)
-    return next(labels for _, score, labels in candidates if score >= best - AUTO_MARGIN)
+    labels = next(labels for _, score, labels in candidates if score >= best - AUTO_MARGIN)
+    return merge_close(vectors, labels)
+
+
+def _center(vectors):
+    total = [sum(column) for column in zip(*vectors)]
+    norm = math.sqrt(sum(v * v for v in total)) or 1.0
+    return [v / norm for v in total]
+
+
+def merge_close(vectors, labels, threshold=None):
+    """自動判斷人數時,聲音很像的兩群合併(同一個人被硬拆成兩群):重複到沒有可以合併的。
+    2026-10-10 實測(10 分鐘素材):單人 Podcast、單人實況被分成兩群,兩群中心相似度 0.94、0.89;
+    真的不同人(兩人 Podcast、Discord 三人、多人 Podcast)最高 0.70,和即時字幕一樣用 0.80 為界。"""
+    threshold = MERGE if threshold is None else threshold
+    labels = list(labels)
+    while True:
+        groups = {}
+        for vector, label in zip(vectors, labels):
+            groups.setdefault(label, []).append(vector)
+        centers = {label: _center(group) for label, group in groups.items()}
+        keys = sorted(centers)
+        pairs = [(sum(map(mul, centers[a], centers[b])), a, b) for i, a in enumerate(keys) for b in keys[i + 1:]]
+        if not pairs:
+            return labels
+        similarity, keep, drop = max(pairs)
+        if similarity < threshold:
+            return labels
+        labels = [keep if label == drop else label for label in labels]
 
 
 def _to_segments(wins, labels, voice):

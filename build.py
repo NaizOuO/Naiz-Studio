@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parent
 NAME = "Naiz Studio"
 # 插件是執行時才從資料夾讀入,PyInstaller 看不到它們用了哪些套件,要自己列出來
 EXTRA_IMPORTS = ["pypdfium2", "resvg_py", "pikepdf", "opencc", "pillow_heif", "rawpy", "vtracer", "queue", "compression.zstd",
-                 "comtypes", "fugashi", "shlex"]        # shlex:fugashi 的編譯模組裡用到,PyInstaller 看不到
+                 "comtypes", "fugashi", "shlex", "pypinyin"]        # shlex:fugashi 的編譯模組裡用到,PyInstaller 看不到
 # 主程式沒用到、但擴充模組可能會用的內建模組;不列出來的話 exe 裡沒有,模組 import 會失敗
 STDLIB_FOR_MODS = ["sqlite3", "configparser", "tomllib", "shelve", "dbm", "wave", "sched", "csv",
                    "http.server", "xml.dom.minidom", "statistics", "fractions", "difflib", "calendar"]
@@ -32,7 +32,7 @@ EXCLUDE = ["tkinter", "pymupdf", "fitz", "scipy", "matplotlib", "mpl_toolkits", 
 # fontTools 讀字型表格時是依名稱動態匯入模組,要整包收進去
 COLLECT = ["core", "PIL", "fontTools", "comtypes"]     # comtypes:即時字幕擷取聲音
 # python-docx 會讀自己附的範本檔,資料檔要一起收進去
-COLLECT_DATA = ["docx"]
+COLLECT_DATA = ["docx", "pypinyin"]          # pypinyin:逐字稿「更精確」判斷同音字,拼音資料是 json 檔
 # 用 delvewheel 打包的套件:DLL 放在套件旁邊的「套件名.libs」,啟動時從那裡載入(fugashi:即時字幕的振假名)
 DELVEWHEEL = ["fugashi"]
 
