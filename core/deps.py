@@ -408,11 +408,141 @@ def _watch_cancel(response, cancel):
     return stop
 
 
+# 同時開好幾條連線、各下載檔案的不同段落:GitHub 一條連線常被限速,
+# 2026-10-12 實測(交替各 30 秒、三輪):1 條平均 0.05 MB/s、4 條 0.31 MB/s;8 條和 4 條差不多。
+# Hugging Face 一條就跑滿網路(約 11.5 MB/s),多開不會更快也不會更慢。
+PARALLEL_MIN = 32 * 1024 * 1024     # 檔案(和剩下要下載的)這麼大以上才分段(小檔案一條就好)
+SWITCH_AFTER = 3.0                  # 一條連線下載這麼多秒後看速度
+SLOW = 4 * 1024 * 1024              # 一條連線每秒不到這麼多:改成分段(實測 Hugging Face 一條約 11.5 MB/s,分段反而慢一點)
+SEGMENT_MIN = 8 * 1024 * 1024       # 每段多大:檔案的 1/18(每條連線約分到 3 段),介於 8～64 MB。
+SEGMENT_MAX = 64 * 1024 * 1024      # 太小的段落每段都要重新連線、轉址,實測 4 MB 一段在 Hugging Face 反而比一條慢 25%
+START_CONNECTIONS = 2
+MAX_CONNECTIONS = 6
+GROW_EVERY = 3.0                    # 每隔幾秒看一次速度,變快就再加一條
+GROW_GAIN = 1.15                    # 加一條後速度要快 15% 以上才繼續加
+BUSY_STATUS = (403, 429, 503)       # 伺服器嫌連線太多:少開一條
+
+
+def _download_parallel(dep, download, total, progress, cancel, start=0, digest=None):
+    """從 start 開始分段同時下載到 download(先把檔案補到完整大小,各段寫到自己的位置);
+    前面 start 個位元組是一條連線已經下載好的,digest 是它們的 SHA-256,下載完接著算後面的。
+    連線數自動調整:先開 START_CONNECTIONS 條,總速度還在變快就加,伺服器嫌多就減。"""
+    with open(download, "r+b" if start else "wb") as fp:
+        fp.truncate(total)
+    segment = min(max(total // (MAX_CONNECTIONS * 3), SEGMENT_MIN), SEGMENT_MAX)
+    pending = [(at, min(at + segment, total)) for at in range(start, total, segment)]
+    lock = threading.Lock()
+    state = {"done": start, "limit": MAX_CONNECTIONS, "error": None, "failures": 0}
+    stop = threading.Event()
+
+    def worker():
+        with open(download, "r+b") as fp:
+            while not stop.is_set():
+                with lock:
+                    if not pending or state["workers"] > state["limit"]:
+                        state["workers"] -= 1
+                        return
+                    begin, end = pending.pop(0)
+                position = begin
+                try:
+                    request = urllib.request.Request(dep.url, headers={"User-Agent": "NaizStudio",
+                                                                       "Range": f"bytes={begin}-{end - 1}"})
+                    response = _open(request, cancel)
+                    watching = _watch_cancel(response, cancel)
+                    try:
+                        with response:
+                            if response.status != 206:
+                                raise ConnectionError("伺服器不接受分段下載")
+                            while position < end and not stop.is_set():
+                                chunk = response.read(min(64 * 1024, end - position))
+                                if not chunk:
+                                    break
+                                fp.seek(position)
+                                fp.write(chunk)
+                                position += len(chunk)
+                                with lock:
+                                    state["done"] += len(chunk)
+                    finally:
+                        watching.set()
+                    if position < end:
+                        raise http.client.IncompleteRead(b"", end - position)
+                except Cancelled:
+                    stop.set()
+                    return
+                except (*NETWORK_ERRORS, OSError) as exc:
+                    with lock:
+                        pending.insert(0, (position, end))      # 沒下載完的部分放回去,下次從斷掉的地方接著下載
+                        state["failures"] += 1
+                        if isinstance(exc, urllib.error.HTTPError) and exc.code in BUSY_STATUS:
+                            state["limit"] = max(1, state["limit"] - 1)
+                        if state["failures"] > RETRIES * MAX_CONNECTIONS:
+                            state["error"] = exc
+                            stop.set()
+                            return
+                    if cancel is not None and cancel.wait(min(2 ** min(state["failures"], 4), 15)):
+                        stop.set()
+                        return
+
+    threads = []
+
+    def add():
+        with lock:
+            state["workers"] = state.get("workers", 0) + 1
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        threads.append(thread)
+
+    for _ in range(START_CONNECTIONS):
+        add()
+    growing, last_speed = True, 0.0
+    mark_time, mark_done = time.monotonic(), start
+    while any(t.is_alive() for t in threads):
+        if cancel is not None and cancel.wait(0.1):
+            stop.set()
+            break
+        if cancel is None:
+            time.sleep(0.1)
+        with lock:
+            done, limit, workers = state["done"], state["limit"], state["workers"]
+        if progress:
+            progress(done, total)
+        now = time.monotonic()
+        if growing and now - mark_time >= GROW_EVERY:
+            speed = (done - mark_done) / (now - mark_time)
+            if workers < limit and pending and (not last_speed or speed > last_speed * GROW_GAIN):
+                add()                       # 還在變快(或第一次量):再加一條
+            else:
+                growing = False             # 不再變快:維持現在的條數
+            last_speed, mark_time, mark_done = speed, now, done
+        if workers < 1 and pending and not stop.is_set():
+            add()                           # 全部被伺服器嫌多退掉了:至少留一條
+    for thread in threads:
+        thread.join(1)
+    if cancel is not None and cancel.is_set():
+        raise Cancelled()
+    if state["error"] is not None:
+        raise ConnectionError(f"下載 {dep.name} 時網路連線一直被中斷，請確認網路後再按重試") from state["error"]
+    if state["done"] < total or pending:
+        raise ConnectionError(f"下載 {dep.name} 沒有下載完整，請重試")
+    digest = digest or hashlib.sha256()
+    with open(download, "rb") as fp:
+        fp.seek(start)
+        while True:
+            block = fp.read(4 * 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest
+
+
 def _download(dep, download, base, progress, cancel):
-    """下載到 download,回傳 SHA-256 的計算物件。連線被對方切斷(例如 WinError 10054)或逾時時,
+    """下載到 download,回傳 SHA-256 的計算物件。先用一條連線,SWITCH_AFTER 秒後還很慢(大檔案、伺服器支援分段)
+    就把剩下的部分改成好幾條連線同時下載(見 _download_parallel);快的伺服器照舊一條,沒有額外的請求。
+    連線被對方切斷(例如 WinError 10054)或逾時時,
     等一下自動重試,並請伺服器從已下載的位置接著傳(不支援續傳時從頭再下載一次)。"""
     digest = hashlib.sha256()
     done, total = 0, 0
+    switch = False
     with open(download, "wb"):
         pass
     for attempt in range(RETRIES + 1):
@@ -436,6 +566,8 @@ def _download(dep, download, base, progress, cancel):
                 if not done:
                     total = length
                     _check_space(dep, base, total)
+                ranges = (response.headers.get("Accept-Ranges") or "").lower() == "bytes"
+                began, since = time.monotonic(), done
                 with open(download, "ab") as fp:
                     while True:
                         if cancel is not None and cancel.is_set():
@@ -448,6 +580,13 @@ def _download(dep, download, base, progress, cancel):
                         done += len(chunk)
                         if progress:
                             progress(done, total)
+                        spent = time.monotonic() - began
+                        if (ranges and total >= PARALLEL_MIN and total - done >= PARALLEL_MIN and spent >= SWITCH_AFTER
+                                and (done - since) / spent < SLOW):
+                            switch = True           # 一條連線太慢:剩下的改成分段同時下載
+                            break
+            if switch:
+                break                       # 在重試的迴圈外面改成分段(分段自己會重試)
             if cancel is not None and cancel.is_set():
                 raise Cancelled()
             if total and done < total:
@@ -469,6 +608,8 @@ def _download(dep, download, base, progress, cancel):
         finally:
             if stop is not None:
                 stop.set()
+    if switch:
+        return _download_parallel(dep, download, total, progress, cancel, done, digest)
     return digest
 
 

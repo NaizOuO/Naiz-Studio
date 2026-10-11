@@ -95,6 +95,8 @@ def screen_text():
 
 
 def draw_text(surface, text, pos, size=16, color=theme.TEXT, bold=False, center=False, right=False):
+    if "\0" in text:
+        text = text.replace("\0", "")      # 字型畫不出空字元(外部來的文字,例如程式說明,偶爾會帶)
     key = (text, size, bold, tuple(color))
     img = _texts.get(key)
     if img is None:

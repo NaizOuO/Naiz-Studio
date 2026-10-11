@@ -383,7 +383,8 @@ def _description(path):
         lang, page = ctypes.cast(pointer, POINTER(wintypes.WORD * 2)).contents
         key = f"\\StringFileInfo\\{lang:04x}{page:04x}\\FileDescription"
         if version.VerQueryValueW(data, key, byref(pointer), byref(length)) and length.value > 1:
-            text = ctypes.wstring_at(pointer, length.value - 1).strip()
+            # 有的程式說明後面補了空字元(長度照補過的算):只取到第一個空字元,不然畫面上畫不出來(v1.22.1)
+            text = ctypes.wstring_at(pointer, length.value - 1).split("\0", 1)[0].strip()
             return text or name
     except Exception:
         pass
