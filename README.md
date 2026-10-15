@@ -223,22 +223,93 @@ python naiz_studio.py
 | Liberation Sans、Liberation Serif（各 4 種樣式） | 英文，字寬和 Arial、Times New Roman 一樣 | 全部一起下載約 2.3 MB |
 | Noto Sans Mono | 英文等寬，程式碼、數據 | 約 1.6 MB |
 
-## 給其他程式呼叫（命令列）
+## 給其他程式、AI 呼叫（命令列、MCP）
 
-可以不開視窗，直接請 Naiz Studio 處理檔案。
+可以不開視窗，讓其他程式或 AI 直接使用 Naiz Studio 的功能，全部在本地處理，不會上傳。
+
+> **給 AI 模型**：使用者要你「接上 Naiz Studio」或「用 Naiz Studio 看影片／轉逐字稿」時，照下面的步驟做。
+> 能用 MCP 就用 MCP（第 1 步）；不能用 MCP 的程式改用命令列（第 4 步）。
+
+### 1. 找到 Naiz Studio
+
+- **下載的版本（exe）**：資料夾裡的 `Naiz Studio.exe`，例如 `C:\Users\使用者\Desktop\Naiz Studio\Naiz Studio.exe`。
+  需要 v1.23.0 以上（舊版沒有 MCP）。不確定位置就請使用者提供 exe 的完整路徑。
+- **原始碼版**：專案資料夾裡的 `naiz_cli.py`，要用已經裝好相依套件的 Python 執行。
+
+### 2. 設定 MCP
+
+MCP 伺服器的啟動方式：
+
+| 版本 | command | args |
+|---|---|---|
+| exe | `Naiz Studio.exe` 的完整路徑 | `["--mcp"]` |
+| 原始碼 | `python` | `["naiz_cli.py 的完整路徑", "--mcp"]` |
+
+**Claude Code**：在終端機執行（路徑換成實際位置）
 
 ```bash
-python naiz_cli.py images-to-pdf --output 報告.pdf 照片1.jpg 照片2.jpg
+claude mcp add naiz-studio -- "C:\Users\使用者\Desktop\Naiz Studio\Naiz Studio.exe" --mcp
 ```
 
-打包成 exe 後則是 `"Naiz Studio.exe" --cli images-to-pdf …`；exe 沒有主控台，要加 `--result 結果.json`
-把結果寫成檔案。
+或在專案的 `.mcp.json`（Claude Desktop 是 `%APPDATA%\Claude\claude_desktop_config.json`）加入：
 
-- `--page-size keep|a4|first`：每頁維持原大小、統一成 A4、統一成第一頁的大小（等比縮放置中，直向橫向各自對齊）
-- `--quality none|light|standard|strong`：壓縮等級
-- `--list 清單.txt`：檔案很多時改用清單檔，每行一個路徑
-- 結果是一行 JSON：`{"ok": true, "output": "…", "pages": 3, "bytes": 812345}`；失敗時 `ok` 為 `false`，
-  `error` 是可以直接顯示給使用者看的中文訊息，離開碼為 1
+```json
+{
+  "mcpServers": {
+    "naiz-studio": {
+      "command": "C:\\Users\\使用者\\Desktop\\Naiz Studio\\Naiz Studio.exe",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
+其他支援 MCP 的程式（Cursor、Discord bot 用的 MCP 用戶端等）也是同樣的 command 和 args，透過標準輸入輸出（stdio）連線。
+設定好後重新開啟 AI 工具，會看到 `naiz-studio` 的工具。
+
+### 3. 工具
+
+| 工具 | 用途 | 常用參數 |
+|---|---|---|
+| `video-look` | 影片拆成一張張畫面（附時間）和一張總覽圖；可以順便轉逐字稿。**要看影片內容時用這個** | `video`（必填）、`every` 每隔幾秒（0＝自動，最多 `max_frames` 張，預設 24）、`transcript`（`none` 或辨識模型，例如 `turbo`）、`language` |
+| `transcribe` | 錄音或影片轉逐字稿（SRT 有時間軸、TXT 純文字） | `media`（必填）、`model`（`base`／`small`／`turbo`／`large`／`breeze`，預設 `turbo`）、`language`（預設 `auto`）、`speakers`（`off`／`auto`／人數）、`refine`（更精確，只對中文）、`format` |
+| `images-to-pdf` | 圖片（也可以混 PDF）依順序合成一份 PDF | `files`、`output`（必填）、`page_size`、`quality` |
+
+每個工具的完整參數、選項和說明，MCP 的工具清單裡都有（命令列用 `info` 查）。
+
+使用時要注意：
+
+- **路徑一律用完整的本機路徑**（例如 `C:\Users\…\影片.mp4`）。
+- **結果**：成功時 `ok` 是 `true`，並附上輸出檔案的完整路徑；`video-look` 另外附上總覽圖（圖片），看得懂圖片的模型可以直接看。
+  `transcribe` 的結果也直接附上逐字稿文字 `text`（太長時截斷，`text_truncated` 為 `true`，完整內容讀 `txt` 檔）。
+- **失敗**：`ok` 是 `false`，`error` 是可以直接告訴使用者的中文說明。
+- **缺少元件**（辨識模型、FFmpeg 等）：預設**不會**下載，結果的 `missing` 列出要下載什麼、多大。
+  **先問使用者同意**，再用 `allow_download: true` 重試（模型可能好幾 GB）。
+- **輸出位置**：沒指定 `output` 時存在 Naiz Studio 資料夾的 `output\video_look\影片名\`、`output\transcripts\`。不會覆蓋原檔，同名時自動加編號。
+- 轉逐字稿、長影片要跑一段時間（10 分鐘的影片約 20 秒到幾分鐘，看顯示卡），會回報進度。
+
+### 4. 命令列（不能用 MCP 的程式）
+
+```bash
+"Naiz Studio.exe" --cli video-look "C:\影片.mp4" --transcript turbo --result "C:\結果.json"
+python naiz_cli.py transcribe "C:\會議.m4a" --speakers auto --progress
+```
+
+- 指令和參數同第 3 步（參數名稱的底線換成 `-`，例如 `--max-frames`；開關類參數寫 `--refine`、`--no-sheet`）。
+  `info` 列出所有指令、參數和說明（JSON）。
+- **exe 沒有主控台，一定要加 `--result 結果.json`**，結果寫在那個檔案裡；原始碼版直接印在標準輸出。
+- `--progress`：處理中每一行印一筆進度 `{"progress": 0.4, "text": "辨識語音"}`，最後一行是結果。
+- `--allow-download`：缺少的元件自動下載。
+- 結果是一行 JSON，格式同第 3 步；失敗時離開碼為 1。
+
+### 5. 有問題時
+
+| 狀況 | 原因與處理 |
+|---|---|
+| AI 工具裡看不到 `naiz-studio` | 路徑錯了、或版本舊於 v1.23.0；改好設定後要重新開啟 AI 工具 |
+| `需要先下載：…` | 缺元件，問使用者後用 `allow_download` 重試，或打開 Naiz Studio 用一次那個功能時下載 |
+| `找不到檔案` | 路徑要用完整路徑，檔名有空白也沒關係（JSON 字串裡反斜線要寫兩個） |
+| 轉逐字稿很慢 | 沒有 NVIDIA 顯示卡時用 `model: small`；`refine` 會多花約 3 倍時間 |
 
 ## 自己寫擴充模組
 

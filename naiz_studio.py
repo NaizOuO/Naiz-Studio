@@ -9,6 +9,7 @@ import time
 import traceback
 from pathlib import Path
 
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")    # 不印 pygame 的歡迎訊息(--cli、--mcp 的輸出只能是 JSON)
 # SDL 預設會丟掉「讓視窗變成作用中」的那一下點擊。從檔案總管拖檔進來後作用中的是檔案總管,
 # 不加這行的話,拖完檔第一次點選檔案、輸入框或頁面都會沒反應
 os.environ.setdefault("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1")
@@ -835,6 +836,12 @@ def main():
 
         run_overlay(int(sys.argv[2]), sys.argv[3])
         return
+    # 給 AI 工具(Claude Code 等)用的 MCP 伺服器:不開視窗,透過標準輸入輸出溝通,對方關掉就結束
+    if len(sys.argv) > 1 and sys.argv[1] == "--mcp":
+        from core import mcp
+
+        paths.migrate_legacy()
+        sys.exit(mcp.main())
     # 給其他程式呼叫的命令列模式:不開視窗,做完就結束
     if len(sys.argv) > 1 and sys.argv[1] == "--cli":
         from core.cli import main as cli_main
