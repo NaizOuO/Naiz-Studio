@@ -95,10 +95,12 @@ def _probe(video):
 
 def _clock(seconds, precise=False):
     """畫面上的時間:00:12、1:02:03;precise 時到 0.1 秒(00:12.5,取得很密時用)。"""
-    whole = int(seconds)
+    # 先整個四捨五入到 0.1 秒再拆:分開算整數和小數的話,8.95 會變成「00:08.0」(小數進位了,整數沒有)
+    tenths = int(round(seconds * 10)) if precise else int(seconds) * 10
+    whole, tenth = divmod(tenths, 10)
     text = f"{whole // 3600}:{whole // 60 % 60:02d}:{whole % 60:02d}" if whole >= 3600 \
         else f"{whole // 60:02d}:{whole % 60:02d}"
-    return text + f".{int(round((seconds - whole) * 10)) % 10}" if precise else text
+    return text + f".{tenth}" if precise else text
 
 
 def _sheet(frames, path, thumb_width):
