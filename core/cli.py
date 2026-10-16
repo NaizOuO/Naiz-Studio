@@ -85,6 +85,10 @@ def _common(sub):
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")          # 一律 UTF-8(主控台是 cp950 時中文才不會變亂碼)
+    except (AttributeError, ValueError):
+        pass
     if argv and argv[0] == "--cli":
         # exe 需要 --cli 才知道不要開視窗;這裡也接受,呼叫的程式就能用同一種寫法指向 exe 或 .py
         argv = argv[1:]

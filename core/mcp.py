@@ -102,10 +102,15 @@ class Server:
             if cancel.is_set():
                 return                          # 已經取消:不用回覆
             content = [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]
-            sheet = result.get("sheet")
-            if sheet and Path(sheet).is_file() and Path(sheet).stat().st_size <= IMAGE_LIMIT:
+            # 總覽圖直接附上(好幾張時照順序附,合計不超過 IMAGE_LIMIT;沒附上的看結果裡的路徑)
+            budget = IMAGE_LIMIT
+            for sheet in result.get("sheets") or ([result["sheet"]] if result.get("sheet") else []):
+                path = Path(sheet)
+                if not path.is_file() or path.stat().st_size > budget:
+                    break
+                budget -= path.stat().st_size
                 content.append({"type": "image", "mimeType": "image/jpeg",
-                                "data": base64.b64encode(Path(sheet).read_bytes()).decode()})
+                                "data": base64.b64encode(path.read_bytes()).decode()})
             self.reply(request_id, {"content": content, "structuredContent": result, "isError": not result.get("ok")})
 
         if name not in self.registry:

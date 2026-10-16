@@ -17,7 +17,7 @@ SCRIPTS = (("tw", "台灣繁體"), ("cn", "簡體"), ("none", "不轉換"))
 FORMATS = (("both", "SRT 和 TXT"), ("srt", "只要 SRT"), ("txt", "只要 TXT"))
 TEXT_LIMIT = 20000          # 結果裡直接附上的逐字稿最多幾個字(太長的請讀 TXT 檔)
 SHEET_COLUMNS = 4
-SHEET_THUMB = 360           # 總覽圖每格寬度
+
 
 
 def _folder(value, default):
@@ -93,13 +93,15 @@ def _probe(video):
     return duration, has_video
 
 
-def _clock(seconds):
-    seconds = int(seconds)
-    return f"{seconds // 3600}:{seconds // 60 % 60:02d}:{seconds % 60:02d}" if seconds >= 3600 \
-        else f"{seconds // 60:02d}:{seconds % 60:02d}"
+def _clock(seconds, precise=False):
+    """畫面上的時間:00:12、1:02:03;precise 時到 0.1 秒(00:12.5,取得很密時用)。"""
+    whole = int(seconds)
+    text = f"{whole // 3600}:{whole // 60 % 60:02d}:{whole % 60:02d}" if whole >= 3600 \
+        else f"{whole // 60:02d}:{whole % 60:02d}"
+    return text + f".{int(round((seconds - whole) * 10)) % 10}" if precise else text
 
 
-def _sheet(frames, path):
+def _sheet(frames, path, thumb_width):
     """總覽圖:縮圖排成格子,每張左上角標時間。"""
     import os
 
@@ -109,16 +111,17 @@ def _sheet(frames, path):
     for frame in frames:
         with Image.open(frame["path"]) as image:
             image = image.convert("RGB")
-            image.thumbnail((SHEET_THUMB, SHEET_THUMB))
+            image.thumbnail((thumb_width, thumb_width * 4))
             thumbs.append((image.copy(), frame["clock"]))
-    cell_w = SHEET_THUMB
+    cell_w = thumb_width
     cell_h = max(t.height for t, _ in thumbs)
     columns = min(SHEET_COLUMNS, len(thumbs))
     rows = math.ceil(len(thumbs) / columns)
     sheet = Image.new("RGB", (columns * cell_w + (columns + 1) * 6, rows * cell_h + (rows + 1) * 6), (20, 22, 28))
     pen = ImageDraw.Draw(sheet)
     try:
-        font = ImageFont.truetype(os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts", "msjh.ttc"), 20)
+        font = ImageFont.truetype(os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts", "msjh.ttc"),
+                                  max(14, thumb_width // 18))
     except OSError:
         font = ImageFont.load_default()
     for index, (thumb, clock) in enumerate(thumbs):
@@ -131,51 +134,132 @@ def _sheet(frames, path):
     sheet.save(path, quality=88)
 
 
-@command("video-look", "影片拆成一張張畫面（附時間）和一張總覽圖，可以順便轉逐字稿；給看得懂圖片的 AI 了解影片內容", [
+def _parse_crop(text):
+    """「x,y,寬,高」(原始畫面的像素)→ ffmpeg 的 crop 濾鏡。"""
+    try:
+        x, y, w, h = (int(float(v)) for v in text.replace("，", ",").split(","))
+    except ValueError:
+        raise CommandError(f"crop 要寫成「x,y,寬,高」（原始畫面的像素），例如 0,80,1280,720：{text}") from None
+    if w < 16 or h < 16 or x < 0 or y < 0:
+        raise CommandError("crop 的寬、高至少 16，x、y 不能是負的")
+    return f"crop={w}:{h}:{x}:{y}"
+
+
+def _changes(frames):
+    """每張和前一張差多少(0～100,畫面平均變化;第一張是 0):先讀這串數字找動作大的時刻,只看那幾張。"""
+    from PIL import Image, ImageChops, ImageStat
+
+    previous = None
+    for frame in frames:
+        with Image.open(frame["path"]) as image:
+            small = image.convert("L").resize((96, 54))
+        frame["change"] = 0.0 if previous is None else round(
+            ImageStat.Stat(ImageChops.difference(small, previous)).mean[0] / 2.55, 1)
+        previous = small
+
+
+def _grab(video, folder, times, width, crop, prefix, precise):
+    """在指定的時間點各擷取一張(時間點不多時用:--at、或間隔很大)。width 0 是原尺寸。"""
+    frames = []
+    filters = ",".join(f for f in (crop, f"scale='min({width},iw)':-2" if width else "") if f)
+    for index, at in enumerate(times):
+        path = folder / f"{prefix}_{index + 1:03d}_{_clock(at, precise).replace(':', '-')}.jpg"
+        command = [deps.FFMPEG.path(), "-nostdin", "-y", "-v", "error", "-ss", f"{at:.3f}", "-i", video,
+                   "-frames:v", "1", "-q:v", "2"]
+        if filters:
+            command += ["-vf", filters]
+        if deps.run([*command, path], capture_output=True, timeout=600).returncode == 0 and path.is_file():
+            frames.append({"time": round(at, 2), "clock": _clock(at, precise), "path": str(path)})
+    return frames
+
+
+@command("video-look", "影片拆成一張張畫面（附時間、和前一張的變化量）和總覽圖，可以只取一段時間、裁切、順便轉逐字稿；"
+                       "給看得懂圖片的 AI 了解影片內容", [
     Param("video", "影片檔（只有聲音的檔案就只轉逐字稿）", kind="file", required=True, positional=True),
-    Param("every", "每隔幾秒擷取一張（0＝依影片長度自動決定）", kind="float", default=0),
-    Param("max_frames", "最多擷取幾張", kind="int", default=24),
-    Param("width", "每張畫面的寬度（像素）", kind="int", default=960),
-    Param("sheet", "另外拼一張總覽圖（所有畫面排成格子、標時間）", kind="bool", default=True),
+    Param("every", "每隔幾秒擷取一張（0＝依長度自動決定，約 24 張）；要看快速動作可以 0.5 或 0.1", kind="float", default=0),
+    Param("start", "從第幾秒開始（只看一段時）", kind="float", default=0),
+    Param("end", "到第幾秒結束（0＝到影片結尾）", kind="float", default=0),
+    Param("max_frames", "最多擷取幾張（0＝自動：沒指定間隔時 24 張，指定間隔時最多 1000 張）", kind="int", default=0),
+    Param("width", "每張畫面的寬度（像素，越小越省看圖的額度）", kind="int", default=960),
+    Param("crop", "只留畫面的一塊：「x,y,寬,高」（原始畫面的像素），例如只留遊戲視窗、去掉瀏覽器和工作列", kind="text"),
+    Param("at", "只取這幾個時間點的原尺寸畫面，用逗號分開（秒），例如 12.8,20.2；總覽圖看到可疑處後用", kind="text"),
+    Param("sheet", "另外拼總覽圖（畫面排成格子、每格標時間）", kind="bool", default=True),
+    Param("sheet_size", "每張總覽圖放幾格（畫面多時分成好幾張總覽圖）", kind="int", default=24),
+    Param("tile_width", "總覽圖每格的寬度（像素）", kind="int", default=360),
     Param("transcript", "順便轉逐字稿用的辨識模型（none＝不轉）", kind="choice",
           choices=(("none", "不轉"),) + MODELS, default="none"),
     Param("language", "逐字稿的原文語言", kind="choice", choices=LANGUAGES, default="auto"),
     Param("output", "輸出資料夾（預設 Naiz Studio 的 output\\video_look\\影片名）", kind="folder"),
-], long=True, examples=["video-look 錄影.mp4", "video-look 錄影.mp4 --every 2 --transcript turbo"])
+], long=True, examples=["video-look 錄影.mp4", "video-look 錄影.mp4 --every 2 --crop 0,80,1280,720",
+                        "video-look 錄影.mp4 --start 8 --end 13 --every 0.1", "video-look 錄影.mp4 --at 12.8,20.2",
+                        "video-look 錄影.mp4 --transcript turbo"])
 def video_look(args, ctx):
     video = args["video"]
     ctx.need([deps.FFMPEG])
-    if args["max_frames"] < 1 or args["width"] < 64:
-        raise CommandError("max_frames 至少 1、width 至少 64")
+    if args["width"] and args["width"] < 64 or args["tile_width"] < 64 or args["sheet_size"] < 1:
+        raise CommandError("width、tile_width 至少 64，sheet_size 至少 1")
+    if args["max_frames"] < 0 or args["every"] < 0:
+        raise CommandError("every、max_frames 不能是負的")
     folder = _folder(args["output"], paths.OUTPUT_DIR / "video_look" / video.stem)
     duration, has_video = _probe(video)
+    crop = _parse_crop(args["crop"]) if args["crop"] else ""
     result = {"output": str(folder), "duration": round(duration, 2), "frames": []}
-    if has_video:
-        every = args["every"] or max(1.0, duration / args["max_frames"])
-        count = max(1, min(args["max_frames"], math.ceil(duration / every) if duration else 1))
-        first = min(every / 2, max(0.0, duration - 0.1))           # 每段的中間,不會拍到開頭的黑畫面
-        ctx.progress(0.0, "擷取畫面")
-        pattern = folder / "frame_%03d.jpg"
-        for old in folder.glob("frame_*.jpg"):
+    for old in folder.glob("*.jpg"):
+        if old.name.startswith(("frame_", "at_", "sheet")):
             old.unlink()
-        code = deps.run([deps.FFMPEG.path(), "-nostdin", "-y", "-v", "error", "-ss", f"{first:.3f}", "-i", video,
-                         "-vf", f"fps=1/{every:.6f},scale={args['width']}:-2", "-frames:v", str(count), "-q:v", "3",
-                         pattern], capture_output=True, timeout=3600).returncode
-        files = sorted(folder.glob("frame_*.jpg"))
-        if code != 0 or not files:
+    if has_video and args["at"]:
+        try:
+            times = [float(v) for v in args["at"].replace("，", ",").split(",") if v.strip()]
+        except ValueError:
+            raise CommandError(f"at 要寫成秒數，用逗號分開，例如 12.8,20.2：{args['at']}") from None
+        bad = [t for t in times if t < 0 or (duration and t > duration)]
+        if bad:
+            raise CommandError(f"時間點超出影片長度（{duration:.1f} 秒）：{bad}")
+        ctx.progress(0.0, "擷取畫面")
+        result["frames"] = _grab(video, folder, times, 0 if args["width"] == 960 else args["width"], crop, "at", True)
+        if not result["frames"]:
             raise CommandError("擷取畫面失敗（影片可能損壞）")
+    elif has_video:
+        start = max(0.0, args["start"])
+        end = min(args["end"] or duration, duration) if duration else args["end"]
+        if duration and start >= end:
+            raise CommandError(f"開始時間要比結束早，而且在影片長度（{duration:.1f} 秒）以內")
+        span = (end - start) if end else 0
+        limit = args["max_frames"] or (24 if not args["every"] else 1000)
+        every = args["every"] or max(1.0, span / limit if span else 1.0)
+        count = max(1, min(limit, math.ceil(span / every) if span else 1))
+        first = start + min(every / 2, max(0.0, span - 0.05))      # 每段的中間,不會拍到開頭的黑畫面
+        precise = every < 1
+        ctx.progress(0.0, "擷取畫面")
+        pattern = folder / "frame_%04d.jpg"
+        filters = ",".join(f for f in (f"fps=1/{every:.6f}", crop, f"scale='min({args['width']},iw)':-2" if args["width"] else "")
+                           if f)
+        code = deps.run([deps.FFMPEG.path(), "-nostdin", "-y", "-v", "error", "-ss", f"{first:.3f}", "-i", video,
+                         "-vf", filters, "-frames:v", str(count), "-q:v", "3", pattern],
+                        capture_output=True, timeout=3600).returncode
+        files = sorted(folder.glob("frame_[0-9][0-9][0-9][0-9].jpg"))
+        if code != 0 or not files:
+            raise CommandError("擷取畫面失敗（影片可能損壞，或裁切範圍超出畫面）")
         for index, path in enumerate(files):
             at = first + index * every
-            named = path.with_name(f"frame_{index + 1:03d}_{_clock(at).replace(':', '-')}.jpg")
+            named = path.with_name(f"frame_{index + 1:04d}_{_clock(at, precise).replace(':', '-')}.jpg")
             path.replace(named)
-            result["frames"].append({"time": round(at, 2), "clock": _clock(at), "path": str(named)})
-        result["every"] = round(every, 2)
-        if args["sheet"]:
-            sheet = folder / "sheet.jpg"
-            _sheet(result["frames"], sheet)
-            result["sheet"] = str(sheet)
+            result["frames"].append({"time": round(at, 2), "clock": _clock(at, precise), "path": str(named)})
+        result["every"] = round(every, 3)
+        result["range"] = [round(start, 2), round(end, 2)]
     elif args["transcript"] == "none":
         raise CommandError("這個檔案沒有畫面；只有聲音的檔案請用 transcribe，或加上 --transcript 轉逐字稿")
+    if result["frames"]:
+        _changes(result["frames"])
+        if args["sheet"]:
+            size = args["sheet_size"]
+            sheets = []
+            for page, begin in enumerate(range(0, len(result["frames"]), size)):
+                sheet = folder / (f"sheet_{page + 1:02d}.jpg" if len(result["frames"]) > size else "sheet.jpg")
+                _sheet(result["frames"][begin:begin + size], sheet, args["tile_width"])
+                sheets.append(str(sheet))
+            result["sheets"] = sheets
+            result["sheet"] = sheets[0]                 # 舊欄位:第一張
     if args["transcript"] != "none":
         ctx.progress(None, "轉逐字稿")
         result["transcript"] = _transcribe(video, folder, "transcript", args["transcript"], args["language"], "off",

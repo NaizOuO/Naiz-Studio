@@ -271,11 +271,18 @@ claude mcp add naiz-studio -- "C:\Users\使用者\Desktop\Naiz Studio\Naiz Studi
 
 | 工具 | 用途 | 常用參數 |
 |---|---|---|
-| `video-look` | 影片拆成一張張畫面（附時間）和一張總覽圖；可以順便轉逐字稿。**要看影片內容時用這個** | `video`（必填）、`every` 每隔幾秒（0＝自動，最多 `max_frames` 張，預設 24）、`transcript`（`none` 或辨識模型，例如 `turbo`）、`language` |
+| `video-look` | 影片拆成一張張畫面（附時間、和前一張的變化量）和總覽圖；可以只取一段、裁切、順便轉逐字稿。**要看影片內容時用這個** | `video`（必填）、`every` 每隔幾秒（0＝自動約 24 張；快速動作用 0.5 或 0.1）、`start`／`end` 只取一段（秒）、`crop` 只留一塊「x,y,寬,高」、`at` 只取幾個時間點的原尺寸畫面（例如 `12.8,20.2`）、`width` 每張寬度、`sheet_size`／`tile_width` 總覽圖每張幾格／每格多寬、`transcript`（`none` 或辨識模型，例如 `turbo`） |
 | `transcribe` | 錄音或影片轉逐字稿（SRT 有時間軸、TXT 純文字） | `media`（必填）、`model`（`base`／`small`／`turbo`／`large`／`breeze`，預設 `turbo`）、`language`（預設 `auto`）、`speakers`（`off`／`auto`／人數）、`refine`（更精確，只對中文）、`format` |
 | `images-to-pdf` | 圖片（也可以混 PDF）依順序合成一份 PDF | `files`、`output`（必填）、`page_size`、`quality` |
 
 每個工具的完整參數、選項和說明，MCP 的工具清單裡都有（命令列用 `info` 查）。
+
+**看影片的建議做法**（看圖的成本大約和像素數成正比，先便宜地找出可疑時段，再密集看那一段）：
+
+1. 粗看全片：`video-look`（自動約 24 張），有無關區域（瀏覽器、工作列）時加 `crop` 只留需要的部分。
+2. 讀結果裡每張的 `change`（和前一張的變化量，0～100），或看總覽圖，找出可疑的時段。
+3. 細看那一段：`start`、`end` 加上小的 `every`（例如 0.1），畫面多時會分成好幾張總覽圖（`sheets`），每張 `sheet_size` 格。
+4. 需要看清楚某一刻：`at` 取那幾個時間點的原尺寸畫面。
 
 使用時要注意：
 
