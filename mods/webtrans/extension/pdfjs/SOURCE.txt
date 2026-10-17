@@ -1,0 +1,7 @@
+pdf.js 4.10.38 官方預先建置的檢視器(pdfjs-4.10.38-dist.zip)
+https://github.com/mozilla/pdf.js/releases/tag/v4.10.38
+授權:Apache-2.0(見 LICENSE)
+改動:
+- web/viewer.mjs validateFileURL:擴充功能內允許開任何網址的 PDF
+- web/viewer.html:加入 ../../content.js(選字翻譯)、../../page.js(整頁翻譯)
+- 拿掉 .map、範例 PDF、debugger

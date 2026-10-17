@@ -444,6 +444,7 @@ TOOLS = [HelloTool]
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | 即時字幕的內建翻譯引擎（沒有 Ollama 時使用）、「中文（通話）」辨識 | MIT |
 | [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR)（阿里巴巴 Qwen 團隊；[ggml-org 轉的 GGUF](https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF)） | 即時字幕「中文（通話）」辨識模型、逐字稿「更精確」 | Apache-2.0 |
 | [CT-Transformer 中英文標點模型](https://github.com/modelscope/FunASR)（阿里巴巴 FunASR；[sherpa-onnx 轉的 int8 版](https://github.com/k2-fsa/sherpa-onnx/releases/tag/punctuation-models)） | 即時字幕「中文（台灣）」補標點 | FunASR 模型授權（可使用、修改、分享，須註明出處與作者、保留模型名稱） |
+| [pdf.js](https://github.com/mozilla/pdf.js)（Mozilla） | 網頁翻譯擴充功能的 PDF 檢視器（讓 PDF 也能選字翻譯） | Apache-2.0 |
 | [Qwen3](https://huggingface.co/Qwen)（Qwen 官方的 GGUF 檔） | 翻譯模型 | Apache-2.0 |
 | [TranslateGemma](https://huggingface.co/google/translategemma-4b-it)（[mradermacher](https://huggingface.co/mradermacher) 轉換的 GGUF 檔） | 翻譯模型 | [Gemma 使用條款](https://ai.google.dev/gemma/terms) |
 | [Noto 字型](https://github.com/notofonts/noto-cjk)（[Google Fonts](https://github.com/google/fonts)） | 字型包：Noto Sans / Serif TC、SC，Noto Sans Mono | OFL-1.1 |

@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Naiz Studio 網頁翻譯",
+  "version": "1.0.0",
+  "description": "選字翻譯並記下來，翻譯在本地的 Naiz Studio 處理，不上傳。",
+  "permissions": ["webNavigation"],
+  "host_permissions": ["<all_urls>"],
+  "action": { "default_title": "整頁翻譯（再按一次換回原文）" },
+  "commands": {
+    "toggle-page": { "suggested_key": { "default": "Alt+T" }, "description": "整頁翻譯／換回原文" }
+  },
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js", "page.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
