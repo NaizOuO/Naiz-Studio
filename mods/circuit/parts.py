@@ -201,6 +201,10 @@ PARTS = {
                                            ("L", [(-0.07, -0.45), (0.07, -0.45)])], label=(0, -0.62)),
     "rail": _multi("電源端", {"a": (0, 0)}, [("L", [(0, 0), (0, 0.25)]), ("L", [(-0.2, 0.25), (0.2, 0.25)])],
                    label=(0, 0.45)),
+    # 黑板、課本常見的電源畫法:往上的箭頭旁邊寫電壓(例如 10V);轉 180 度就是負電源
+    "rail_arrow": _multi("電源端(箭頭)", {"a": (0, 0)}, [("L", [(0, 0), (0, 0.5)]),
+                                                     ("L", [(-0.12, 0.36), (0, 0.5), (0.12, 0.36)])],
+                         label=(0, 0.7)),
 
     # 二極體
     "diode": _two("二極體", 0.2, _diode()),
@@ -282,7 +286,7 @@ PARTS["vcvs"]["name"] = "電壓控制電壓源"
 CATEGORIES = [
     ("被動元件", ["resistor", "rheostat", "potentiometer", "capacitor", "polar_cap", "var_cap", "inductor",
               "transformer", "coupled", "battery", "fuse", "crystal"]),
-    ("電源", ["vsource", "isource", "sine", "square", "vcvs", "ccvs", "vccs", "cccs", "ground", "rail"]),
+    ("電源", ["vsource", "isource", "sine", "square", "vcvs", "ccvs", "vccs", "cccs", "ground", "rail", "rail_arrow"]),
     ("二極體", ["diode", "schottky", "zener", "tunnel", "varactor", "led", "photodiode", "scr"]),
     ("電晶體與放大器", ["npn", "pnp", "nmos", "pmos", "nmos_dep", "pmos_dep", "nmos4", "pmos4", "nmos_s", "pmos_s", "njfet", "pjfet",
                  "igbt", "opamp", "comparator"]),
