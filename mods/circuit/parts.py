@@ -119,6 +119,14 @@ def _mosfet(p=False, depletion=False, body=False):
     return shapes
 
 
+def _mosfet_simple(p=False):
+    """課本、黑板上常見的簡化畫法:通道一條實線,箭頭畫在源極的引線上(N 通道往外、P 通道往內)。"""
+    shapes = [("L", [(0, 0), (0.4, 0)]), ("L", [(0.4, -0.35), (0.4, 0.35)]), ("L", [(0.55, -0.45), (0.55, 0.45)]),
+              ("L", [(0.55, 0.35), (1, 0.35), (1, 1)]), ("L", [(0.55, -0.35), (1, -0.35), (1, -1)])]
+    shapes.append(("A", (0.92, -0.35), (0.6, -0.35)) if p else ("A", (0.6, -0.35), (0.95, -0.35)))
+    return shapes
+
+
 def _jfet(p=False):
     shapes = [("L", [(0.5, 0.4), (0.5, -0.4)]), ("L", [(0.5, 0.3), (1, 0.3), (1, 1)]),
               ("L", [(0.5, -0.3), (1, -0.3), (1, -1)]), ("L", [(0, 0), (0.5, 0)])]
@@ -218,6 +226,8 @@ PARTS = {
                     _mosfet(body=True)),
     "pmos4": _multi("P 通道 MOSFET(四端)", {"g": (0, 0), "d": (1, 1), "s": (1, -1), "b": (1.5, 0)},
                     _mosfet(p=True, body=True)),
+    "nmos_s": _multi("N 通道 MOSFET(簡化)", {"g": (0, 0), "d": (1, 1), "s": (1, -1)}, _mosfet_simple()),
+    "pmos_s": _multi("P 通道 MOSFET(簡化)", {"g": (0, 0), "d": (1, 1), "s": (1, -1)}, _mosfet_simple(p=True)),
     "njfet": _multi("N 通道 JFET", {"g": (0, 0), "d": (1, 1), "s": (1, -1)}, _jfet()),
     "pjfet": _multi("P 通道 JFET", {"g": (0, 0), "d": (1, 1), "s": (1, -1)}, _jfet(p=True)),
     "igbt": _multi("IGBT", {"g": (0, 0), "c": (1, 1), "e": (1, -1)}, _bjt(gate=True)),
@@ -274,7 +284,7 @@ CATEGORIES = [
               "transformer", "coupled", "battery", "fuse", "crystal"]),
     ("電源", ["vsource", "isource", "sine", "square", "vcvs", "ccvs", "vccs", "cccs", "ground", "rail"]),
     ("二極體", ["diode", "schottky", "zener", "tunnel", "varactor", "led", "photodiode", "scr"]),
-    ("電晶體與放大器", ["npn", "pnp", "nmos", "pmos", "nmos_dep", "pmos_dep", "nmos4", "pmos4", "njfet", "pjfet",
+    ("電晶體與放大器", ["npn", "pnp", "nmos", "pmos", "nmos_dep", "pmos_dep", "nmos4", "pmos4", "nmos_s", "pmos_s", "njfet", "pjfet",
                  "igbt", "opamp", "comparator"]),
     ("量測與其他", ["voltmeter", "ammeter", "ohmmeter", "switch", "lamp", "relay", "speaker", "antenna", "probe",
                "block"]),
@@ -287,7 +297,7 @@ PREFIX = {"resistor": "R", "rheostat": "R", "potentiometer": "R", "capacitor": "
           "crystal": "X", "vsource": "V", "isource": "I", "sine": "v", "square": "v", "diode": "D",
           "schottky": "D", "zener": "D", "tunnel": "D", "varactor": "D", "led": "D", "photodiode": "D",
           "scr": "SCR", "npn": "Q", "pnp": "Q", "nmos": "M", "pmos": "M", "nmos_dep": "M", "pmos_dep": "M",
-          "nmos4": "M", "pmos4": "M", "njfet": "J", "pjfet": "J", "igbt": "Q", "opamp": "U", "comparator": "U",
+          "nmos4": "M", "pmos4": "M", "nmos_s": "M", "pmos_s": "M", "njfet": "J", "pjfet": "J", "igbt": "Q", "opamp": "U", "comparator": "U",
           "switch": "S", "lamp": "L", "relay": "K", "speaker": "LS", "voltage": "v", "current": "i", "loop": "I"}
 
 
