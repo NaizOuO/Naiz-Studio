@@ -217,9 +217,12 @@ def _raw_geometry(el, resistor_style):
         ha, va = _align((where[0] - center[0], where[1] - center[1]))
         labels.append((where, name, ha, va, "label"))
         if value:
-            shift = label_size() * 1.25 if name else 0
-            labels.append(((where[0], where[1] - shift), value, ha, "top" if va == "bottom" and name else va,
-                           "value"))
+            if name and va == "center":         # 名稱在旁邊:數值從名稱下面往下排(數值換行時才不會疊到名稱)
+                labels.append(((where[0], where[1] - label_size() * 0.6), value, ha, "top", "value"))
+            else:
+                shift = label_size() * 1.25 if name else 0
+                labels.append(((where[0], where[1] - shift), value, ha, "top" if va == "bottom" and name else va,
+                               "value"))
         terminals = [apply(fr, p) for p in part["terminals"].values()]
         return dict(shapes=shapes, labels=labels, terminals=terminals)
 
@@ -244,7 +247,8 @@ def _raw_geometry(el, resistor_style):
             shapes = [("T", a, "+", 0.3), ("T", b, "−", 0.3)]
             labels.append((origin, name, "center", "center", "label"))
         else:
-            tail, tip = apply(fr, (-0.22, 0)), apply(fr, (0.22, 0))
+            half = max(length / 2, 0.22)        # 箭頭從 a 畫到 b,拉長就變長(太短時至少有個箭頭的長度)
+            tail, tip = apply(fr, (-half, 0)), apply(fr, (half, 0))
             shapes = [("A", tail, tip)]
             normal = (uy[0] * side * _two_side(ux[0], ux[1]), uy[1] * side * _two_side(ux[0], ux[1]))
             where = (origin[0] + normal[0] * 0.2, origin[1] + normal[1] * 0.2)
@@ -289,10 +293,12 @@ def geometry(el, resistor_style="zigzag"):
 def label_box(point, text, ha, va):
     """標籤文字在畫布上的範圍 (xmin, ymin, xmax, ymax)。"""
     x, y = point
-    width = text_width(text)
+    rows = text.split("\\\\")                     # \\ 換行
+    width = max(text_width(row.strip()) for row in rows)
+    height = label_size() * (1 + 1.25 * (len(rows) - 1))
     left = x - (width / 2 if ha == "center" else width if ha == "right" else 0)
-    low = y - (label_size() if va == "top" else 0 if va == "bottom" else label_size() / 2)
-    return (left, low - label_size() * 0.15, left + width, low + label_size() * 1.1)
+    low = y - (height if va == "top" else 0 if va == "bottom" else height / 2)
+    return (left, low - label_size() * 0.15, left + width, low + height + label_size() * 0.1)
 
 
 def label_at(el, point, pad=0.06):

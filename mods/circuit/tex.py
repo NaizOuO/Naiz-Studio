@@ -168,6 +168,13 @@ def _math(text, size, roman=False):
             atom = _math(group, size, roman)
         elif ch == "\\":
             match = re.match(r"\\([A-Za-z]+|.)", text[i:])
+            if match is None:                       # 最後一個字是反斜線(還在打字):照原文顯示
+                atom = _glyphs("\\", size, "math")
+                i += 1
+                out.add(atom, x)
+                x += atom.width
+                last = atom
+                continue
             name = match.group(1)
             i += len(match.group(0))
             if name in SPACES:
@@ -281,8 +288,30 @@ def segments(text):
 _layouts = {}
 
 
-def layout(text, size):
-    """排好整個標籤,回傳 Box(單位是像素)。"""
+LINE_BREAK = re.compile(r"\\\\")
+LINE_GAP = 1.25             # 換行的行距(字級的倍數)
+
+
+def lines(text):
+    """標籤用 \\ 換行(和 LaTeX 一樣),拆成一行一行。"""
+    return [line.strip() for line in LINE_BREAK.split(text)]
+
+
+def layout(text, size, align="left"):
+    """排好整個標籤,回傳 Box(單位是像素)。有 \\ 時排成多行,align 是每行的對齊(left、center、right)。"""
+    parts = lines(text)
+    if len(parts) > 1:
+        key = (text, round(size, 2), align)
+        if key not in _layouts:
+            boxes = [layout(part, size) for part in parts]
+            width = max(b.width for b in boxes)
+            box = Box(width=width, ascent=boxes[0].ascent, descent=boxes[0].descent)
+            for index, line in enumerate(boxes):
+                shift = {"left": 0, "center": (width - line.width) / 2, "right": width - line.width}[align]
+                box.add(line, shift, -index * size * LINE_GAP)
+            box.width = width
+            _layouts[key] = box
+        return _layouts[key]
     key = (text, round(size, 2))
     if key in _layouts:
         return _layouts[key]

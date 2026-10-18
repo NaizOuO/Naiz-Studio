@@ -53,7 +53,7 @@ def _draw(ax, shapes, at, ux, uy, color):
             ax.add_patch(Polygon([(x2, y2), (bx - dy * w, by + dx * w), (bx + dy * w, by - dx * w)], fc=color, lw=0))
 
 
-def _label(ax, p, text, vx, vy, shift=None, color=LABEL):
+def _label(ax, p, text, vx, vy, shift=None, color=LABEL, va_fixed=None):
     """標籤放在 p(shift 是拖曳過的位移),(vx, vy) 是它在元件的哪個方向,用來決定對齊方式;(0, 0) 是置中。"""
     if not text:
         return
@@ -65,6 +65,7 @@ def _label(ax, p, text, vx, vy, shift=None, color=LABEL):
         ha, va = "center", ("bottom" if vy > 0 else "top")
     else:
         ha, va = ("left" if vx > 0 else "right"), "center"
+    va = va_fixed or va
     if shift:
         p = (p[0] + shift[0], p[1] + shift[1])
     ax.text(*p, text, ha=ha, va=va, color=color)
@@ -108,6 +109,9 @@ def _multi(ax, at, part, rot=0, mirror=False, label="", value="", flip=False, sh
     vx, vy = p[0] - mid[0], p[1] - mid[1]
     _label(ax, p, label, vx, vy, shift)
     if value:
+        if label and abs(vx) > abs(vy):  # 名稱在旁邊:數值從名稱下面往下排
+            _label(ax, (p[0], p[1] - {size} * 0.6), value, vx, vy, vshift, VALUE, va_fixed="top")
+            return
         if label and abs(vy) >= abs(vx) and vy > 0:
             vx, vy = 0, -1
         _label(ax, (p[0], p[1] - {size} * 1.25 * bool(label)), value, vx, vy, vshift, VALUE)
@@ -145,12 +149,13 @@ def voltage(ax, a, b, label="", shift=None):
 CURRENT = '''
 
 def current(ax, a, b, label="", flip=False, shift=None):
-    """電流箭頭:在 a、b 中間畫一個從 a 指向 b 的箭頭。"""
+    """電流箭頭:從 a 指向 b 的箭頭(太短時至少有個箭頭的長度)。"""
     n = math.hypot(b[0] - a[0], b[1] - a[1])
     ux = ((b[0] - a[0]) / n, (b[1] - a[1]) / n)
     uy = (-ux[1], ux[0])
     mid = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
-    _draw(ax, [("A", (-0.22, 0), (0.22, 0))], mid, ux, uy, PART)
+    half = max(n / 2, 0.22)
+    _draw(ax, [("A", (-half, 0), (half, 0))], mid, ux, uy, PART)
     side = (1 if uy[1] > 0 else -1) if abs(uy[1]) > 0.3 else (1 if uy[0] > 0 else -1)
     side = -side if flip else side
     _label(ax, _put((0, 0.2 * side), mid, ux, uy), label, uy[0] * side, uy[1] * side, shift)
@@ -210,6 +215,8 @@ def _point(p):
 def to_tex(text):
     """標籤換成 matplotlib 的寫法。已經用 $...$ 寫好的照原樣;沒有 $ 的話,含上下標的字放進 $...$,
     Ω、μ 這類字母換成 \\Omega、\\mu;數學式外面的 % & # 加反斜線(筆記用 LaTeX 排字)。"""
+    if len(tex.lines(text)) > 1:                    # \\ 換行:每行各自轉,用換行接起來
+        return "\n".join(to_tex(line) for line in tex.lines(text))
     if "$" in text.replace("\\$", ""):
         return text
     pieces = []
@@ -225,7 +232,7 @@ def to_tex(text):
 
 def _text_literal(text):
     value = to_tex(text)
-    if "\\" in value and not value.endswith("\\") and '"' not in value:
+    if "\\" in value and not value.endswith("\\") and '"' not in value and "\n" not in value:
         return f'r"{value}"'
     return repr(value)
 

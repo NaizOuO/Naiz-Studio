@@ -98,7 +98,7 @@ class Painter:
         if not text:
             return
         x, y = self.px(point)
-        box = tex.layout(text, size * self.scale)
+        box = tex.layout(text, size * self.scale, ha)
         left = x - {"left": 0, "center": box.width / 2, "right": box.width}[ha]
         base = tex.baseline(box, y, va)
         for item in box.items:
@@ -260,7 +260,7 @@ def render_svg(elements, style, resistor_style, scale=80):
         if not value:
             return
         x, y = px(point)
-        box = tex.layout(value, size * scale)
+        box = tex.layout(value, size * scale, ha)
         left = x - {"left": 0, "center": box.width / 2, "right": box.width}[ha]
         base = tex.baseline(box, y, va)
         for item in box.items:

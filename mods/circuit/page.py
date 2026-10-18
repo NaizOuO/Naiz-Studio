@@ -105,7 +105,7 @@ class CircuitPage(Page):
         self.square = Slider(0, 100, 0, step=5, accent=accent)
         self.caption = TextInput(placeholder="圖說(可不填)", accent=accent, size=14)
         self.name_input = TextInput(placeholder="例如 R_1", accent=accent, size=14)
-        self.value_input = TextInput(placeholder="例如 10 k\\Omega", accent=accent, size=14)
+        self.value_input = TextInput(placeholder="例如 10 k\\Omega，打 \\\\ 換行", accent=accent, size=14)
         self.search = TextInput(placeholder="搜尋", accent=accent, size=13)
         self.inputs = [self.name_input, self.value_input, self.caption, self.search]
         self._editing = None
@@ -416,10 +416,20 @@ class CircuitPage(Page):
 
     def select(self, indices):
         self.selected = set(indices)
+        self.picked_label = None
         self._sync_inputs()
 
     def delete_selected(self):
         if not self.selected:
+            return
+        picked = getattr(self, "picked_label", None)
+        if picked and self.selected == {picked[0]} and picked[0] < len(self.elements):
+            el, key = self.elements[picked[0]], picked[1]          # 點過標籤:只刪那個標籤的文字
+            self.picked_label = None
+            if el.get(key):
+                self.edit(lambda: el.__setitem__(key, ""))
+                (el.get("offsets") or {}).pop(key, None)
+                self._sync_inputs()
             return
         chosen = self.selected
         self.edit(lambda: setattr(self, "elements", [el for i, el in enumerate(self.elements) if i not in chosen]))
@@ -950,6 +960,7 @@ class CircuitPage(Page):
         self._motion(pos)
 
     def _press_select(self, pos, world, point, double):
+        self.picked_label = None
         handle = self._handle_at(pos)
         if handle:
             self._start_move(point, handle=handle)
@@ -963,6 +974,7 @@ class CircuitPage(Page):
                 self.name_input.select_all()
                 return
             el = self.elements[index]
+            self.picked_label = (index, "label" if role == "label" else "value")
             self.begin()
             start = dict(el.get("offsets") or {}).get(role, [0, 0])
             self.drag = dict(mode="label", index=index, role=role, start=world, offset=list(start))
@@ -992,6 +1004,8 @@ class CircuitPage(Page):
             return
         if index not in self.selected:
             self.select([index])
+            if role and not text_like:              # 直接點在標籤上:之後按 Delete 只刪這個標籤
+                self.picked_label = (index, "label" if role == "label" else "value")
         if double and "label" in self.elements[index]:
             self.name_input.focus()
             self.name_input.select_all()
